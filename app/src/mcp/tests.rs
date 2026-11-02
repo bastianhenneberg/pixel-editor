@@ -62,6 +62,8 @@ fn protocol_and_tools() {
         "pace_ms",
         "get_user_view",
         "CONSISTENCY RULES: every pixel write needs an explicit target",
+        "mirror_document(src, dst)",
+        "transform (op flip_h",
     ] {
         assert!(instructions.contains(part), "instructions lack {part:?}: {instructions}");
     }
@@ -105,6 +107,8 @@ fn protocol_and_tools() {
         "diff_snapshot",
         "restore_snapshot",
         "get_user_view",
+        "transform",
+        "mirror_document",
     ] {
         assert!(names.contains(&required), "missing tool {required}");
     }
@@ -752,5 +756,106 @@ fn get_user_view_shows_a_shaped_selection() {
         "{t}"
     );
     assert!(t.contains("\n      23\n    3 8·\n    4 8c\n"), "{t}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn transform_rect_cel_frames_with_diff_history_and_locks() {
+    let (s, dir) = server("transform");
+    ok(&s, "create_document", json!({"name": "t", "width": 6, "height": 4}));
+    ok(&s, "set_rows", json!({"path": "t", "layer": 0, "frame": 0, "rows": ["12....", "3....."]}));
+    // rect: only that box, with a diff, dry run first
+    let t = ok(
+        &s,
+        "transform",
+        json!({"path": "t", "op": "flip_h", "scope": "rect", "layer": 0, "frame": 0, "rect": {"x": 0, "y": 0, "w": 3, "h": 2}, "dry_run": true}),
+    );
+    assert!(t.starts_with("DRY RUN"), "{t}");
+    assert_eq!(load(&dir, "t.pxe.json").rows(0, 0)[0], "12....");
+    let t = ok(
+        &s,
+        "transform",
+        json!({"path": "t", "op": "flip_h", "scope": "rect", "layer": 0, "frame": 0, "rect": {"x": 0, "y": 0, "w": 3, "h": 2}}),
+    );
+    assert!(t.contains("recorded as \"Claude: transform flip_h"), "{t}");
+    let d = load(&dir, "t.pxe.json");
+    assert_eq!(d.rows(0, 0)[..2], [".21...", "..3..."]);
+    // a non-square rect turned by 90°: the 3x2 box becomes a 2x3 box on its centre
+    let t = ok(
+        &s,
+        "transform",
+        json!({"path": "t", "op": "rot90", "scope": "rect", "layer": 0, "frame": 0, "rect": {"x": 0, "y": 0, "w": 3, "h": 2}}),
+    );
+    assert!(t.contains("-> x 0..1 y -1..1 (2x3)") && !t.contains("cut off"), "{t}");
+    assert_eq!(load(&dir, "t.pxe.json").rows(0, 0)[..2], [".2....", "31...."]);
+    let h = ok(&s, "history", json!({"path": "t"}));
+    assert!(h.contains("transform rot90"), "{h}");
+    ok(&s, "undo", json!({"path": "t"}));
+    assert_eq!(load(&dir, "t.pxe.json").rows(0, 0)[..2], [".21...", "..3..."]);
+
+    // whole frames: two frames, a linked one, a region and a locked marker
+    ok(&s, "add_frame", json!({"path": "t", "copy_from": 0, "linked": true}));
+    ok(&s, "add_frame", json!({"path": "t", "copy_from": 0}));
+    ok(&s, "set_region", json!({"path": "t", "name": "hand", "x": 1, "y": 0, "w": 2, "h": 1}));
+    ok(&s, "set_region", json!({"path": "t", "name": "origin", "kind": "marker", "x": 0, "y": 3, "locked": true}));
+    ok(&s, "set_tag", json!({"path": "t", "name": "walk", "from": 0, "to": 1}));
+    // frame 0 alone would change its linked frame 1 too
+    let e = err(&s, "transform", json!({"path": "t", "op": "flip_h", "scope": "frame", "frame": 0}));
+    assert!(e.contains("linked with frames [1]") && e.contains("edit_linked"), "{e}");
+    let t = ok(&s, "transform", json!({"path": "t", "op": "flip_h", "scope": "tag", "tag": "walk"}));
+    assert!(t.contains("(1 cels)") && t.contains("locked regions kept their rect: origin"), "{t}");
+    let d = load(&dir, "t.pxe.json");
+    assert_eq!(d.rows(0, 0)[..2], ["...12.", "...3.."]);
+    assert_eq!(d.rows(0, 1), d.rows(0, 0));
+    assert_eq!(d.rows(0, 2)[0], ".21...", "frame 2 is outside the tag");
+    let hand = &d.regions[d.find_region("hand").unwrap()];
+    assert_eq!(hand.rect_at(0), Some(Rect::new(3, 0, 2, 1)));
+    assert_eq!(hand.rect_at(2), Some(Rect::new(1, 0, 2, 1)));
+    assert_eq!(d.regions[d.find_region("origin").unwrap()].point_at(0), Some((0, 3)));
+    // scope all + cel, locked layer, unknown scope, wrong args
+    ok(&s, "transform", json!({"path": "t", "op": "rot180", "scope": "all"}));
+    ok(&s, "transform", json!({"path": "t", "op": "flip_v", "scope": "cel", "layer": 0, "frame": 2}));
+    ok(&s, "set_layer", json!({"path": "t", "layer": 0, "locked": true}));
+    let e = err(&s, "transform", json!({"path": "t", "op": "flip_h", "scope": "all"}));
+    assert!(e.contains("locked"), "{e}");
+    let e = err(&s, "transform", json!({"path": "t", "op": "spin", "scope": "all"}));
+    assert!(e.contains("unknown op"), "{e}");
+    let e = err(&s, "transform", json!({"path": "t", "op": "flip_h", "scope": "cel", "frame": 0}));
+    assert!(e.contains("missing \"layer\""), "{e}");
+    let e = err(&s, "transform", json!({"path": "t", "op": "flip_h", "scope": "bogus"}));
+    assert!(e.contains("unknown scope"), "{e}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn transform_respects_locked_regions_and_mirror_document_copies() {
+    let (s, dir) = server("mirror");
+    ok(&s, "create_document", json!({"name": "walk_right", "width": 4, "height": 2}));
+    ok(&s, "set_rows", json!({"path": "walk_right", "layer": 0, "frame": 0, "rows": ["12..", "3..."]}));
+    ok(&s, "add_frame", json!({"path": "walk_right", "copy_from": 0, "linked": true, "duration_ms": 300}));
+    ok(&s, "set_tag", json!({"path": "walk_right", "name": "walk", "from": 0, "to": 1, "direction": "pingpong"}));
+    ok(&s, "set_region", json!({"path": "walk_right", "name": "face", "x": 0, "y": 0, "w": 1, "h": 1, "locked": true}));
+    let e = err(
+        &s,
+        "transform",
+        json!({"path": "walk_right", "op": "flip_h", "scope": "cel", "layer": 0, "frame": 0, "edit_linked": true}),
+    );
+    assert!(e.contains("locked region \"face\""), "{e}");
+    let t = ok(&s, "mirror_document", json!({"src": "walk_right", "dst": "walk_left"}));
+    assert!(t.contains("wrote walk_left.pxe.json") && t.contains("2 frames"), "{t}");
+    let src = load(&dir, "walk_right.pxe.json");
+    let m = load(&dir, "walk_left.pxe.json");
+    assert_eq!(src.rows(0, 0), ["12..", "3..."], "the source stays");
+    assert_eq!(m.rows(0, 0), ["..21", "...3"]);
+    assert!(m.layers[0].is_linked(1));
+    assert_eq!((m.frames[1].duration_ms, &m.tags), (300, &src.tags));
+    let face = &m.regions[0];
+    assert_eq!((face.rect_at(0), face.locked), (Some(Rect::new(3, 0, 1, 1)), true));
+    let h = ok(&s, "history", json!({"path": "walk_left"}));
+    assert!(h.contains("mirror_document flip_h from walk_right.pxe.json"), "{h}");
+    assert!(err(&s, "mirror_document", json!({"src": "walk_right", "dst": "walk_left"})).contains("already exists"));
+    assert!(err(&s, "mirror_document", json!({"src": "walk_right", "dst": "x", "op": "rot90"})).contains("flip_h"));
+    ok(&s, "mirror_document", json!({"src": "walk_right", "dst": "walk_left.aseprite"}));
+    assert_eq!(io::load(&dir.join("walk_left.aseprite")).unwrap().rows(0, 0), ["..21", "...3"]);
     std::fs::remove_dir_all(&dir).unwrap();
 }

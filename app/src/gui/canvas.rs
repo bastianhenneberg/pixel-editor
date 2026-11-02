@@ -54,6 +54,8 @@ pub struct CanvasState {
     /// Give the note field the keyboard on its next paint.
     pub(super) focus_note: bool,
     panning: bool,
+    /// The symmetry axis being dragged by its grip.
+    pub(super) axis_drag: Option<super::transform::AxisDrag>,
     wheel: f32,
     tex: Option<TextureHandle>,
     prev_tex: Option<TextureHandle>,
@@ -76,6 +78,7 @@ impl Default for CanvasState {
             note_focused: false,
             focus_note: false,
             panning: false,
+            axis_drag: None,
             wheel: 0.0,
             tex: None,
             prev_tex: None,
@@ -119,7 +122,7 @@ impl EditorApp {
             Tool::Ellipse => draw::ellipse_in_box(s.0, s.1, e.0, e.1, self.filled),
             _ => return None,
         };
-        let pts = pts.into_iter().filter(|(x, y)| self.may_paint(*x, *y)).collect();
+        let pts = self.sym_points(pts).into_iter().filter(|(x, y)| self.may_paint(*x, *y)).collect();
         Some((pts, g.key))
     }
 
@@ -277,8 +280,9 @@ impl EditorApp {
         self.canvas.hover =
             pointer.hover_pos().filter(|p| area.contains(*p)).map(to_px).filter(|(x, y)| self.doc.in_bounds(*x, *y));
 
-        // ---- input: tools
-        if !self.canvas.panning {
+        // ---- input: symmetry axis grips, then tools
+        let grips = self.axis_grips(canvas, cell);
+        if !self.canvas.panning && !self.axis_input(&resp, &pointer, canvas, cell, &grips) {
             self.tool_input(&resp, &pointer, mods, to_px);
         }
         // selection tools: a right click (not a drag) opens the selection menu
@@ -444,6 +448,9 @@ impl EditorApp {
             mesh.add_colored_rect(r, c);
         }
         painter.add(egui::Shape::mesh(mesh));
+        if !clean {
+            self.paint_axes(&painter, canvas, cell, &grips);
+        }
         // follow mode: the journal note as a banner at the top of the canvas
         if let Some(note) = self.follow.banner_text().filter(|_| !clean) {
             let galley = painter.layout_no_wrap(note.to_string(), egui::FontId::proportional(15.0), Color32::BLACK);
@@ -518,10 +525,18 @@ impl EditorApp {
             }
             match self.tool {
                 Tool::Fill => {
-                    if self.doc.in_bounds(p.0, p.1) && self.may_paint(p.0, p.1) {
-                        let pts: Vec<(i32, i32)> = draw::flood_region(&self.doc, layer, frame, p.0, p.1)
-                            .into_iter()
-                            .filter(|(x, y)| self.may_paint(*x, *y))
+                    // with symmetry, each mirrored seed fills its own area too
+                    let seeds: Vec<(i32, i32)> = self
+                        .sym_points(vec![p])
+                        .into_iter()
+                        .filter(|&(x, y)| self.doc.in_bounds(x, y) && self.may_paint(x, y))
+                        .collect();
+                    if !seeds.is_empty() {
+                        let mut seen = std::collections::HashSet::new();
+                        let pts: Vec<(i32, i32)> = seeds
+                            .iter()
+                            .flat_map(|s| draw::flood_region(&self.doc, layer, frame, s.0, s.1))
+                            .filter(|&(x, y)| self.may_paint(x, y) && seen.insert((x, y)))
                             .collect();
                         let desc =
                             format!("Füllen {} Pixel mit {} · {}", pts.len(), self.doc.key_label(key), self.here());
@@ -531,7 +546,9 @@ impl EditorApp {
                 Tool::Pencil | Tool::Eraser => {
                     let key = if self.tool == Tool::Eraser { TRANSPARENT } else { key };
                     self.history.push(self.doc.clone(), "Stift");
-                    if self.may_paint(p.0, p.1) && self.doc.set(layer, frame, p.0, p.1, key) {
+                    let pts: Vec<(i32, i32)> =
+                        self.sym_points(vec![p]).into_iter().filter(|(x, y)| self.may_paint(*x, *y)).collect();
+                    if self.doc.set_points(layer, frame, &pts, key) > 0 {
                         self.touch();
                     }
                     self.canvas.gesture = Some(Gesture { start: p, last: p, key, painted: 1 });
@@ -555,7 +572,8 @@ impl EditorApp {
                 if matches!(self.tool, Tool::Pencil | Tool::Eraser) {
                     let (from, key) = (g.last, g.key);
                     g.last = p;
-                    let pts: Vec<(i32, i32)> = draw::line(from.0, from.1, p.0, p.1)
+                    let pts: Vec<(i32, i32)> = self
+                        .sym_points(draw::line(from.0, from.1, p.0, p.1))
                         .into_iter()
                         .filter(|(x, y)| self.may_paint(*x, *y))
                         .collect();
@@ -595,7 +613,8 @@ impl EditorApp {
                     return;
                 }
             };
-            let pts: Vec<(i32, i32)> = pts.into_iter().filter(|(x, y)| self.may_paint(*x, *y)).collect();
+            let pts: Vec<(i32, i32)> =
+                self.sym_points(pts).into_iter().filter(|(x, y)| self.may_paint(*x, *y)).collect();
             let desc = format!("{} {} · {}", self.tool.label(), self.doc.key_label(g.key), self.here());
             self.edit(desc, |d| d.set_points(layer, frame, &pts, g.key));
         }
@@ -737,4 +756,103 @@ pub(super) fn drag_rect(a: (i32, i32), b: (i32, i32)) -> pixel_core::Rect {
     let (x0, x1) = (a.0.min(b.0), a.0.max(b.0));
     let (y0, y1) = (a.1.min(b.1), a.1.max(b.1));
     pixel_core::Rect::new(x0, y0, (x1 - x0 + 1) as u32, (y1 - y0 + 1) as u32)
+}
+
+/// Screen size of a symmetry axis grip (points).
+const GRIP: f32 = 12.0;
+
+impl EditorApp {
+    /// Grips of the active symmetry axes: just outside the canvas, above
+    /// (vertical axis) and left of it (horizontal axis).
+    fn axis_grips(&self, canvas: Rect, cell: f32) -> Vec<(super::transform::AxisDrag, Rect)> {
+        use super::transform::AxisDrag;
+        let m = self.symmetry.mode;
+        let (ax, ay) = self.axis2();
+        let mut out = Vec::new();
+        if m.vertical() {
+            let x = canvas.min.x + ax as f32 / 2.0 * cell;
+            out.push((AxisDrag::X, Rect::from_center_size(Pos2::new(x, canvas.min.y - GRIP), Vec2::splat(GRIP))));
+        }
+        if m.horizontal() {
+            let y = canvas.min.y + ay as f32 / 2.0 * cell;
+            out.push((AxisDrag::Y, Rect::from_center_size(Pos2::new(canvas.min.x - GRIP, y), Vec2::splat(GRIP))));
+        }
+        out
+    }
+
+    /// Drag an axis by its grip; true while the pointer belongs to it.
+    fn axis_input(
+        &mut self,
+        resp: &egui::Response,
+        pointer: &egui::PointerState,
+        canvas: Rect,
+        cell: f32,
+        grips: &[(super::transform::AxisDrag, Rect)],
+    ) -> bool {
+        use super::transform::AxisDrag;
+        if resp.hovered() && pointer.primary_pressed() {
+            if let Some(p) = pointer.interact_pos() {
+                if let Some((a, _)) = grips.iter().find(|(_, r)| r.expand(3.0).contains(p)) {
+                    self.canvas.axis_drag = Some(*a);
+                }
+            }
+        }
+        let Some(axis) = self.canvas.axis_drag else { return false };
+        if let Some(p) = pointer.latest_pos() {
+            // snap to pixel edges and pixel centres
+            let (w, h) = (self.doc.width as i32, self.doc.height as i32);
+            match axis {
+                AxisDrag::X => {
+                    self.symmetry.x2 = Some((((p.x - canvas.min.x) / cell * 2.0).round() as i32).clamp(1, 2 * w - 1))
+                }
+                AxisDrag::Y => {
+                    self.symmetry.y2 = Some((((p.y - canvas.min.y) / cell * 2.0).round() as i32).clamp(1, 2 * h - 1))
+                }
+            }
+        }
+        if !pointer.primary_down() {
+            self.canvas.axis_drag = None;
+            let (ax, ay) = self.axis2();
+            self.status = format!("Symmetrieachse: x {} · y {}", ax as f32 / 2.0, ay as f32 / 2.0);
+        }
+        true
+    }
+
+    /// The symmetry axes as dashed lines with their grips.
+    fn paint_axes(
+        &self,
+        painter: &egui::Painter,
+        canvas: Rect,
+        cell: f32,
+        grips: &[(super::transform::AxisDrag, Rect)],
+    ) {
+        use super::transform::AxisDrag;
+        let (ax, ay) = self.axis2();
+        let col = Color32::from_rgb(255, 120, 200);
+        for (dark, w) in [(true, 3.0), (false, 1.5)] {
+            let stroke = egui::Stroke::new(w, if dark { Color32::from_black_alpha(140) } else { col });
+            for (axis, grip) in grips {
+                let (a, b) = match axis {
+                    AxisDrag::X => {
+                        let x = canvas.min.x + ax as f32 / 2.0 * cell;
+                        (Pos2::new(x, canvas.min.y - 4.0), Pos2::new(x, canvas.max.y + 4.0))
+                    }
+                    AxisDrag::Y => {
+                        let y = canvas.min.y + ay as f32 / 2.0 * cell;
+                        (Pos2::new(canvas.min.x - 4.0, y), Pos2::new(canvas.max.x + 4.0, y))
+                    }
+                };
+                painter.extend(egui::Shape::dashed_line(&[a, b], stroke, 6.0, 4.0));
+                if !dark {
+                    // a triangle pointing at the canvas
+                    let c = grip.center();
+                    let pts = match axis {
+                        AxisDrag::X => vec![grip.left_top(), grip.right_top(), Pos2::new(c.x, grip.max.y)],
+                        AxisDrag::Y => vec![grip.left_top(), grip.left_bottom(), Pos2::new(grip.max.x, c.y)],
+                    };
+                    painter.add(egui::Shape::convex_polygon(pts, col, egui::Stroke::new(1.0, Color32::BLACK)));
+                }
+            }
+        }
+    }
 }

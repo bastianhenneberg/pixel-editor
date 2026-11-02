@@ -33,6 +33,7 @@ impl EditorApp {
         if matches!(self.tool, Tool::Rect | Tool::Ellipse) {
             ui.checkbox(&mut self.filled, "gefüllt");
         }
+        self.symmetry_panel(ui);
         if self.tool == Tool::Point {
             ui.label(
                 RichText::new(

@@ -58,7 +58,7 @@ Der Editor prüft Datei und Journal etwa alle 100 ms und spielt jede neue Änder
 
 ## Werkzeugleiste
 
-Links steht eine Symbolleiste mit Werkzeuggruppen wie in Photoshop: Stift, Radierer, Füllen, Linie, **Formen** (Rechteck, Ellipse), Pipette, **Auswahl-Werkzeuge** (Auswahl, Auswahl-Pinsel, Zauberstab, Lasso) und KI zeigen. Jeder Knopf zeigt das zuletzt benutzte Werkzeug seiner Gruppe; ein kleines Dreieck unten rechts heißt, dass die Gruppe mehr enthält. Klick wählt das gezeigte Werkzeug. **Rechtsklick, langes Drücken oder Klick auf das Dreieck** klappt die Gruppe auf (Symbol, Name, Kürzel); ein Klick daneben oder Esc schließt sie. Der Tooltip nennt Name und Kürzel. Darunter stehen Name und Kürzel des aktiven Werkzeugs, seine Hinweise und Einstellungen (gefüllt, Ablegen vorne/hinten, Zauberstab-Modus, Markierungsknöpfe). Das Menü **Werkzeuge** ist genauso gruppiert (Untermenüs „Formen“ und „Auswahl-Werkzeuge“).
+Links steht eine Symbolleiste mit Werkzeuggruppen wie in Photoshop: Stift, Radierer, Füllen, Linie, **Formen** (Rechteck, Ellipse), Pipette, **Auswahl-Werkzeuge** (Auswahl, Auswahl-Pinsel, Zauberstab, Lasso) und KI zeigen. Jeder Knopf zeigt das zuletzt benutzte Werkzeug seiner Gruppe; ein kleines Dreieck unten rechts heißt, dass die Gruppe mehr enthält. Klick wählt das gezeigte Werkzeug. **Rechtsklick, langes Drücken oder Klick auf das Dreieck** klappt die Gruppe auf (Symbol, Name, Kürzel); ein Klick daneben oder Esc schließt sie. Der Tooltip nennt Name und Kürzel. Darunter stehen Name und Kürzel des aktiven Werkzeugs, seine Hinweise und Einstellungen (gefüllt, Symmetrie mit Achsen, Ablegen vorne/hinten, Zauberstab-Modus, Markierungsknöpfe). Das Menü **Werkzeuge** ist genauso gruppiert (Untermenüs „Formen“ und „Auswahl-Werkzeuge“).
 
 ## Auswählen und Verschieben
 
@@ -124,6 +124,19 @@ target/release/pixel-editor preview figur.pxe.json vorschau.png [--zoom 8] [--fr
 target/release/pixel-editor render-animation figur.pxe.json walk_down anim.png [--region NAME|x,y,w,h] [--track NAME|x,y,w,h] [--zoom N] [--jump 2]
 ```
 
+## Spiegeln, Drehen, Symmetrie
+
+**Menü „Bild“**: Horizontal spiegeln (**Alt+H**), Vertikal spiegeln (**Alt+V**), 90° rechts drehen (**Alt+R**), 90° links drehen (**Alt+L**), 180° drehen (**Alt+Umschalt+R**). Die Kürzel und die obersten Einträge wirken auf die Auswahl, ohne Auswahl auf den aktuellen Cel. Die Untermenüs wählen den Bereich ausdrücklich:
+- **Auswahl**: genau die gewählten Pixel (auch Zauberstab-, Lasso- und Pinsel-Formen; die Maske dreht sich mit), gedreht um die Mitte ihres Rechtecks. Schwebende Pixel (verschoben oder eingefügt) drehen sich, ohne den Cel zu ändern, bis sie abgelegt werden. Dieselben fünf Einträge stehen im Rechtsklick-Menü der Auswahl-Werkzeuge.
+- **Cel**: der aktuelle Cel um die Leinwandmitte; Regionen, die nur für diese Ebene gelten, wandern mit.
+- **Frame (alle Ebenen)**, **Frames des Tags** (des abgespielten Tags oder des ersten, der den Frame enthält), **Alle Frames**: um die Leinwandmitte, damit Ebenen und Frames deckungsgleich bleiben. Jede verknüpfte Cel wird genau einmal gedreht. Regionen und Marker auf diesen Frames wandern mit.
+
+Ein nicht quadratischer Bereich, um 90° gedreht, belegt das gedrehte Rechteck auf derselben Mitte. Was dabei über die Leinwand hinausgeht, wird abgeschnitten; die Statuszeile nennt die Zahl („12 Pixel an der Leinwand abgeschnitten“). Gesperrte Ebenen und Frames werden übersprungen und genannt, Pixel in gesperrten Regionen bleiben, gesperrte Regionen und Marker behalten ihr Rechteck. Jede Drehung ist ein Rückgängig-Schritt mit Beschreibung.
+
+**„Animation gespiegelt duplizieren…“** (Menü Bild) schreibt eine horizontal gespiegelte Kopie des Dokuments in eine neue Datei und öffnet sie im neuen Tab. Vorgeschlagen wird der Name mit `right`↔`left` getauscht, `walk_side` wird zu `walk_left`, sonst `<name>_mirrored`. Tags, Dauern, Ebenen, Sperren, verknüpfte Cels und Regionen bleiben erhalten; Regionen-Rechtecke und Marker werden mitgespiegelt. Das Original bleibt unverändert.
+
+**Symmetrisch zeichnen** (Werkzeugfeld bei Stift, Radierer, Füllen, Linie, Rechteck, Ellipse; Menü Bild; **Alt+S** schaltet Aus → Vertikal → Horizontal → Beide): jeder Strich, jede Form und jede Füllung wird an der vertikalen Achse (links/rechts), der horizontalen (oben/unten) oder an beiden gespiegelt, auch in der Vorschau beim Ziehen. Die Achsen liegen zuerst in der Leinwandmitte und erscheinen als gestrichelte Linien. Verschieben: am dreieckigen Griff über (vertikale Achse) bzw. links neben der Leinwand (horizontale Achse) ziehen, oder die Zahl im Werkzeugfeld eingeben (in halben Pixeln: `12` liegt auf einer Pixelkante, `12.5` geht durch die Pixelmitte). „Mitte“ setzt sie zurück. Die Einstellung gilt je Tab.
+
 ## Bedienung
 
 Aufbau wie in Aseprite: links Werkzeuge und Palette, in der Mitte die Leinwand, rechts die Eigenschaften (Ebene, Frame/Cel, Tag), unten die **Zeitleiste**:
@@ -143,6 +156,8 @@ Tastenkürzel (soweit sinnvoll wie in Aseprite):
 | Zauberstab (W) | Klick wählt die zusammenhängende Fläche gleicher Farbe auf der Ebene (4 Nachbarn); Schalter „alle gleichfarbigen“ im Werkzeugfeld und im Menü Werkzeuge; in der Auswahl ziehen verschiebt sie |
 | Lasso (Q) | Umriss frei ziehen; gewählt wird alles innerhalb und auf dem Umriss |
 | Umschalt / Alt oder Strg beim Auswählen | bei Rechteck, Zauberstab und Lasso: zur Auswahl hinzufügen / von ihr abziehen; ohne Taste ersetzt die Geste die Auswahl |
+| Alt+H / Alt+V / Alt+R / Alt+L / Alt+Umschalt+R | Auswahl (sonst Cel) horizontal / vertikal spiegeln, 90° rechts / 90° links / 180° drehen (Menü Bild, siehe oben) |
+| Alt+S | Symmetrisch zeichnen: Aus → Vertikal → Horizontal → Beide |
 | Umschalt+H | Ablegen „Vorne“/„Hinten“ umschalten (auch im Werkzeugfeld und im Menü Werkzeuge), siehe unten |
 | Strg+C / Strg+X / Strg+V | Auswahl kopieren / ausschneiden / einfügen (schwebend, verschiebbar, Enter legt ab) |
 | Strg+A / Strg+D / Strg+Umschalt+I / Entf | alles auswählen / Auswahl aufheben / Auswahl umkehren / Auswahl löschen (auch im Menü Auswahl und per Rechtsklick auf die Leinwand) |
@@ -211,6 +226,8 @@ oder `claude mcp add pixel-editor -- /home/bastian/Development/pixel-editor/targ
 | `get_rows(path, layer?, frame?, region? \| x/y/w/h, composite?)` | Ausschnitt lesen |
 | `set_pixels`, `set_rows`, `draw_line`, `draw_rect`, `draw_ellipse`, `fill`, `clear` | Pixel schreiben; immer `layer` + `frame`, optional `region`/`clip`, `edit_linked`, `dry_run`, `note` |
 | `copy_region`, `move_region(region \| clip, dx?, dy?, to_frame?, to_layer?, mode?)` | Bereich kopieren/verschieben, auch in andere Frames/Ebenen; `move_region` verschiebt das Rechteck der Region auf diesem Frame mit |
+| `transform(path, op, scope, layer?, frame?, region? \| rect?, frames? \| from/to?, tag?)` | spiegeln/drehen: `op` `flip_h`, `flip_v`, `rot90` (rechts), `rot180`, `rot270` (links); `scope` `rect`/`region`/`cel` (eine Ebene + Frame) oder `frame`/`frames`/`tag`/`all` (ganze Frames um die Leinwandmitte, alle Ebenen oder nur `layer`; Regionen wandern mit). Abgeschnittene Pixel werden gezählt. Diff, `dry_run`, `note`, `pace_ms`, Verlauf wie die anderen Schreibwerkzeuge; Cels, die mit Frames außerhalb verknüpft sind, brauchen `edit_linked` |
+| `mirror_document(src, dst, op?)` | gespiegelte Kopie (z. B. `walk_left` aus `walk_right`): alle Frames, Tags, Dauern, verknüpfte Cels und Regionen (Rechtecke mitgespiegelt); das Original bleibt |
 | `list_regions`, `set_region(name, kind?, x/y/w/h, frame? \| from/to \| tag, layer?, locked?, color?, hide?, rename?)`, `delete_region` | Regionen und Marker (`kind: "marker"`, nur x/y) |
 | `add_layer`, `set_layer(…, locked?)`, `delete_layer` | Ebenen |
 | `add_frame(copy_from?, linked?, …)`, `delete_frame`, `set_frame_duration`, `set_frame(name?, duration_ms?, locked?, move_to?)`, `link_cel` | Frames und verknüpfte Cels |
@@ -286,7 +303,7 @@ Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen n
 
 ## Bekannte Grenzen
 
-- Kein Spiegeln/Drehen der Auswahl, keine Spiegelsymmetrie beim Zeichnen.
+- Drehen nur in 90°-Schritten (keine freien Winkel, kein Skalieren). Symmetrie wirkt nicht auf Auswahl-Werkzeuge und Pipette.
 - Zeitleiste: Frames werden per Knopf verschoben, nicht per Ziehen. Die Ebenennamen-Spalte scrollt horizontal mit.
 - Keine Ebenengruppen, Blend-Modi, Cel-Deckkraft oder Tilemaps (beim Aseprite-Import gemeldet). Frame-Namen und -Sperren gehen beim Umweg über `.aseprite` verloren (Aseprite kennt sie nicht).
 - Tags sind Bereiche wie in Aseprite. Eine beliebige Reihenfolge entsteht über angehängte verknüpfte Frames (GUI „Folge“, MCP `set_tag frames`).

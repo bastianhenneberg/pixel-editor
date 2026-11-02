@@ -13,6 +13,7 @@ mod tabs;
 mod tests;
 mod timeline;
 mod toolbar;
+mod transform;
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant, SystemTime};
@@ -208,6 +209,10 @@ pub struct EditorApp {
     drop_behind: bool,
     /// Zauberstab: every pixel of the color, not only the connected area.
     wand_all: bool,
+    /// Symmetric drawing (per document).
+    symmetry: transform::Symmetry,
+    /// "Animation gespiegelt duplizieren": the destination path being typed.
+    mirror_dialog: Option<String>,
     /// The last used tool of each toolbar group.
     group_tool: [Tool; toolbar::GROUPS.len()],
     /// The open tool group flyout.
@@ -310,6 +315,8 @@ impl EditorApp {
             clean_view: false,
             drop_behind: false,
             wand_all: false,
+            symmetry: Default::default(),
+            mirror_dialog: None,
             group_tool: toolbar::GROUPS.map(|(_, tools)| tools[0]),
             flyout: None,
             preview: Default::default(),
@@ -848,6 +855,7 @@ impl EditorApp {
                 self.layer -= 1;
             }
         }
+        self.transform_shortcuts(ctx);
         if alt(Key::N) {
             self.new_frame(true, false);
         }
@@ -1098,6 +1106,9 @@ impl EditorApp {
             ui.menu_button("Auswahl", |ui| {
                 self.selection_menu_entries(ui);
             });
+            ui.menu_button("Bild", |ui| {
+                self.image_menu_entries(ui);
+            });
             ui.menu_button("Werkzeuge", |ui| {
                 self.tool_menu_entries(ui);
                 ui.separator();
@@ -1304,6 +1315,7 @@ impl eframe::App for EditorApp {
         self.save_settings(&ctx);
 
         self.dialogs(&ctx);
+        self.mirror_dialog_ui(&ctx);
         self.update_title(&ctx);
         self.publish_view();
         if self.autoshot.as_mut().is_some_and(|s| s.tick(&ctx, now)) {

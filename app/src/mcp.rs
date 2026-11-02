@@ -29,6 +29,7 @@ use pixel_core::document::{Direction, Rect, Region, RegionKind, Tag, KEY_ORDER};
 use pixel_core::export::{self, ExportOptions, Target};
 use pixel_core::journal::{Focus, Journal};
 use pixel_core::render::PreviewOptions;
+use pixel_core::transform::{self, Op};
 use pixel_core::{draw, import, io, palettes, render, Document, PaletteEntry, Rgba, TRANSPARENT};
 use serde_json::{json, Map, Value};
 
@@ -614,6 +615,8 @@ impl Server {
                 Ok(format!("clear {}", r.describe()))
             }),
             "copy_region" | "move_region" => self.copy_or_move(a, name == "move_region"),
+            "transform" => self.transform_tool(a),
+            "mirror_document" => self.mirror_document(a),
             "list_regions" => {
                 let (_, doc, _) = self.load(a)?;
                 Ok(Out::Text(list_regions(&doc, a)?))
@@ -1365,6 +1368,192 @@ impl Server {
         self.finish_write(a, &path, &before, doc, &scopes, tool, detail, true)
     }
 
+    /// Mirror or rotate pixels: a rect/region or a whole cel (one layer and
+    /// frame), or whole frames (all layers or one) around the canvas centre.
+    fn transform_tool(&self, a: &Value) -> Result<Out, String> {
+        let (path, doc, _) = self.load(a)?;
+        let op = Op::parse(str_arg(a, "op")?)?;
+        let scope = str_arg(a, "scope")?;
+        let before = doc.clone();
+        let mut doc = doc;
+        let canvas = Rect::new(0, 0, doc.width, doc.height);
+        let cut = |n: usize| if n > 0 { format!("; {n} pixels cut off at the canvas edge") } else { String::new() };
+        let (scopes, detail, what) = match scope {
+            "rect" | "region" | "cel" => {
+                let s = self.target(&doc, a, "layer", "frame")?;
+                let area = match (scope, s.clip) {
+                    ("cel", None) => canvas,
+                    ("cel", Some(_)) => return Err("scope cel transforms the whole cel; drop region/clip/rect".into()),
+                    ("region", _) if a.get("region").is_none() => return Err("scope region needs region (name)".into()),
+                    ("rect", _) if a.get("region").is_some() => {
+                        return Err("scope rect needs rect/clip, not region".into())
+                    }
+                    (_, Some(c)) => c,
+                    (_, None) => {
+                        return Err(format!(
+                            "scope {scope} needs {}",
+                            if scope == "rect" { "rect/clip {x,y,w,h}" } else { "region" }
+                        ))
+                    }
+                };
+                let moved = transform::transform_area(&mut doc, s.layer, s.frame, area, None, op, false);
+                let mut detail = format!(
+                    "transform {}: {} of layer {:?} frame {} -> {}{}",
+                    op.id(),
+                    area.describe(),
+                    doc.layers[s.layer].name,
+                    doc.frame_label(s.frame),
+                    moved.rect.describe(),
+                    cut(moved.outcome.clipped)
+                );
+                if scope == "cel" {
+                    // regions of this layer only follow the cel
+                    let frames = doc.layers[s.layer].linked_frames(s.frame);
+                    let skipped = transform::transform_regions(&mut doc, &frames, Some(s.layer), op, true);
+                    detail += &locked_regions_note(&skipped);
+                }
+                let clip = (scope != "cel").then(|| area.union(&moved.rect));
+                let what = format!(
+                    "{} {} [{}]",
+                    doc.frame_label(s.frame),
+                    doc.layers[s.layer].name,
+                    a.get("region").and_then(Value::as_str).map_or(area.describe(), str::to_string)
+                );
+                (vec![CelScope { layer: s.layer, frame: s.frame, clip }], detail, what)
+            }
+            "frame" | "frames" | "tag" | "all" => {
+                if a.get("region").is_some() || a.get("clip").is_some() || a.get("rect").is_some() {
+                    return Err(format!(
+                        "scope {scope} transforms whole frames; region/clip/rect belong to scope region/rect"
+                    ));
+                }
+                let (frames, label) = self.scope_frames(&doc, a, scope)?;
+                let layers: Vec<usize> = match index_or_name(a.get("layer")) {
+                    Some(l) => vec![doc.find_layer(&l)?],
+                    None => (0..doc.layers.len()).collect(),
+                };
+                for &l in &layers {
+                    for &f in &frames {
+                        if let Some(why) = doc.edit_blocked(l, f) {
+                            return Err(format!(
+                                "{why}; nothing was written (unlock it, or pass layer to leave other layers alone)"
+                            ));
+                        }
+                        let outside: Vec<usize> =
+                            doc.layers[l].linked_frames(f).into_iter().filter(|g| !frames.contains(g)).collect();
+                        if !outside.is_empty() && !bool_arg(a, "edit_linked", false) {
+                            return Err(format!(
+                                "the cel of layer {:?} on frame {} is linked with frames {outside:?} outside the scope; \
+                                 transforming it would change them too. Pass edit_linked: true, or unlink it first (link_cel unlink: true)",
+                                doc.layers[l].name,
+                                doc.frame_label(f)
+                            ));
+                        }
+                    }
+                }
+                let cels = transform::unique_cels(&doc, &layers, &frames);
+                let mut clipped = 0;
+                for &(l, f) in &cels {
+                    clipped += transform::transform_cel(&mut doc, l, f, op, false).clipped;
+                }
+                let one_layer = (layers.len() == 1 && doc.layers.len() > 1).then_some(layers[0]);
+                let skipped = transform::transform_regions(&mut doc, &frames, one_layer, op, true);
+                let layer_label = match one_layer {
+                    Some(l) => format!("layer {:?}", doc.layers[l].name),
+                    None => "all layers".to_string(),
+                };
+                let detail = format!(
+                    "transform {} around the canvas centre: {label}, {layer_label} ({} cels){}{}",
+                    op.id(),
+                    cels.len(),
+                    cut(clipped),
+                    locked_regions_note(&skipped)
+                );
+                let scopes = cels.iter().map(|&(layer, frame)| CelScope { layer, frame, clip: None }).collect();
+                (scopes, detail, format!("{label}, {layer_label}"))
+            }
+            s => return Err(format!("unknown scope {s:?} (rect, region, cel, frame, frames, tag, all)")),
+        };
+        let mut args = a.clone();
+        if args.get("note").and_then(Value::as_str).is_none_or(|n| n.trim().is_empty()) {
+            args["note"] = json!(format!("{}: transform {} {what}", self.author(), op.id()));
+        }
+        self.finish_write(&args, &path, &before, doc, &scopes, "transform", detail, true)
+    }
+
+    /// The frames of a whole-frame transform scope and a label for them.
+    fn scope_frames(&self, d: &Document, a: &Value, scope: &str) -> Result<(Vec<usize>, String), String> {
+        Ok(match scope {
+            "frame" => {
+                let f = d.find_frame(&index_or_name(a.get("frame")).ok_or("scope frame needs frame")?)?;
+                (vec![f], format!("frame {}", d.frame_label(f)))
+            }
+            "frames" => {
+                let frames: Vec<usize> = if let Some(list) = a.get("frames").and_then(Value::as_array) {
+                    list.iter()
+                        .map(|v| d.find_frame(&index_or_name(Some(v)).ok_or("frames: give indices or names")?))
+                        .collect::<Result<_, _>>()?
+                } else {
+                    let from = d.find_frame(
+                        &index_or_name(a.get("from")).ok_or("scope frames needs frames [..] or from/to")?,
+                    )?;
+                    let to = d.find_frame(&index_or_name(a.get("to")).ok_or("scope frames needs to")?)?;
+                    if to < from {
+                        return Err(format!("from {from} is after to {to}"));
+                    }
+                    (from..=to).collect()
+                };
+                if frames.is_empty() {
+                    return Err("frames is empty".into());
+                }
+                let label = format!("frames {frames:?}");
+                (frames, label)
+            }
+            "tag" => {
+                let name = str_arg(a, "tag")?;
+                let t = d.tags.iter().find(|t| t.name == name).ok_or_else(|| {
+                    format!(
+                        "no tag {name:?}; tags are [{}]",
+                        d.tags.iter().map(|t| t.name.as_str()).collect::<Vec<_>>().join(", ")
+                    )
+                })?;
+                ((t.from..=t.to).collect(), format!("tag {name} (frames {}..{})", t.from, t.to))
+            }
+            _ => ((0..d.frames.len()).collect(), "all frames".to_string()),
+        })
+    }
+
+    /// A mirrored copy of a document (e.g. walk_left from walk_right).
+    fn mirror_document(&self, a: &Value) -> Result<Out, String> {
+        let (src, doc, _) = self.load(&json!({"path": str_arg(a, "src")?}))?;
+        let op = Op::parse(a.get("op").and_then(Value::as_str).unwrap_or("flip_h"))?;
+        if !matches!(op, Op::FlipH | Op::FlipV) {
+            return Err("mirror_document mirrors: op flip_h (default) or flip_v".into());
+        }
+        let (mirrored, clipped) = transform::mirror_document(&doc, op);
+        mirrored.validate()?;
+        let msg = format!(
+            "{} frames, {} layers, {} tags, {} regions mirrored ({}); durations and linked cels kept{}",
+            mirrored.frames.len(),
+            mirrored.layers.len(),
+            mirrored.tags.len(),
+            mirrored.regions.len(),
+            op.id(),
+            if clipped > 0 { format!("; {clipped} pixels cut off") } else { String::new() }
+        );
+        if bool_arg(a, "dry_run", false) {
+            return Ok(Out::Text(format!("DRY RUN, nothing written. Would write a copy of {}: {msg}", self.rel(&src))));
+        }
+        let dest = self.new_doc_path(str_arg(a, "dst")?, bool_arg(a, "overwrite", false))?;
+        if dest == src {
+            return Err("dst is the source document; use transform scope all to mirror it in place".into());
+        }
+        io::save(&mirrored, &dest)?;
+        let note = note_arg(a, || format!("{}: mirror_document {} from {}", self.author(), op.id(), self.rel(&src)));
+        Journal::for_document(&dest).record_edit(&mirrored, &self.author(), &note, None)?;
+        Ok(Out::Text(format!("wrote {}: {msg}\nrecorded as {note:?}", self.rel(&dest))))
+    }
+
     fn new_doc_path(&self, name: &str, overwrite: bool) -> Result<PathBuf, String> {
         let file =
             if io::is_document_path(Path::new(name)) { name.to_string() } else { format!("{name}{}", io::EXTENSION) };
@@ -1856,6 +2045,15 @@ fn palette_line(doc: &Document) -> String {
     doc.palette.iter().map(|p| format!("{}={}", p.label(), p.color)).collect::<Vec<_>>().join(" ")
 }
 
+/// "; locked regions kept their rect: a, b" (or nothing).
+fn locked_regions_note(names: &[String]) -> String {
+    if names.is_empty() {
+        String::new()
+    } else {
+        format!("; locked regions kept their rect: {}", names.join(", "))
+    }
+}
+
 fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
 }
@@ -2117,7 +2315,10 @@ author: use focus to show where you are about to work and pace_ms on writes so t
 drawn. When the user says 'this', 'here', 'the marks' or 'what I selected', call get_user_view: it shows the \
 document, frame, layer, selection (with its pixels) and cursor of every open editor, and all 'KI zeigen' marks \
 of every document grouped by frame: numbered areas or pixels with an optional note (e.g. #2 'brauner Block \
-weg') and their pixels. Marks are the user's instructions; after handling them remove them with clear_marks.";
+weg') and their pixels. Marks are the user's instructions; after handling them remove them with clear_marks. \
+Mirroring/rotating: transform (op flip_h|flip_v|rot90|rot180|rot270; scope rect/region/cel of one layer+frame, or \
+frame/frames/tag/all around the canvas centre; regions follow). A facing-left animation from a facing-right one: \
+mirror_document(src, dst) writes a mirrored copy with tags, durations, linked cels and regions kept; never redraw it.";
 
 fn tools() -> &'static Value {
     static TOOLS: OnceLock<Value> = OnceLock::new();
@@ -2228,6 +2429,27 @@ fn tool_list() -> Value {
                 "to_layer": {"type": ["integer", "string"], "description": "destination layer (default same)"},
                 "mode": {"type": "string", "enum": ["over", "replace"]},
                 "update_region": boolean("move the region's rect too (same frame only), default true")})), &w_req(&[])),
+        tool("transform", "Mirror or rotate pixels, with diff and history like the other writes. scope rect (rect/clip) or region (region): that area of one cel (layer + frame), turned around its centre; a non-square area turned by 90° occupies the turned box on the same centre. scope cel: the whole cel (layer + frame), around the canvas centre. scope frame (frame) / frames (frames [..] or from/to) / tag (tag) / all: whole frames, all layers or only layer, around the canvas centre; each linked cel is turned once, region rects and markers on those frames follow (locked ones stay). Pixels that leave the canvas are cut off and counted. Locked layers/frames/regions refuse.", json!({
+                "path": path,
+                "op": {"type": "string", "enum": ["flip_h", "flip_v", "rot90", "rot180", "rot270"], "description": "flip_h = mirror left/right, flip_v = top/bottom, rot90 = 90° clockwise, rot270 = 90° counter-clockwise"},
+                "scope": {"type": "string", "enum": ["rect", "region", "cel", "frame", "frames", "tag", "all"]},
+                "layer": {"type": ["integer", "string"], "description": "layer (required for rect/region/cel; for whole frames: only this layer)"},
+                "frame": {"type": ["integer", "string"], "description": "frame (rect/region/cel/frame)"},
+                "region": {"type": "string", "description": "scope region: this region's rect on that frame"},
+                "clip": {"type": "object", "description": "scope rect: {x, y, w, h}", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "w": {"type": "integer"}, "h": {"type": "integer"}}},
+                "rect": {"type": "object", "description": "same as clip", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "w": {"type": "integer"}, "h": {"type": "integer"}}},
+                "frames": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "scope frames: these frames"},
+                "from": {"type": ["integer", "string"], "description": "scope frames: first frame"},
+                "to": {"type": ["integer", "string"], "description": "scope frames: last frame (inclusive)"},
+                "tag": {"type": "string", "description": "scope tag: the frames of this tag"},
+                "edit_linked": boolean("allow changing cels linked to frames outside the target"),
+                "dry_run": dry.clone(), "note": note.clone(),
+                "pace_ms": int("show the change row by row in an open editor, this many ms apart")}), &["path", "op", "scope"]),
+        tool("mirror_document", "Write a mirrored copy of a document (e.g. walk_left from walk_right): every frame mirrored around the canvas centre; tags, durations, linked cels, layers, locks and regions are kept, region rects and markers are mirrored too. The source is not changed.", json!({
+                "src": {"type": "string", "description": "source document path relative to the workdir"},
+                "dst": {"type": "string", "description": "new document name (\".pxe.json\" is appended unless given; .aseprite works too)"},
+                "op": {"type": "string", "enum": ["flip_h", "flip_v"], "description": "flip_h (default, left/right) or flip_v"},
+                "overwrite": boolean("replace an existing file"), "dry_run": dry.clone(), "note": note.clone()}), &["src", "dst"]),
         tool("list_regions", "List named regions with their rects per frame range, layer restriction and lock state. With frame: the rects on that frame.",
             json!({"path": path, "frame": {"type": ["integer", "string"], "description": "only show rects on this frame"}}), &["path"]),
         tool("set_region", "Create or update a named region (a rect the user and the AI assistant use to name a part, e.g. \"left_shoe\"). Without frame/from+to/tag the rect applies to all frames; with them only to those frames (other frames keep their rect). layer restricts it to one layer. locked protects its pixels from every edit. kind marker makes it a named point (origin, hand anchor): locked then protects only its position and name, never the pixels; it can be used as a render_animation track anchor.", meta(json!({

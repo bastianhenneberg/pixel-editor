@@ -3,6 +3,7 @@
 //! changes go through `edit`, so they are undoable steps with a
 //! description, and they respect locks.
 
+use pixel_core::transform::{transform_block, transformed_rect, Op};
 use pixel_core::{draw, Document, Rect, TRANSPARENT};
 
 use super::{EditorApp, Tool};
@@ -67,6 +68,21 @@ impl Selection {
             self.mask = None;
         }
         self
+    }
+
+    /// A selection from a box and its mask (None = the whole box).
+    pub fn with_mask(rect: Rect, mask: Option<Vec<bool>>) -> Selection {
+        Selection { rect, mask }.normalized()
+    }
+
+    pub fn mask(&self) -> Option<&[bool]> {
+        self.mask.as_deref()
+    }
+
+    /// Mirrored or rotated around the centre of its box.
+    pub fn transformed(&self, op: Op) -> Selection {
+        let mask = self.mask.as_ref().map(|m| transform_block(m, self.rect.w, self.rect.h, op));
+        Selection { rect: transformed_rect(self.rect, op), mask }
     }
 
     pub fn contains(&self, x: i32, y: i32) -> bool {
@@ -208,6 +224,8 @@ pub struct Floating {
     pub origin: Option<Rect>,
     pub layer: usize,
     pub frame: usize,
+    /// Mirrored or rotated since it was lifted or pasted.
+    pub transformed: bool,
 }
 
 /// Clipboard content: keys of a w x h block and which pixels were selected.
@@ -324,7 +342,7 @@ impl EditorApp {
         let desc = format!("Auswahl angehoben {} · {}", s.describe(), self.here());
         let pts: Vec<(i32, i32)> = s.points().collect();
         self.edit(desc, |d| d.set_points(l, f, &pts, TRANSPARENT));
-        self.floating = Some(Floating { pixels, rect: r, origin: Some(r), layer: l, frame: f });
+        self.floating = Some(Floating { pixels, rect: r, origin: Some(r), layer: l, frame: f, transformed: false });
         self.selection = Some(s);
         true
     }
@@ -374,6 +392,7 @@ impl EditorApp {
         let r = fl.rect;
         let what = self.selection.as_ref().map_or_else(|| r.describe(), |s| s.describe());
         let mut desc = match fl.origin {
+            Some(o) if o == r && fl.transformed => format!("Auswahl gedreht/gespiegelt {what} · {}", self.here()),
             Some(o) if o == r => format!("Auswahl unverändert abgelegt · {}", self.doc.frame_label(fl.frame)),
             Some(o) => format!("Auswahl verschoben um ({}, {}) {what} · {}", r.x - o.x, r.y - o.y, self.here()),
             None => format!("Eingefügt {what} · {}", self.here()),
@@ -458,8 +477,14 @@ impl EditorApp {
         };
         let (x, y) = self.selection.as_ref().map_or((0, 0), |s| (s.rect.x, s.rect.y));
         let rect = Rect::new(x, y, clip.w, clip.h);
-        self.floating =
-            Some(Floating { pixels: clip.pixels.clone(), rect, origin: None, layer: self.layer, frame: self.frame });
+        self.floating = Some(Floating {
+            pixels: clip.pixels.clone(),
+            rect,
+            origin: None,
+            layer: self.layer,
+            frame: self.frame,
+            transformed: false,
+        });
         self.selection = Some(Selection { rect, mask: clip.mask.clone() });
         if !self.tool.selects() {
             self.tool = Tool::Select;

@@ -15,6 +15,7 @@ pub mod io;
 pub mod journal;
 pub mod palettes;
 pub mod render;
+pub mod transform;
 
 pub use color::Rgba;
 pub use document::{Document, Frame, Layer, PaletteEntry, Rect, Region, Tag, SKIP, TRANSPARENT};

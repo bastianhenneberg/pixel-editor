@@ -17,7 +17,7 @@ use std::time::Instant;
 use eframe::egui::{self, Color32, Key, KeyboardShortcut, Modifiers};
 use pixel_core::{io, Document, History};
 
-use super::{canvas, follow, panels, select, timeline, EditorApp, Pending};
+use super::{canvas, follow, panels, select, timeline, transform, EditorApp, Pending};
 
 /// Declares the per-document fields once: `TabState` holds them for a
 /// background tab and `swap_tab` exchanges them with the editor's.
@@ -63,6 +63,7 @@ per_tab! {
     history: History,
     rev: u64,
     color: u8,
+    symmetry: transform::Symmetry,
     layer: usize,
     frame: usize,
     panel_frame: usize,

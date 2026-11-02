@@ -2238,3 +2238,213 @@ fn timeline_scrubbing_and_wheel() {
     wheel(&mut h, -1.0);
     assert_eq!(h.state().frame, 3);
 }
+
+// ---- mirroring, rotating, symmetric drawing --------------------------------------
+
+#[test]
+fn transform_selection_cel_frames_and_menus() {
+    let _gpu = gpu_lock();
+    let mut h = select_app();
+    let alt = |h: &mut Harness<'_, EditorApp>, k: egui::Key| {
+        h.key_press_modifiers(Modifiers::ALT, k);
+        h.step();
+    };
+    // rectangle selection over "8c" / "88", mirrored with Alt+H
+    h.key_press(egui::Key::M);
+    h.step();
+    drag_px(&mut h, (2, 2), (3, 3));
+    alt(&mut h, egui::Key::H);
+    let row = |h: &Harness<'_, EditorApp>, y: i32| (h.state().doc.get(0, 0, 2, y), h.state().doc.get(0, 0, 3, y));
+    assert_eq!((row(&h, 2), row(&h, 3)), ((b'c', b'8'), (b'8', b'8')));
+    assert!(h.state().status.starts_with("Horizontal spiegeln: Auswahl"), "{}", h.state().status);
+    h.key_press_modifiers(Modifiers::COMMAND, egui::Key::Z);
+    h.step();
+    assert_eq!(row(&h, 2), (b'8', b'c'), "one undo step");
+    // the selection tools' context menu turns it 90° clockwise
+    right_click_px(&mut h, 2, 2);
+    h.get_by_label("90° rechts drehen  (Alt+R)").click();
+    h.run_steps(1);
+    assert_eq!((row(&h, 2), row(&h, 3)), ((b'8', b'8'), (b'8', b'c')));
+    // a shaped selection (wand) keeps its shape: 180° moves only the three 8s
+    h.key_press(egui::Key::W);
+    h.step();
+    click_px(&mut h, 2, 2);
+    assert_eq!(sel_points(&h).len(), 3);
+    h.key_press_modifiers(Modifiers::ALT | Modifiers::SHIFT, egui::Key::R);
+    h.step();
+    assert_eq!((row(&h, 2), row(&h, 3)), ((TRANSPARENT, b'8'), (b'8', b'8')));
+    assert_eq!(sel_points(&h), vec![(3, 2), (2, 3), (3, 3)], "the mask turned with the pixels");
+
+    // floating pixels turn without touching the cel until they are dropped
+    h.key_press(egui::Key::M);
+    h.step();
+    drag_px(&mut h, (10, 10), (11, 10));
+    drag_px(&mut h, (10, 10), (10, 12));
+    assert!(h.state().floating.is_some());
+    alt(&mut h, egui::Key::H);
+    assert_eq!(h.state().doc.get(0, 0, 10, 10), TRANSPARENT, "lifted");
+    h.key_press(egui::Key::Enter);
+    h.step();
+    let d = &h.state().doc;
+    assert_eq!((d.get(0, 0, 10, 12), d.get(0, 0, 11, 12)), (TRANSPARENT, b'8'));
+    assert!(h.state().history.undo_steps().last().unwrap().contains("verschoben"));
+
+    // no selection: the Bild menu works on the cel, around the canvas centre
+    h.key_press_modifiers(Modifiers::COMMAND, egui::Key::D);
+    h.step();
+    menu(&mut h, "Bild");
+    h.get_by_label("Horizontal spiegeln  (Alt+H)").click();
+    h.run_steps(1);
+    assert_eq!(h.state().doc.get(0, 0, 63 - 11, 12), b'8');
+    assert!(h.state().status.starts_with("Horizontal spiegeln: Cel"), "{}", h.state().status);
+
+    // frame scope turns every layer; a locked layer is skipped and named
+    let top = h.state_mut().doc.add_layer("oben", 1);
+    h.state_mut().doc.set(top, 0, 0, 0, b'2');
+    h.state_mut().rev += 1;
+    menu(&mut h, "Bild");
+    h.get_by_label("Frame (alle Ebenen)").hover();
+    h.run_steps(3);
+    h.get_by_label("Vertikal spiegeln").click();
+    h.run_steps(1);
+    let d = &h.state().doc;
+    assert_eq!((d.get(top, 0, 0, 63), d.get(0, 0, 52, 63 - 12)), (b'2', b'8'));
+    h.state_mut().doc.layers[top].locked = true;
+    h.state_mut().doc.add_frame(1, Some(0), false).unwrap();
+    h.state_mut().doc.set_tag(pixel_core::Tag::new("walk", 0, 1)).unwrap();
+    h.state_mut().rev += 1;
+    menu(&mut h, "Bild");
+    h.get_by_label("Frames des Tags walk").hover();
+    h.run_steps(3);
+    h.get_by_label("180° drehen").click();
+    h.run_steps(1);
+    let d = &h.state().doc;
+    for f in 0..2 {
+        assert_eq!(d.get(0, f, 63 - 52, 12), b'8', "frame {f} turned");
+        assert_eq!(d.get(top, f, 0, 63), b'2', "locked layer stays on frame {f}");
+    }
+    assert!(h.state().status.contains("übersprungen: layer 1 \"oben\" is locked"), "{}", h.state().status);
+    // all frames, once more through the menu
+    menu(&mut h, "Bild");
+    h.get_by_label("Alle Frames").hover();
+    h.run_steps(3);
+    h.get_by_label("90° links drehen").click();
+    h.run_steps(1);
+    assert_eq!(h.state().doc.get(0, 1, 12, 63 - 11), b'8');
+}
+
+#[test]
+fn symmetric_drawing_with_movable_axes() {
+    let _gpu = gpu_lock();
+    let mut h = harness(EditorApp::new(None));
+    h.run_steps(3);
+    h.state_mut().color = b'2';
+    h.key_press_modifiers(Modifiers::ALT, egui::Key::S);
+    h.step();
+    assert_eq!(h.state().symmetry.mode, super::transform::SymMode::Vertical);
+    let get = |h: &Harness<'_, EditorApp>, x: i32, y: i32| h.state().doc.get(0, 0, x, y);
+    // pencil: the mirrored pixel too
+    click_px(&mut h, 1, 1);
+    assert_eq!((get(&h, 1, 1), get(&h, 62, 1)), (b'2', b'2'));
+    // rectangle: preview and result mirrored
+    h.key_press(egui::Key::U);
+    h.step();
+    drag_px(&mut h, (2, 5), (5, 8));
+    assert_eq!((get(&h, 2, 5), get(&h, 61, 5), get(&h, 58, 8)), (b'2', b'2', b'2'));
+    // line, then fill inside the left rectangle fills the right one too
+    h.key_press(egui::Key::L);
+    h.step();
+    drag_px(&mut h, (10, 3), (12, 3));
+    assert_eq!(get(&h, 53, 3), b'2');
+    h.key_press(egui::Key::G);
+    h.step();
+    h.state_mut().color = b'4';
+    click_px(&mut h, 3, 6);
+    assert_eq!((get(&h, 3, 6), get(&h, 60, 6), get(&h, 30, 30)), (b'4', b'4', TRANSPARENT));
+    // both axes: four pixels per click, the eraser too
+    h.state_mut().symmetry.mode = super::transform::SymMode::Both;
+    h.key_press(egui::Key::B);
+    h.step();
+    h.state_mut().color = b'9';
+    click_px(&mut h, 3, 20);
+    for (x, y) in [(3, 20), (60, 20), (3, 43), (60, 43)] {
+        assert_eq!(get(&h, x, y), b'9', "({x}, {y})");
+    }
+    h.key_press(egui::Key::E);
+    h.step();
+    click_px(&mut h, 60, 43);
+    assert_eq!((get(&h, 3, 20), get(&h, 60, 20)), (TRANSPARENT, TRANSPARENT));
+    // drag the vertical axis by its grip above the canvas to x = 10
+    let app = h.state();
+    let (r, cell) = (app.canvas.screen, app.canvas.screen.width() / 64.0);
+    let grip = Pos2::new(r.min.x + 32.0 * cell, r.min.y - 12.0);
+    let to = Pos2::new(r.min.x + 10.0 * cell, r.min.y - 12.0);
+    drag_screen(&mut h, grip, to);
+    assert_eq!(h.state().symmetry.x2, Some(20));
+    assert!(h.state().canvas.axis_drag.is_none());
+    h.key_press(egui::Key::B);
+    h.step();
+    click_px(&mut h, 2, 30);
+    assert_eq!((get(&h, 2, 30), get(&h, 17, 30), get(&h, 2, 33)), (b'9', b'9', b'9'));
+    // the axis through a pixel centre (typed 12.5): that column maps to itself
+    h.state_mut().symmetry =
+        super::transform::Symmetry { mode: super::transform::SymMode::Vertical, x2: Some(25), y2: None };
+    click_px(&mut h, 10, 50);
+    assert_eq!((get(&h, 10, 50), get(&h, 14, 50)), (b'9', b'9'));
+
+    // screenshot: both axes, a symmetric figure and the Bild menu
+    let d = &mut h.state_mut().doc;
+    d.set_points(0, 0, &pixel_core::draw::ellipse(31, 32, 14, 10, true), b'6');
+    d.set_points(0, 0, &pixel_core::draw::ellipse(31, 32, 14, 10, false), b'0');
+    h.state_mut().symmetry =
+        super::transform::Symmetry { mode: super::transform::SymMode::Both, x2: Some(64), y2: Some(64) };
+    h.state_mut().rev += 1;
+    h.run_steps(2);
+    menu(&mut h, "Bild");
+    h.get_by_label("Alle Frames").hover();
+    h.run_steps(3);
+    let shot = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/transform-screenshot.png");
+    h.render().unwrap().save(&shot).unwrap();
+    eprintln!("saved {}", shot.display());
+}
+
+#[test]
+fn mirrored_duplicate_opens_in_a_new_tab() {
+    let _gpu = gpu_lock();
+    let dir = scratch_dir("mirror");
+    let path = dir.join("walk_right.pxe.json");
+    let mut doc = Document::new(8, 4, Document::builtin_palette("sweetie16").unwrap()).unwrap();
+    doc.set_rows(0, 0, 0, 0, &["12".into(), "3".into()]).unwrap();
+    doc.add_frame(1, Some(0), true).unwrap();
+    doc.frames[1].duration_ms = 240;
+    doc.set_tag(pixel_core::Tag::new("walk", 0, 1)).unwrap();
+    doc.regions.push(pixel_core::Region::new("hand", pixel_core::Rect::new(0, 0, 2, 1)));
+    io::save(&doc, &path).unwrap();
+    let mut h = harness(EditorApp::new(Some(path.clone())));
+    h.run_steps(3);
+    menu(&mut h, "Bild");
+    h.get_by_label("Animation gespiegelt duplizieren…").click();
+    h.run_steps(2);
+    let want = dir.join("walk_left.pxe.json");
+    assert_eq!(h.state().mirror_dialog.as_deref(), Some(want.to_str().unwrap()));
+    h.get_by_label("Duplizieren").click();
+    h.run_steps(3);
+    let m = io::load(&want).unwrap();
+    assert_eq!(m.rows(0, 0)[..2], ["......21", ".......3"]);
+    assert!(m.layers[0].is_linked(1));
+    assert_eq!((m.frames[1].duration_ms, &m.tags), (240, &doc.tags));
+    assert_eq!(m.regions[0].rect_at(0), Some(pixel_core::Rect::new(6, 0, 2, 1)));
+    assert_eq!(io::load(&path).unwrap(), doc, "the source stays as it was");
+    assert_eq!(h.state().path.as_deref(), Some(want.as_path()), "the copy opens");
+    assert_eq!(h.state().tabs.len(), 2);
+    assert!(h.state().status.starts_with("Gespiegelt dupliziert"), "{}", h.state().status);
+    // a second copy under the same name is refused
+    menu(&mut h, "Bild");
+    h.get_by_label("Animation gespiegelt duplizieren…").click();
+    h.run_steps(2);
+    h.state_mut().mirror_dialog = Some(want.display().to_string());
+    h.get_by_label("Duplizieren").click();
+    h.run_steps(2);
+    assert!(h.state().status.contains("gibt es schon"), "{}", h.state().status);
+    std::fs::remove_dir_all(&dir).unwrap();
+}

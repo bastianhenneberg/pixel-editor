@@ -298,6 +298,8 @@ impl EditorApp {
             self.delete_selection();
             ui.close();
         }
+        ui.separator();
+        self.selection_transform_entries(ui);
         if self.floating.is_some() {
             ui.separator();
             if ui.button("Hier vorne ablegen").clicked() {
