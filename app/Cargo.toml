@@ -1,0 +1,21 @@
+[package]
+name = "pixel-editor"
+description = "Pixel-art and animation editor with an MCP server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "pixel-editor"
+path = "src/main.rs"
+
+[dependencies]
+pixel-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "wgpu", "wayland", "x11", "clipboard"] }
+rfd = "0.17"
+base64 = "0.22"
+
+[dev-dependencies]
+egui_kittest = { version = "0.37", features = ["eframe", "wgpu", "snapshot"] }

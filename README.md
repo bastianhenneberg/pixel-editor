@@ -1,0 +1,295 @@
+# pixel-editor
+
+Nativer Pixelart- und Animationseditor in Rust. Man kann ihn von Hand bedienen (Bedienkonzept wie Aseprite), und Claude kann ihn über MCP steuern. Beide arbeiten auf denselben Dateien (`.pxe.json` oder `.aseprite`). Ist eine Datei im Editor offen, sieht man Claudes Änderungen live, weil der Editor sie bei Änderungen auf der Platte neu lädt.
+
+- `core/`: Dokumentmodell (Ebenen × Frames, verknüpfte Cels, Tags), Laden/Speichern (`.pxe.json`, `.aseprite`), Zeichenfunktionen, Rendering, Undo, Exporter. Keine GUI-Abhängigkeiten.
+- `app/`: das Programm `pixel-editor` (GUI mit egui/eframe) und der MCP-Server (`pixel-editor mcp <ordner>`).
+- Dateiformat: [FORMAT.md](FORMAT.md)
+- Beispiel: `examples/schleim.pxe.json` (16×16, 4 Frames, Frame 2 mit Frame 0 verknüpft, Tag `idle` 0..3), komplett per MCP erstellt.
+
+Verhältnis zu `~/Development/pixelart-studio`: Der Editor ist die Zentrale zum Zeichnen, Ansehen, Animieren und Exportieren. `pxa` bleibt Claudes prozeduraler Generator. Palettentasten und Sheet-JSON sind kompatibel; ein PNG(-Sheet) aus `pxa` lässt sich mit `import_png` übernehmen.
+
+## Pixelgenauigkeit
+
+Nirgends wird geglättet:
+- Zoom nur in ganzen Stufen, gezählt in physischen Bildschirmpixeln. Die Leinwand liegt auf dem Pixelraster des Bildschirms, auch bei gebrochener UI-Skalierung (getestet bei 1,0 und 1,5).
+- Texturen werden mit Nearest Neighbour gezeichnet. Formvorschauen (Linie/Rechteck/Ellipse beim Ziehen) werden in die Leinwand-Textur gerechnet. Raster und Rahmen sind Meshes ohne Kantenglättung.
+- Exporte und Vorschaubilder skalieren nur ganzzahlig, und Farben bleiben exakt (GIF mit eigener Palette, `.aseprite` indiziert). Die Vorschau-Beschriftung nutzt eine eingebaute Pixelschrift.
+
+## Konsistenz: benennen, gezielt ändern, sperren, nachvollziehen
+
+Mensch und Claude sollen jedes Element genau benennen können, und Claude ändert nur das Genannte. Nichts wird „neu generiert“.
+
+- **Namen überall**: Ebenen, Frames (eindeutiger Name, zusätzlich als `<tag>/<n>` adressierbar, z. B. `walk_down/2`), Tags, Paletteneinträge (Taste + Name, z. B. `9 harness`) und Regionen. Die GUI zeigt sie in der Zeitleiste (Frame-Nummer + Name, Tag-Balken, Ebenennamen), in den Paletten-Tooltips, in den Überschriften der Eigenschaften und in der **Statuszeile**: `Frame walk_down/1 (f2) · Ebene body · x 4, y 4 · Farbe 9 harness · Region left_shoe`. Diese Zeile kann man ablesen und Claude so sagen.
+- **Regionen**: benannte Rechtecke (je Frame änderbar, optional auf eine Ebene beschränkt), als beschriftete Umrisse auf der Leinwand (abschaltbar) und in der Vorschau. In der GUI entstehen sie aus einer Auswahl („Region aus Auswahl“), per MCP mit `set_region`.
+- **Marker** (`kind: "marker"`): benannte Punkte wie `origin` oder ein Handanker, gezeigt als Fadenkreuz mit Beschriftung (der markierte Pixel bleibt sichtbar). Gesperrt schützt ein Marker nur seine Position und seinen Namen, nie die Pixel darunter. `move_region` auf einen gesperrten Marker schlägt fehl, Pixel-Schreiben dort funktioniert. In `render_animation` dient ein Marker als `track`-Anker: sein Punkt je Schritt wird verbunden. In der GUI: „als Marker“ beim Anlegen aus der Auswahl.
+- **Gezielte Änderungen (MCP)**: Jeder Schreibbefehl braucht ein ausdrückliches Ziel, also Ebene und Frame, optional eine Region oder `clip`-Rechteck. Was außerhalb läge, wird nicht geändert und gemeldet. Eine Schlussprüfung stellt sicher, dass keine andere Cel, Ebene, Palette, kein Tag und keine Region verändert wurde. Verknüpfte Cels werden nur mit `edit_linked: true` beschrieben. Jede Antwort enthält einen kompakten Diff: Anzahl, umschließendes Rechteck, Zeilen vorher/nachher. Mit `dry_run: true` wird nur gezeigt, was passieren würde.
+- **Sperren**: Ebenen, Frames und Regionen lassen sich sperren (GUI: Kästchen in der Zeitleiste bzw. Rechtsklick auf die Frame-Nummer, Häkchen bei Regionen; MCP: `locked`). Schreibversuche scheitern mit einer klaren Meldung; in der GUI malen Werkzeuge nicht in gesperrte Regionen.
+- **Verlauf**: Jede Änderung ist ein rückgängig machbarer Schritt mit Beschreibung, sichtbar im Panel „Verlauf“ (Klick auf einen älteren Schritt geht dorthin zurück). MCP-Änderungen haben eine Notiz (`note`, sonst z. B. `Claude: set_rows walk_down/2 body [left_shoe] (3x2)`). Der Editor übernimmt sie beim Neuladen als Schritt. Alles landet auch im Journal neben der Datei (`.pxe-history/`, siehe FORMAT.md): MCP `history`, `undo` (auch über GUI-Speicherungen hinweg), benannte Schnappschüsse (`snapshot`, `list_snapshots`, `diff_snapshot`, `restore_snapshot`; in der GUI „Schnappschuss … Sichern / wiederherstellen“).
+
+## Der KI live zusehen („KI folgen“)
+
+Der Editor prüft Datei und Journal etwa alle 100 ms und spielt jede neue Änderung von außen der Reihe nach ab. Schnell aufeinanderfolgende Schreibvorgänge gehen nicht verloren; jeder wird ein eigener Verlaufsschritt mit Claudes Notiz.
+
+- **Folgen** (Standard an; Schalter im Menü Ansicht und als Badge „Folgen: an/aus“ in der Statuszeile):
+  - Bei einer Änderung springt der Editor zu Frame und Ebene der Änderung.
+  - Er verschiebt die Ansicht und zoomt nur heraus, wenn nötig, damit der geänderte Bereich sichtbar ist.
+  - Die geänderten Pixel leuchten etwa 600 ms gelb auf, mit einem verblassenden Rahmen.
+  - Claudes Notiz erscheint 3 s als Banner oben auf der Leinwand und in der Statuszeile.
+- **Wer war das?** Der MCP-Server nimmt den Namen aus `clientInfo.name` beim Verbinden: `claude-code`/`claude…` → „Claude“, `codex…` → „Codex“, sonst der Name mit großem Anfangsbuchstaben, ohne Angabe „KI“. So können Claude und eine Codex-Sitzung am selben Arbeitsordner arbeiten. Der Name steht als Autor im Journal, vor den Standardnotizen („Codex: set_rows …“) und in `focus`-Bannern. Der Editor zeigt ihn im Banner, im Verlauf und im Badge („Folgen: an · Codex“).
+- **Pause**: Jede eigene Eingabe (Klick, Taste) pausiert das Folgen 5 s („Folgen: pausiert 4 s“). Der Inhalt wird trotzdem aktualisiert, nur die Ansicht springt nicht.
+- **Ungespeicherte eigene Änderungen**: Nichts wird überschrieben, wie bisher erscheint der Konflikt-Balken.
+- **MCP**:
+  - `focus(path, frame, layer?, region? | rect?, note?)` lenkt nur die Ansicht („Claude: arbeitet an fist_left“), ohne etwas zu ändern. Ist die Datei im Fenster als Hintergrund-Tab offen, wechselt das Fenster zu diesem Tab (nur bei „Folgen: an“, nicht während der Pause). Eine Datei ohne Tab öffnet `focus` nicht, dafür gibt es `open_editor`.
+  - `pace_ms` an jedem Schreibwerkzeug zeichnet die Änderung Zeile für Zeile mit dieser Pause (höchstens 48 Striche, höchstens 30 s). Man sieht sie entstehen, und am Ende ist sie ein einziger Verlaufsschritt.
+  - `open_editor(path)` öffnet die Datei als Tab im laufenden Editorfenster des Arbeitsordners („opened … as tab in the running editor (pid …)“); ist sie dort schon offen, wird ihr Tab gewählt. Nur wenn kein Fenster läuft, startet ein neues, losgelöst auf dem Bildschirm des Nutzers (siehe „Tabs“). Fehlen dem MCP-Server die Anzeige-Variablen (Claude Code startet ihn ohne), leitet der Editor sie ab: `XDG_RUNTIME_DIR` (sonst `/run/user/<uid>`), der neueste `wayland-*`-Socket darin, `HYPRLAND_INSTANCE_SIGNATURE` bei genau einer Hyprland-Instanz, `DISPLAY=:0` nur als Notlösung. Danach wartet er 1,5 s: Beendet sich der Editor in der Zeit, kommt ein Fehler mit seiner Ausgabe statt „opened“. Die Ausgabe steht in `.pxe-history/<datei>/gui.log`.
+
+## Tabs: mehrere Dateien in einem Fenster
+
+- Jede offene Datei ist ein Tab in der Menüzeile, benannt relativ zum Arbeitsordner des Fensters (`toast_warrior/walk_side`). `•` davor heißt ungespeicherte Änderungen, ein gelber Punkt dahinter: von außen geändert (z. B. von Claude) und noch nicht angesehen; der Tooltip nennt die Änderung. `×` (oder mittlere Maustaste) schließt den Tab, `+` öffnet einen leeren.
+- **Strg+Tab / Strg+Umschalt+Tab** wechseln, **Strg+W** schließt (mit ungespeicherten Änderungen kommt die bekannte Frage Speichern/Verwerfen/Abbrechen). Der letzte Tab wird beim Schließen durch ein leeres Dokument ersetzt. Beenden fragt einmal für alle Tabs mit ungespeicherten Änderungen.
+- Öffnen (Strg+O, „Öffnen über Pfad…“) und Neu (Strg+N) legen einen neuen Tab an; ein unberührter leerer Tab wird dafür wiederverwendet.
+- **Je Tab** bleiben: Frame, Ebene, Farbe, Auswahl (auch schwebend), Wiedergabe, Zoom/Ausschnitt, Verlauf mit Rückgängig, ungespeicherte Änderungen, Konflikt-Balken, Banner und Aufleuchten, Statusmeldung und die rechte Leiste samt ihrem stehenden Frame beim Abspielen. **Fürs ganze Fenster** gelten: Werkzeug, Raster/Onion Skin/Regionen/Saubere Ansicht, die Vorschau, die Zwischenablage (Kopieren zwischen Dokumenten geht), Ablegen vorne/hinten, „alle gleichfarbigen“ beim Zauberstab und „KI folgen“.
+- **Live**: Alle Tabs werden wie bisher alle 100 ms geprüft und neu geladen. Eine Änderung in einem Hintergrund-Tab holt den Tab nicht nach vorn, sie markiert ihn nur; der Tab springt dabei schon zur Stelle der Änderung, so dass man sie beim Hinsehen gleich sieht. Nur ein ausdrückliches `focus` der KI wechselt den Tab.
+- **„KI folgen“ gilt fürs ganze Fenster**, nicht je Tab: Es ist die Entscheidung, ob die Ansicht der KI hinterherläuft, und genau diese Entscheidung steuert auch den Tab-Wechsel bei `focus`. Je Tab wäre sie unsichtbar, sobald der Tab im Hintergrund liegt, und ein `focus` könnte in einen Tab wechseln, in dem das Folgen aus ist. Auch die 5-s-Pause nach eigener Eingabe gilt fürs Fenster: Wer gerade arbeitet, dem wird weder die Ansicht noch der Tab weggezogen.
+- **Ein Fenster je Arbeitsordner**: Das Fenster lauscht auf einem Unix-Socket `$XDG_RUNTIME_DIR/pixel-editor/<hash des Arbeitsordners>.sock` (sonst `/run/user/<uid>/…`). `pixel-editor open <datei>` und MCP `open_editor` suchen das Fenster vom Ordner der Datei aus nach außen (beim MCP-Server zuerst dessen Arbeitsordner) und schicken ihm die Datei; nur ohne Fenster startet ein neues mit `--workdir` (MCP: dessen Arbeitsordner; CLI: das aktuelle Verzeichnis, wenn die Datei darin liegt, sonst ihr Ordner). Ein Socket, dessen Fenster abgestürzt ist, nimmt keine Verbindung an; er wird übergangen und vom nächsten Fenster ersetzt. Ein Fenster, das gerade nicht gezeichnet wird (anderer Arbeitsbereich), antwortet nach 3 s mit „queued“ und öffnet den Tab beim nächsten Bild.
+- **Wiederherstellen**: Die offenen Tabs merkt sich der Editor je Arbeitsordner in `~/.config/pixel-editor/settings.json` und öffnet sie beim nächsten Start für denselben Ordner wieder (fehlende Dateien entfallen); die angeforderte Datei bleibt vorn.
+- `get_user_view` sieht den Tab, der vorn ist. Ein Hintergrund-Tab hat keine Ansichtsdatei.
+
+## Werkzeugleiste
+
+Links steht eine Symbolleiste mit Werkzeuggruppen wie in Photoshop: Stift, Radierer, Füllen, Linie, **Formen** (Rechteck, Ellipse), Pipette, **Auswahl-Werkzeuge** (Auswahl, Auswahl-Pinsel, Zauberstab, Lasso) und KI zeigen. Jeder Knopf zeigt das zuletzt benutzte Werkzeug seiner Gruppe; ein kleines Dreieck unten rechts heißt, dass die Gruppe mehr enthält. Klick wählt das gezeigte Werkzeug. **Rechtsklick, langes Drücken oder Klick auf das Dreieck** klappt die Gruppe auf (Symbol, Name, Kürzel); ein Klick daneben oder Esc schließt sie. Der Tooltip nennt Name und Kürzel. Darunter stehen Name und Kürzel des aktiven Werkzeugs, seine Hinweise und Einstellungen (gefüllt, Ablegen vorne/hinten, Zauberstab-Modus, Markierungsknöpfe). Das Menü **Werkzeuge** ist genauso gruppiert (Untermenüs „Formen“ und „Auswahl-Werkzeuge“).
+
+## Auswählen und Verschieben
+
+Eine Auswahl ist eine Pixelmaske: genau die gewählten Pixel, nicht ihr umgebendes Rechteck. Das Rechteck (M) ist nur eine Art, sie zu bilden. Dazu kommen **Auswahl-Pinsel** (Umschalt+M), **Zauberstab** (W) und **Lasso** (Q), in der Werkzeugpalette und im Menü Werkzeuge. Mit Umschalt kommt eine Geste zur Auswahl dazu, mit Alt oder Strg wird sie abgezogen, ohne Taste ersetzt sie die Auswahl. Der Umriss läuft an den Kanten der Maske entlang (weiß innen, schwarz außen); die Statuszeile nennt Rechteck und Pixelzahl („Auswahl x 1..6 y 0..6 (6x7), 12 Pixel“).
+
+**Auswahl-Befehle** im Menü **Auswahl** und per Rechtsklick auf die Leinwand mit einem Auswahl-Werkzeug: Auswahl aufheben (Strg+D), Alles auswählen (Strg+A), Auswahl umkehren (Strg+Umschalt+I), Ausschneiden, Kopieren, Einfügen, Löschen und, solange Pixel schweben, „Hier vorne ablegen“ / „Hier hinten ablegen“ (einmalig, der eingestellte Modus bleibt). Beim Auswahl-Pinsel öffnet nur ein Rechtsklick ohne Ziehen das Menü; Ziehen mit der rechten Taste nimmt Pixel heraus, einzelne Pixel nimmst du mit Alt+Klick (oder Strg+Klick) heraus.
+
+Verschieben (in der Auswahl ziehen oder Pfeiltasten), Strg+C/X/V, Entf und Enter wirken nur auf die gewählten Pixel; alles andere im Rechteck bleibt, wo es ist. Beim Kopieren wandert die Form mit, eingefügt wird wieder genau diese Form.
+
+**Ablegen: Vorne / Hinten** (Werkzeugfeld bei den Auswahl-Werkzeugen und beim Verschieben, Menü Werkzeuge, **Umschalt+H**):
+- **Vorne** (Standard): die verschobenen Pixel überdecken, was dort ist; transparente verschobene Pixel lassen das Darunterliegende stehen.
+- **Hinten**: die verschobenen Pixel füllen nur Stellen, die auf der Ebene leer sind. Sie landen also hinter dem Bestehenden.
+
+Die Vorschau beim Verschieben zeigt schon das Ergebnis im gewählten Modus. Esc legt die Pixel unverändert an ihren Ursprung zurück. Im Verlauf steht beim hinten Abgelegten „· hinten“.
+
+## Was du gerade ansiehst: `get_user_view`
+
+Die KI (Claude, Codex …) sieht deinen Bildschirm nicht. Damit „das hier“ oder „die Auswahl“ trotzdem eindeutig ist, schreibt der Editor laufend auf, was er zeigt, und die KI liest das mit dem MCP-Werkzeug `get_user_view`.
+
+- **Ansichtsdatei**: Jeder laufende Editor schreibt `.pxe-history/<datei>/views/<pid>.json` neben das offene Dokument. Eine Datei je Prozess, mehrere offene Editoren stören sich also nicht. Geschrieben wird bei jeder Änderung, höchstens 5-mal pro Sekunde, und sonst einmal pro Minute als Lebenszeichen. Beim Schließen oder beim Wechsel zu einem anderen Dokument verschwindet die Datei.
+- **Inhalt**: Dokument, Frame (Index, Name, `tag/n`-Adresse), Ebene (Index, Name), Auswahl (Rechteck der Auswahl und, bei einer geformten Auswahl, welche Pixel darin gewählt sind), das Pixel unter dem Mauszeiger (x, y, Taste, Farbname, sichtbare Farbe, Regionen dort), Zoom, Werkzeug, ob „KI folgen“ an ist, ob es ungespeicherte Änderungen gibt, Zeitstempel und pid.
+- **Werkzeug „KI zeigen“ (K)**: in der Werkzeugleiste (blaues Symbol) und im Menü **Werkzeuge**. Damit setzt du beliebig viele nummerierte Markierungen, auf jedem Frame, jeweils mit einer Notiz für die KI:
+  - **Ziehen** auf freier Fläche markiert einen Bereich, ein **Klick** ein Pixel. Jede Markierung kommt dazu (#1, #2, … je Dokument), keine ersetzt eine andere. Pixel und Auswahl bleiben, wie sie sind.
+  - Danach öffnet sich unter der Markierung ein kleines Textfeld: Notiz tippen („brauner Block weg“), **Enter** oder ein Klick daneben speichert sie. Leer lassen geht auch. Ein Klick daneben schließt nur das Feld und setzt keine neue Markierung.
+  - **Klick in eine Markierung** wählt sie aus und öffnet ihre Notiz zum Ändern. **Ziehen im Inneren** verschiebt sie, **Ziehen an Ecken und Kanten** (weiße Griffe der ausgewählten Markierung) ändert die Größe. Esc hebt die Auswahl auf.
+  - **Rechtsklick** auf eine Markierung entfernt nur diese.
+- **KI zeigen ohne Werkzeug** (Knopf in der Statuszeile, Menü Werkzeuge oder Ansicht, **Strg+Umschalt+K**, auch während ein Textfeld den Cursor hat): fügt eine Markierung für die aktuelle Auswahl oder, ohne Auswahl, für den ganzen Frame hinzu.
+- **Anzeige**: Die Markierungen des aktuellen Frames sind hellblau umrandet und mit Nummer und gekürzter Notiz beschriftet („#1 brauner Block weg“). Markierungen anderer Frames erscheinen nicht auf der Leinwand; dafür zeigt die Zeitleiste über jedem Frame mit Markierungen einen blauen Punkt mit ihrer Anzahl (Tooltip: „2 KI-Markierungen“). Die Saubere Ansicht blendet alles aus.
+- **Entfernen**: Rechtsklick (eine), „KI-Markierungen dieses Frames entfernen“ und „Alle KI-Markierungen entfernen“ in den Menüs Werkzeuge/Ansicht, „Frame: N entfernen“ / „Alle N entfernen“ unter dem Werkzeug, „KI-Markierungen (N) ×“ in der Statuszeile (alle). Sind alle weg, beginnt die Nummerierung wieder bei 1.
+- **Speicherort**: je Dokument (also je Tab) in `.pxe-history/<datei>/marks.json`. Sie bleiben, auch wenn der Editor geschlossen wird, und der Editor lädt sie beim Öffnen wieder. Ändert die KI sie (`clear_marks`), aktualisiert sich der offene Editor sofort. Eine alte `pointer.json` (früher: ein einzelner Zeiger) wird beim Lesen als Markierung #1 übernommen.
+- Kommt eine Taste nicht an: `PIXEL_EDITOR_DEBUG_KEYS=1 pixel-editor …` schreibt jede empfangene Taste mit Modifikatoren nach stderr (bei `open` in `gui.log`).
+- **`get_user_view`** (ohne Argumente) liefert:
+  - für jeden lebenden Editor auf einem Dokument im Arbeitsordner die Ansicht, neueste zuerst. Ansichtsdateien von beendeten Prozessen oder ohne Lebenszeichen seit 10 Minuten werden ignoriert und gelöscht.
+  - bei einer Auswahl zusätzlich die ausgewählten Pixel, genau wie `get_rows` für ihr Rechteck auf diesem Frame und dieser Ebene. Bei einer geformten Auswahl (Zauberstab, Auswahl-Pinsel, Lasso, zusammengesetzt) steht `·` für nicht ausgewählte Pixel im Rechteck, dazu die Zahl der gewählten Pixel;
+  - alle „KI zeigen“-Markierungen jedes Dokuments im Arbeitsordner (auch wenn kein Editor mehr darauf offen ist), nach Frame gruppiert: Nummer, Frame (Adresse, Index, Name), Rechteck oder „the whole frame“, Ebene, Alter, Notiz und die Pixel des Bereichs. Hat die KI sie erledigt, entfernt sie sie mit `clear_marks`;
+  - einen deutlichen Hinweis, wenn kein Editor offen ist.
+- **Ungespeicherte Änderungen**: Die KI liest und schreibt die Datei. Hast du ungespeicherte Änderungen, sagt `get_user_view` das ausdrücklich, weil die Pixel aus der Datei dann von deinem Bildschirm abweichen können.
+- Ein neues, noch nie gespeichertes Dokument hat keine Datei, also auch keine Ansicht für die KI („KI zeigen“ bittet dann ums Speichern). Dokumente außerhalb des Arbeitsordners des MCP-Servers sieht die KI ebenfalls nicht.
+
+## Bauen
+
+Rust ist per rustup im Benutzerverzeichnis installiert (`~/.cargo/bin`).
+
+```sh
+cd ~/Development/pixel-editor
+cargo build --release          # Binary: target/release/pixel-editor
+cargo test                     # Kern-, MCP- und GUI-Tests (GUI offscreen über wgpu)
+```
+
+Zusätzliche Systempakete waren nicht nötig. Gerendert wird mit wgpu (Vulkan). Das OpenGL-Backend (glow) scheitert auf diesem Rechner unter nativem Wayland mit `glutin error: [3003]` (EGL_BAD_ALLOC, NVIDIA). Die GUI-Tests laufen nacheinander (eine Sperre in den Tests), weil mehrere parallel erzeugte wgpu-Geräte hier hängen blieben.
+
+## Starten
+
+```sh
+target/release/pixel-editor                        # leeres 64×64-Dokument
+target/release/pixel-editor figur.pxe.json         # öffnen (oder neu anlegen, wenn sie fehlt)
+target/release/pixel-editor figur.aseprite         # Aseprite-Datei öffnen; Speichern schreibt wieder .aseprite
+target/release/pixel-editor open figur.pxe.json    # als Tab ins laufende Fenster des Arbeitsordners, sonst neues Fenster (losgelöst)
+target/release/pixel-editor --workdir art art/held/walk.pxe.json   # Fenster mit Arbeitsordner (Tab-Namen, `open`)
+target/release/pixel-editor mcp ~/Development/pixel-art    # MCP-Server für diesen Ordner
+target/release/pixel-editor export figur.pxe.json godot [ausgabeordner] [--scale N] [--godot-res-dir res://…]
+target/release/pixel-editor preview figur.pxe.json vorschau.png [--zoom 8] [--frame f0]
+target/release/pixel-editor render-animation figur.pxe.json walk_down anim.png [--region NAME|x,y,w,h] [--track NAME|x,y,w,h] [--zoom N] [--jump 2]
+```
+
+## Bedienung
+
+Aufbau wie in Aseprite: links Werkzeuge und Palette, in der Mitte die Leinwand, rechts die Eigenschaften (Ebene, Frame/Cel, Tag), unten die **Zeitleiste**:
+
+- ein Raster aus Ebenen (Zeilen, oberste Ebene oben; links Sichtbarkeit, Sperre, Name) × Frames (Spalten; Nummer und Name, gesperrte Frames rot). Ein Punkt heißt: die Cel hat Pixel; ein Kreis: sie ist leer. Ein Ring markiert verknüpfte Cels, eine Linie verbindet benachbarte verknüpfte Cels.
+- darüber die Tags als farbige Bereiche mit Richtungszeichen (`>` vorwärts, `<` rückwärts, `<>` Ping-Pong, `><` Ping-Pong rückwärts); sich überlappende Tags liegen in eigenen Spuren.
+- **Scrubben**: linke Maustaste auf einer Frame-Nummer (oder einer Cel) drücken und nach links/rechts ziehen: der aktuelle Frame folgt der Spalte unter dem Mauszeiger, live auf Leinwand und rechter Leiste. Läuft die Wiedergabe, hält sie an und bleibt danach angehalten. Das Mausrad über den Frame-Nummern (und Tags/Vorschaubildern) geht je Raste einen Frame vor oder zurück; über den Cels scrollt es wie bisher.
+- Frame-Nummern und Vorschaubilder (abschaltbar). Klick auf eine Cel wählt Ebene und Frame, auf einen Tag wählt ihn für Wiedergabe und Bearbeitung, auf den Punkt links schaltet die Ebene sichtbar/unsichtbar. Rechtsklick auf eine Cel: Verknüpfung lösen, mit vorherigem Frame verknüpfen, leeren.
+
+Tastenkürzel (soweit sinnvoll wie in Aseprite):
+
+| Taste / Maus | Funktion |
+|---|---|
+| B / E / G / I / L / U / Umschalt+U / M / Umschalt+M / W / Q / K | Stift / Radierer / Füllen / Pipette / Linie / Rechteck / Ellipse / Auswahl / Auswahl-Pinsel / Zauberstab / Lasso / KI zeigen (auch im Menü Werkzeuge) |
+| Auswahl (M): ziehen | Rechteck auswählen; in der Auswahl ziehen oder Pfeiltasten (Umschalt = 8 px) verschieben die Pixel; Enter legt ab, Esc bricht ab |
+| Auswahl-Pinsel (Umschalt+M) | Klicken oder Ziehen malt einzelne Pixel in die Auswahl; Alt/Strg+Klick oder Ziehen mit der rechten Taste nimmt sie heraus; Rechtsklick ohne Ziehen öffnet das Auswahl-Menü |
+| Zauberstab (W) | Klick wählt die zusammenhängende Fläche gleicher Farbe auf der Ebene (4 Nachbarn); Schalter „alle gleichfarbigen“ im Werkzeugfeld und im Menü Werkzeuge; in der Auswahl ziehen verschiebt sie |
+| Lasso (Q) | Umriss frei ziehen; gewählt wird alles innerhalb und auf dem Umriss |
+| Umschalt / Alt oder Strg beim Auswählen | bei Rechteck, Zauberstab und Lasso: zur Auswahl hinzufügen / von ihr abziehen; ohne Taste ersetzt die Geste die Auswahl |
+| Umschalt+H | Ablegen „Vorne“/„Hinten“ umschalten (auch im Werkzeugfeld und im Menü Werkzeuge), siehe unten |
+| Strg+C / Strg+X / Strg+V | Auswahl kopieren / ausschneiden / einfügen (schwebend, verschiebbar, Enter legt ab) |
+| Strg+A / Strg+D / Strg+Umschalt+I / Entf | alles auswählen / Auswahl aufheben / Auswahl umkehren / Auswahl löschen (auch im Menü Auswahl und per Rechtsklick auf die Leinwand) |
+| Linksklick | mit der gewählten Farbe zeichnen |
+| Rechtsklick | mit Transparenz zeichnen (bei jedem Werkzeug) |
+| Alt + Klick | Farbe aufnehmen |
+| Mausrad | zoomen in ganzen Stufen, um den Mauszeiger herum |
+| Mittlere Maustaste / Leertaste + ziehen | verschieben |
+| + / − / 0 | zoomen / einpassen |
+| Strg+' | Pixelraster an/aus (hellere Linie alle 8 px) |
+| F3 | Onion Skin (vorheriger Frame rot, nächster blau, hinter dem aktuellen) |
+| H | Saubere Ansicht: Raster, Regionen samt Namen, Marker, Auswahlrahmen, Onion Skin, Aufleuchten und Banner von Claude, Mauszeiger-Kästchen und Leinwandrahmen auf einmal aus und wieder an. Die einzelnen Schalter (z. B. Raster) bleiben, wie du sie gesetzt hast. Auch per Knopf in der Statuszeile („Saubere Ansicht: an“) und im Menü Ansicht |
+| P | Vorschau ein/aus: kleines Fenster oben rechts über der Leinwand mit dem aktuellen Frame, ohne jede Einblendung, in 1×/2×/3× (echte Bildschirmpixel), Hintergrund Schachbrett/Dunkel/Hell; „Tag abspielen“ spielt den Tag des aktuellen Frames in Echtzeit als Schleife ab. Verschiebbar (an der Titelleiste) und einklappbar; Lage, Maßstab, Hintergrund, eingeklappt und an/aus merkt sich der Editor in `~/.config/pixel-editor/settings.json`. Zeigt Claudes Änderungen sofort mit |
+| Enter | Abspielen/Pause (gewählter Tag oder alle Frames, mit Richtung und Loop); bei schwebender Auswahl: ablegen |
+| Alt+, / Alt+. (auch , / . und ← / →) | vorheriger / nächster Frame |
+| ↑ / ↓ | Ebene darüber / darunter |
+| Alt+N / Alt+B / Alt+C | neuer Frame (Kopie) / neuer leerer Frame / Frame löschen |
+| Umschalt+N | neue Ebene |
+| Strg+Z / Strg+Umschalt+Z (oder Strg+Y) | Rückgängig / Wiederholen |
+| Strg+N / Strg+O / Strg+S / Strg+Umschalt+S | Neu / Öffnen (beide im neuen Tab) / Speichern / Speichern unter |
+| Strg+Tab / Strg+Umschalt+Tab / Strg+W | nächster / vorheriger Tab / Tab schließen |
+| Strg+Umschalt+K | KI zeigen: Auswahl oder Frame als weitere Markierung für die KI hinzufügen (`get_user_view`) |
+
+- **Neu** bietet die Vorlagen Figur 48×48, Tile 32×32 und 16×16 sowie eine eingebaute Palette.
+- **Zeitleisten-Leiste**: Abspielen, Animation (Tag) wählen, Onion Skin, Vorschaubilder; Frame: `+ Neu` (Kopie), `+ Leer`, `+ Verknüpft` (neuer Frame mit verknüpften Cels), Löschen, `<`/`>` verschieben; Ebene: Neu, Löschen, Hoch, Runter.
+- **Eigenschaften**: Ebene (Name, sichtbar, gesperrt, Deckkraft), Frame (Name, Dauer, „für alle“, gesperrt, Status der Cel: leer, eigenständig oder verknüpft mit Frames …, „Verknüpfung lösen“, „Mit vorherigem Frame verknüpfen“), Tag (Name, Bereich, Richtung, Loop, Farbe; „Übernehmen“, „Löschen“, „Neu“; **Folge** für eine beliebige Reihenfolge wie `0 1 0 2`, angelegt als verknüpfte Frames, damit der Tag ein Bereich bleibt wie in Aseprite), Regionen (Liste mit Rechteck im aktuellen Frame, Sperre, Löschen; Klick übernimmt sie als Auswahl; neue Region aus der Auswahl, auf Wunsch nur für diesen Frame), Verlauf (Schritte mit Beschreibung, Rückgängig/Wiederholen, Schnappschüsse).
+- **Palette**: Klick wählt, Name der Farbe, Farbe ändern (Farbwähler oder Hex-Feld), „+ Farbe“, „Entfernen“ (betroffene Pixel werden transparent). Tooltips zeigen Taste, Name und Farbwert.
+- **Öffnen/Speichern** nutzt den Dateidialog des Systems (xdg-portal) für `.pxe.json` und `.aseprite`. Ohne Portal oder bei Abbruch erscheint ein eigener Pfad-Dialog.
+- **Live-Neuladen**: etwa alle 0,3 s. Ein Neuladen lässt sich mit Strg+Z zurücknehmen. Bei ungespeicherten eigenen Änderungen wird nichts überschrieben, ein Hinweisbalken fragt nach.
+- **Export** (Menü): PNG-Sheet, Godot, Unity, GIF, Aseprite nach `<Ordner des Dokuments>/export/<name>/`.
+
+## MCP-Server
+
+`pixel-editor mcp <arbeitsordner>` spricht MCP (JSON-RPC 2.0, eine Nachricht pro Zeile über stdin/stdout). Pfade sind relativ zum Arbeitsordner, Pfade außerhalb werden abgelehnt. Die Endung darf man weglassen (`"path": "held"` findet `held.pxe.json` oder `held.aseprite`). Ebenen und Frames gehen per Index oder Name, Standard ist jeweils 0.
+
+Konfiguration für Claude Code (`.mcp.json` im Projekt):
+
+```json
+{
+  "mcpServers": {
+    "pixel-editor": {
+      "command": "/home/bastian/Development/pixel-editor/target/release/pixel-editor",
+      "args": ["mcp", "/home/bastian/Development/pixel-art"]
+    }
+  }
+}
+```
+
+oder `claude mcp add pixel-editor -- /home/bastian/Development/pixel-editor/target/release/pixel-editor mcp /home/bastian/Development/pixel-art` (der Arbeitsordner muss existieren; `pixel-art` ist nur ein Beispiel).
+
+### Für Claude gedacht
+
+- **Lesen in Tastenzeilen**: `get_document` liefert eine Übersicht: Palette mit Namen, Ebenen mit Sperren, Frames mit ihren `tag/n`-Adressen, Tags samt Abspielreihenfolge und Regionen. Dazu je Cel die Pixel als Zeilen von Palettentasten, auf den Inhalt zugeschnitten, mit Lineal und Zeilennummern in absoluten Koordinaten. `get_rows` liest ein Rechteck oder eine Region einer Ebene oder, mit `composite: true`, des sichtbaren Gesamtbilds, samt Legende der benutzten Farben.
+- **Schreiben mit Ziel**: `layer` und `frame` sind Pflicht, `region` oder `clip` grenzen weiter ein. `set_rows` beginnt ohne x/y an der Ecke der Region. Farben gehen per Taste oder Name (`"key": "harness"`).
+- **Genaue Fehler**: Unbekannte Argumente werden mit der Liste der gültigen abgelehnt (z. B. `colour`). Fehlende Pflichtargumente werden benannt. Ungültige Tasten werden mit Position gemeldet (`rows[1][1] (x=2, y=3)`, `pixels[4]`). Unbekannte Ebenen, Frames, Tags und Regionen werden mit der Liste der vorhandenen gemeldet. Gesperrte Ziele und verknüpfte Cels werden mit dem Weg zur Lösung gemeldet. Bei einem Fehler wird nichts geschrieben.
+- **Diff statt Vertrauen**: Jede Schreibantwort enthält die geänderten Pixel, das Rechteck und die Zeilen vorher/nachher sowie den Verlaufseintrag; `dry_run` zeigt das, ohne zu schreiben.
+- **`render_preview`**: wie die Vorschau von pixelart-studio. Je Frame gibt es eine Beschriftung (Index, Name, ms, Tags, LINK), Koordinatenlineale, das gezoomte Bild mit Raster (heller alle 8 px), Regionen als beschriftete Umrisse (gesperrte gestrichelt) sowie 1×/2×-Vorschauen; unten die Palette mit Tasten. Das PNG wird nach `preview/` geschrieben und direkt als Bild zurückgegeben.
+
+### Werkzeuge
+
+| Werkzeug | Zweck |
+|---|---|
+| `list_documents` | `.pxe.json`/`.aseprite` im Arbeitsordner mit Tags und Regionen |
+| `create_document(name, width, height, palette?, layer_name?, …)` | neues Dokument; Palette als Name oder Liste `{key, color, name?}` |
+| `get_document(path, layer?, frame?, pixels?, crop?)` | Übersicht + Tastenzeilen |
+| `get_rows(path, layer?, frame?, region? \| x/y/w/h, composite?)` | Ausschnitt lesen |
+| `set_pixels`, `set_rows`, `draw_line`, `draw_rect`, `draw_ellipse`, `fill`, `clear` | Pixel schreiben; immer `layer` + `frame`, optional `region`/`clip`, `edit_linked`, `dry_run`, `note` |
+| `copy_region`, `move_region(region \| clip, dx?, dy?, to_frame?, to_layer?, mode?)` | Bereich kopieren/verschieben, auch in andere Frames/Ebenen; `move_region` verschiebt das Rechteck der Region auf diesem Frame mit |
+| `list_regions`, `set_region(name, kind?, x/y/w/h, frame? \| from/to \| tag, layer?, locked?, color?, hide?, rename?)`, `delete_region` | Regionen und Marker (`kind: "marker"`, nur x/y) |
+| `add_layer`, `set_layer(…, locked?)`, `delete_layer` | Ebenen |
+| `add_frame(copy_from?, linked?, …)`, `delete_frame`, `set_frame_duration`, `set_frame(name?, duration_ms?, locked?, move_to?)`, `link_cel` | Frames und verknüpfte Cels |
+| `set_tag(name, from/to \| frames, direction?, loop?, color?, delete?)` | Tags (Bereich + Richtung; `frames` in beliebiger Reihenfolge über verknüpfte Frames) |
+| `set_palette_color(key, color?, name?, remove?)` | Palette mit Namen |
+| `render_preview(path, frame? \| frames?, layer?, zoom?, grid?, regions?, inline?)` | Vorschau ansehen |
+| `render_animation(path, tag, region?, track?, zoom?, jump_threshold?, inline?)` | Animation als Standbild prüfen (siehe unten) |
+| `history`, `undo(steps?)`, `snapshot(name, note?)`, `list_snapshots`, `diff_snapshot(name, layer?, frame?)`, `restore_snapshot(name)` | Verlauf und Schnappschüsse |
+| `focus(path, frame, layer?, region? \| rect?, note?)`, `open_editor(path)`; `pace_ms` an Schreibwerkzeugen | live zusehen (siehe „KI folgen“) |
+| `get_user_view` | was im Editor gerade offen und ausgewählt ist, samt Pixeln der Auswahl und allen „KI zeigen“-Markierungen mit Notizen (siehe „Was du gerade ansiehst“) |
+| `clear_marks(path, frame?, numbers?)` | „KI zeigen“-Markierungen entfernen: alle des Dokuments, nur die eines Frames oder bestimmte Nummern |
+| `export(path, target, …)` | `png_sheet`, `godot`, `unity`, `gif`, `aseprite` |
+| `save_as(path, to)`, `import_png(…)` | Umwandeln / PNG übernehmen |
+
+Strukturänderungen (Ebenen, Frames, Tags, Palette, Regionen) haben ebenfalls `dry_run` und `note`, werden protokolliert und antworten mit einer Zusammenfassung der Änderungen.
+
+### Animationen prüfen: `render_animation`
+
+Claude sieht nur Standbilder. `render_animation` macht deshalb aus einem Tag ein Prüfbild und eine Analyse (MCP-Werkzeug und CLI `render-animation`).
+
+- **Filmstreifen** in echter Abspielreihenfolge (Richtung und Ping-Pong ausgeschrieben). Jede Zelle ist beschriftet mit Schritt, Frame-Name, ms und geänderten Pixeln. Bei Loops folgt nach dem letzten Schritt noch einmal Schritt 0 („loop -> 0“), damit Sprünge an der Nahtstelle sichtbar werden.
+- Eine **rot gestrichelte Linie** zeigt die unterste deckende Zeile des ersten Schritts (Bodenlinie).
+- **Onion-Zeile**: vorheriger Schritt kühl getönt mit etwa 35 %, aktueller warm getönt darüber.
+- **Differenz-Zeile**: geänderte Pixel magenta über dem abgedunkelten Bild. Passen die meisten Pixel zum vorherigen Schritt, wenn man ihn um (dx, dy) verschiebt (z. B. das Wippen des Körpers), wird gegen den verschobenen Schritt verglichen. Die Zelle zeigt dann „moved dx,dy chg N“, und es bleibt nur die echte Änderung sichtbar (etwa nur der Fuß, der sich bewegt).
+- **`region`** (Name, „x,y,w,h“ oder {x,y,w,h}) zeigt nur diesen Bereich, vergrößert. **`track`** markiert per Schritt das Rechteck der deckenden Pixel im Bereich (cyan) und verbindet die Mittelpunkte (gelb), z. B. Füße, Kopf oder Schwertspitze.
+- **Textauswertung**: je Schritt geänderte Pixel, Verschiebung der Silhouette (oben/unten/links/rechts) und die Ausrichtung; dazu die Gesamtdauer, die Track-Mittelpunkte und Warnungen:
+  - Bodenlinie ändert sich
+  - Silhouette springt um mehr als `jump_threshold` px (Standard 2)
+  - isolierte Pixel ohne deckenden Nachbarn
+  - neue verwaiste Pixel ohne 4-Nachbarn gleicher Taste (verglichen mit dem vorherigen Schritt an der verschobenen Position)
+  - Schritte, die mit dem vorherigen identisch sind
+
+Das PNG landet in `preview/<name>_<tag>_anim.png` und wird direkt als Bild zurückgegeben.
+
+## Exporte
+
+Sheets enthalten die Frames in Reihenfolge (höchstens 16 pro Reihe, über `columns` einstellbar). Frames mit identischem Bild (z. B. verknüpfte) teilen sich einen Bereich im Sheet. Unsichtbare Ebenen werden nicht exportiert. Ohne Tags entsteht eine Animation `default` über alle Frames. Tag-Richtungen werden in die Frame-Folge ausgeschrieben (Ping-Pong 0 1 2 1, rückwärts 2 1 0).
+
+- **png_sheet**: `<name>.png` + `<name>.json` in der Form der `*_sheet.json` von pixelart-studio.
+- **godot**: `<name>.png` + `<name>.tres` (SpriteFrames, Godot-4-Textformat), eine Animation je Tag mit Loop-Flag. Die Zeiten bleiben exakt: `speed` = 1000 / Basisdauer, `duration` je Frame = ms / Basisdauer. Standardmäßig verweist die `.tres` relativ auf die PNG; mit `godot_res_dir` auf einen festen `res://`-Pfad. In Godot für Pixelart die Texturfilterung auf *Nearest* stellen.
+- **unity**: `<name>.png` + `.png.meta` (Sprite Mode *Multiple*, Filter *Point*, Kompression *None*, keine Mipmaps, 32 Pixels per Unit) + `<name>.anim.json` mit Sprite-Namen (`<tag>_<n>`) und Zeiten. GUIDs und IDs sind aus den Namen berechnet und bleiben bei erneutem Export gleich.
+- **gif**: `<name>_<animation>.gif` je Animation, Standard 4×, echte Transparenz, exakte Farben (bis 255), Dauer auf 10 ms gerundet (GIF-Grenze).
+- **aseprite**: `<name>.aseprite` (indiziert, oder `color_mode: "rgba"`) mit Ebenen, Frames, Dauern, verknüpften Cels, Tags (Richtung, Loop, Farbe) und Palette (Tasten als Eintragsnamen). Ebenso direkt über „Speichern unter“ mit Endung `.aseprite`.
+
+### Was geprüft ist und was nicht
+
+- **Godot**: mit Godot 4.7.2 headless in einem Wegwerf-Projekt geprüft. Import ohne Fehler, `load()` der `.tres` mit relativem und mit `res://`-Pfad, Regionen, Loop-Flags, Ping-Pong-Folge, Millisekunden je Frame, Pixelfarben. Godot 4.6 selbst ist nicht installiert; das Format (`format=3`) ist dasselbe.
+- **Aseprite**: Aseprite ist nicht installiert. Geprüft wurden Hin- und Rückweg mit dem eigenen Leser (Pixel identisch, samt Ebenensperre, Palettennamen und Regionen ↔ Slices) und das Lesen der Exporte mit einem unabhängigen Parser, dem Rust-Crate `asefile` (MIT, nur Test-Abhängigkeit). Für indizierte und RGBA-Dateien stimmen dort Größe, Ebenen, Sichtbarkeit, Dauern, Tags, aufgelöste Link-Cels und exakte Pixelfarben. `asefile` 0.3 kennt die Richtung „Ping-Pong rückwärts“ (Aseprite 1.3) noch nicht; das ist dort nicht geprüft. Echte, mit Aseprite erzeugte Dateien lagen nicht vor. Der Import ist nur gegen eigene Dateien und die Beschreibung getestet.
+- **Unity**: **nicht geprüft**, Unity ist nicht installiert. Die `.meta` folgt dem Aufbau von Unity 2022/6000.
+- **GIF / PNG-Sheet**: Dauern, Transparenz, Farben und JSON-Aufbau geprüft.
+- **GUI**: per egui_kittest offscreen geprüft, mit echten Maus- und Tastaturereignissen. Getestet sind:
+  - Stift, Rückgängig/Wiederholen, Rechteck, Füllen, Aseprite-Kürzel
+  - verknüpfter Frame, Wiedergabe, Live-Neuladen samt Journal-Beschreibung, Öffnen/Speichern von `.aseprite`
+  - Pixelgenauigkeit der Leinwand
+  - Namen in der Statuszeile und im Verlauf, Sperren (Ebene, gesperrte Region)
+  - Auswahl verschieben/Pfeiltasten/Kopieren/Einfügen in anderen Frame, Region aus Auswahl, Tag als Folge
+  - Werkzeugleiste: Gruppenknöpfe, Aufklappen per Rechtsklick, Pfeil und langem Drücken, Gruppe merkt sich das letzte Werkzeug, Untermenüs im Menü Werkzeuge; Bild in `target/toolbar-screenshot.png`
+  - Strg+A, Strg+D, Strg+Umschalt+I (hin und zurück), Kontextmenü der Leinwand und Menü Auswahl, „Hier hinten ablegen“
+  - Pixel-Auswahl: Zauberstab (auch „alle gleichfarbigen“), Auswahl-Pinsel (Ziehen mit rechts, Alt, Strg nehmen heraus; Rechtsklick öffnet das Menü), Rechteck und Lasso mit Umschalt/Alt/Strg, Umriss entlang der Maske, Verschieben einer geformten Auswahl (Pixel außerhalb bleiben), Ablegen vorne und hinten samt Vorschau, Pfeile und Esc, Kopieren/Einfügen/Ausschneiden/Entf mit Maske; `get_user_view` mit `·` für nicht gewählte Pixel
+  - Tabs: öffnen, wechseln (Strg+Tab, Klick), schließen mit Rückfrage, eigener Zustand je Tab, Markierung bei Änderung im Hintergrund ohne Tab-Wechsel, `focus` wechselt den Tab, Öffnen aus einem anderen Prozess über den Socket (`open`/`open_editor`), Wiederherstellen; Bild der Tab-Leiste in `target/tabs-screenshot.png`
+  - Zeitleiste scrubben (Ziehen über die Nummern und Cels, Pause, Klemmen am Rand, Klick wählt weiter), Mausrad über den Nummern
+  - KI-Markierungen: mehrere per Ziehen und Klick, Notiz tippen und mit Enter speichern, Klick daneben schließt nur das Notizfeld, Klick hinein wählt aus und ändert die Notiz, verschieben, Größe an Kante und Ecke, Rechtsklick entfernt eine, Menü „dieses Frames“, Statuszeile „alle“, andere Frames nicht auf der Leinwand aber in der Zeitleiste, eigene Markierungen je Tab, Strg+Umschalt+K auch mit Fokus in einem Textfeld, Übernahme einer alten `pointer.json`, Neuladen nach `clear_marks`; Bild in `target/marks-screenshot.png`. Am echten Bildschirm wurde die Oberfläche bisher nicht bedient.
+
+Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen nach `target/gui-screenshot.png`. Mit sichtbarem Fenster: `PIXEL_EDITOR_SCREENSHOT=/pfad/bild.png pixel-editor datei.pxe.json` speichert nach 2 s (`PIXEL_EDITOR_SCREENSHOT_DELAY`) ein Bild des eigenen Fensters und beendet das Programm.
+
+## Für Claude: Arbeitsweise
+
+1. `create_document` (Figuren 48×48, Begleithund 48×36, Schleim 32×32, Tiles 32×32, Angriffe größer wie 104×56 oder 80×96 mit gesperrtem Marker `origin` an den Füßen; ein Dokument je Animation, ein Ordner je Figur; Spiel-Viewport 640×360), Farben und Ebenen benennen, Teile als Regionen anlegen (`set_region`).
+2. Flächen mit `set_rows`, Formen mit `draw_*`/`fill`, Details mit `set_pixels`, immer mit Ziel (Ebene, Frame, Region).
+3. Den zurückgegebenen Diff prüfen, `render_preview` ansehen, mit `get_rows` Details prüfen. Bei Korrekturwünschen nur die genannte Region ändern; vor größeren Umbauten `snapshot`.
+4. Animation: `add_frame(copy_from)` + kleine Änderungen. Bezieht sich der Nutzer auf „das hier“, erst `get_user_view` aufrufen. Wiederkehrende Frames mit `linked: true` anlegen, dann `set_frame_duration` und `set_tag` (Bereich + Richtung).
+5. `export` (für das Testspiel `godot`), für Aseprite-Nutzer `aseprite`.
+
+## Bekannte Grenzen
+
+- Kein Spiegeln/Drehen der Auswahl, keine Spiegelsymmetrie beim Zeichnen.
+- Zeitleiste: Frames werden per Knopf verschoben, nicht per Ziehen. Die Ebenennamen-Spalte scrollt horizontal mit.
+- Keine Ebenengruppen, Blend-Modi, Cel-Deckkraft oder Tilemaps (beim Aseprite-Import gemeldet). Frame-Namen und -Sperren gehen beim Umweg über `.aseprite` verloren (Aseprite kennt sie nicht).
+- Tags sind Bereiche wie in Aseprite. Eine beliebige Reihenfolge entsteht über angehängte verknüpfte Frames (GUI „Folge“, MCP `set_tag frames`).
+- Palette: Tasten lassen sich in der GUI nicht umbenennen oder umsortieren (Farbnamen schon).
+- Kein direkter Import von `.pxs` (Umweg: `pxa build` → PNG-Sheet → `import_png` mit Tile-Größe).
+- Fehlermeldungen des Kerns (auch in der GUI-Statuszeile) sind englisch, weil sie mit dem MCP-Server geteilt werden.

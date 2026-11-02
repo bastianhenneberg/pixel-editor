@@ -1,0 +1,20 @@
+[package]
+name = "pixel-core"
+description = "Document model, drawing, rendering and exporters for pixel-editor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "pixel_core"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+png = "0.18"
+gif = "0.14"
+flate2 = "1"
+
+[dev-dependencies]
+# independent .aseprite parser, used only to cross-check our writer
+asefile = "0.3"
