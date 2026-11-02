@@ -42,6 +42,13 @@ fn scratch_dir(name: &str) -> std::path::PathBuf {
     d
 }
 
+/// Real art for the screenshot tests, from the folder in
+/// `PIXEL_EDITOR_TEST_ART` (with `tiles32.pxe.json`, `toast_warrior/`,
+/// `slime/`). Unset or missing: the tests fall back to a stand-in.
+fn test_art(rel: &str) -> std::path::PathBuf {
+    std::env::var_os("PIXEL_EDITOR_TEST_ART").map_or_else(|| "/nonexistent".into(), std::path::PathBuf::from).join(rel)
+}
+
 #[test]
 fn pencil_stroke_and_undo() {
     let _gpu = gpu_lock();
@@ -2559,7 +2566,7 @@ fn new_tile_document_starts_tiled() {
 #[test]
 fn tiled_screenshot_of_the_tileset() {
     let _gpu = gpu_lock();
-    let src = std::path::Path::new(env!("HOME")).join("Development/pixelart-studio/art/tiles32.pxe.json");
+    let src = test_art("tiles32.pxe.json");
     let dir = scratch_dir("tileset");
     let path = dir.join("tiles32.pxe.json");
     let doc = match io::load(&src) {
@@ -2767,9 +2774,10 @@ fn tilemap_follows_the_tileset_tab_and_external_edits() {
 #[test]
 fn tilemap_screenshot_of_the_world() {
     let _gpu = gpu_lock();
-    let home = std::path::Path::new(env!("HOME"));
-    let art = home.join("Development/pixelart-studio/art");
-    let world = home.join("Development/pixel-sandbox/world.txt");
+    let art = test_art("");
+    // the sandbox's world.txt, from `PIXEL_EDITOR_TEST_WORLD`
+    let world =
+        std::env::var_os("PIXEL_EDITOR_TEST_WORLD").map_or_else(|| "/nonexistent".into(), std::path::PathBuf::from);
     let (Ok(_), Ok(text)) = (io::load(&art.join("tiles32.pxe.json")), std::fs::read_to_string(&world)) else {
         eprintln!("tiles32 or world.txt not found, no screenshot");
         return;
@@ -3021,8 +3029,7 @@ fn pixel_perfect_compare_screenshot() {
 #[test]
 fn shading_screenshot_of_the_toast() {
     let _gpu = gpu_lock();
-    let src =
-        std::path::Path::new(env!("HOME")).join("Development/pixelart-studio/art/toast_warrior/walk_side.pxe.json");
+    let src = test_art("toast_warrior/walk_side.pxe.json");
     let Ok(doc) = io::load(&src) else {
         eprintln!("walk_side not found, no screenshot");
         return;
@@ -3329,7 +3336,7 @@ fn dither_screenshot_of_all_patterns() {
 #[test]
 fn outline_compare_screenshot_of_the_slime() {
     let _gpu = gpu_lock();
-    let src = std::path::Path::new(env!("HOME")).join("Development/pixelart-studio/art/slime/idle.pxe.json");
+    let src = test_art("slime/idle.pxe.json");
     let Ok(slime) = io::load(&src) else {
         eprintln!("slime not found, no screenshot");
         return;
@@ -3383,14 +3390,19 @@ fn replace_dialog_screenshot() {
     use super::recolor::{Edit, RecolorDialog};
     use super::transform::Scope;
     let _gpu = gpu_lock();
-    let src = std::path::Path::new(env!("HOME")).join("Development/pixelart-studio/art/slime/idle.pxe.json");
+    let src = test_art("slime/idle.pxe.json");
     let mut app = match io::load(&src) {
         Ok(doc) => {
             let mut app = EditorApp::new(None);
             app.doc = doc;
             app
         }
-        Err(_) => doc_app(32, 32),
+        Err(_) => {
+            // stand-in: a blob of '2' to replace
+            let mut app = doc_app(32, 32);
+            app.doc.set_points(0, 0, &pixel_core::draw::rect(8, 8, 23, 23, true), b'2');
+            app
+        }
     };
     app.preview.settings.open = false;
     let mut h = harness(app);
@@ -3402,7 +3414,8 @@ fn replace_dialog_screenshot() {
     h.run_steps(3);
     let n: usize = (0..h.state().doc.frames.len()).map(|f| count_key(&h.state().doc, 0, f, from)).sum();
     assert!(n > 0);
-    h.get_by_label(&format!("Vorschau: {n} Pixel in {} Cels", h.state().doc.frames.len()));
+    let cels = h.state().doc.frames.len();
+    h.get_by_label(&format!("Vorschau: {n} Pixel in {cels} Cel{}", if cels == 1 { "" } else { "s" }));
     let shot = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/replace-screenshot.png");
     h.render().unwrap().save(&shot).unwrap();
     eprintln!("saved {}", shot.display());
@@ -3602,7 +3615,7 @@ fn timeline_multi_select_and_drag_reorder() {
 fn reference_layer_in_the_gui() {
     let _gpu = gpu_lock();
     let dir = scratch_dir("reference");
-    let art = std::path::Path::new(env!("HOME")).join("Development/pixelart-studio/art/toast_warrior");
+    let art = test_art("toast_warrior");
     let (doc, picture) = match (io::load(&art.join("walk_side.pxe.json")), io::load(&art.join("walk_up.pxe.json"))) {
         // the reference: walk_up's first frame, twice as big (a sketch to compare against)
         (Ok(d), Ok(up)) => (d, pixel_core::render::composite(&up, 0).scaled(2)),

@@ -7,7 +7,7 @@ Nativer Pixelart- und Animationseditor in Rust. Man kann ihn von Hand bedienen (
 - Dateiformat: [FORMAT.md](FORMAT.md)
 - Beispiel: `examples/schleim.pxe.json` (16×16, 4 Frames, Frame 2 mit Frame 0 verknüpft, Tag `idle` 0..3), komplett per MCP erstellt.
 
-Verhältnis zu `~/Development/pixelart-studio`: Der Editor ist die Zentrale zum Zeichnen, Ansehen, Animieren und Exportieren. `pxa` bleibt Claudes prozeduraler Generator. Palettentasten und Sheet-JSON sind kompatibel; ein PNG(-Sheet) aus `pxa` lässt sich mit `import_png` übernehmen.
+Verhältnis zu `pixelart-studio` (Spiel-Repo mit dem Generator `pxa`): Der Editor ist die Zentrale zum Zeichnen, Ansehen, Animieren und Exportieren. `pxa` bleibt Claudes prozeduraler Generator. Palettentasten und Sheet-JSON sind kompatibel; ein PNG(-Sheet) aus `pxa` lässt sich mit `import_png` übernehmen.
 
 ## Pixelgenauigkeit
 
@@ -103,7 +103,7 @@ Die KI (Claude, Codex …) sieht deinen Bildschirm nicht. Damit „das hier“ o
 Rust ist per rustup im Benutzerverzeichnis installiert (`~/.cargo/bin`).
 
 ```sh
-cd ~/Development/pixel-editor
+cd pixel-editor
 cargo build --release          # Binary: target/release/pixel-editor
 cargo test                     # Kern-, MCP- und GUI-Tests (GUI offscreen über wgpu)
 ```
@@ -118,7 +118,7 @@ target/release/pixel-editor figur.pxe.json         # öffnen (oder neu anlegen, 
 target/release/pixel-editor figur.aseprite         # Aseprite-Datei öffnen; Speichern schreibt wieder .aseprite
 target/release/pixel-editor open figur.pxe.json    # als Tab ins laufende Fenster des Arbeitsordners, sonst neues Fenster (losgelöst)
 target/release/pixel-editor --workdir art art/held/walk.pxe.json   # Fenster mit Arbeitsordner (Tab-Namen, `open`)
-target/release/pixel-editor mcp ~/Development/pixel-art    # MCP-Server für diesen Ordner
+target/release/pixel-editor mcp ~/pixel-art   # MCP-Server für diesen Ordner
 target/release/pixel-editor export figur.pxe.json godot [ausgabeordner] [--scale N] [--godot-res-dir res://…]
 target/release/pixel-editor preview figur.pxe.json vorschau.png [--zoom 8] [--frame f0]
 target/release/pixel-editor render-animation figur.pxe.json walk_down anim.png [--region NAME|x,y,w,h] [--track NAME|x,y,w,h] [--zoom N] [--jump 2]
@@ -218,7 +218,7 @@ Rechts: Datei, Tileset, **Tileset im Tab öffnen**, Kachelgröße, **Kartengrö�
 
 **Live**: Ändert sich ein Tile im Tileset, ändert es sich überall auf der Karte. Ist das Tileset in einem anderen Tab offen, zeigt die Karte dessen Pixel schon während des Zeichnens, auch ungespeichert („live aus dem offenen Tab“). Gespeicherte Änderungen am Tileset oder an Objekt-Dokumenten (auch von der KI) und Änderungen an der Karte selbst (MCP `set_tiles` …) lädt der Karten-Tab wie Dokumente nach; geänderte Zellen leuchten kurz gelb, die Notiz steht in der Statuszeile, und der Schritt ist rückgängig zu machen. Bei ungespeicherten eigenen Änderungen erscheint der bekannte Konflikt-Balken.
 
-**world.txt der Sandbox** (`~/Development/pixel-sandbox/world.txt`): Import über Datei → „world.txt importieren…“, CLI `import-world` oder MCP `import_world`; Export über Export → „world.txt“, CLI `export-world` oder MCP `export_world`. Die Zeichen bleiben dieselben, die Kommentarzeilen samt Legende werden unverändert an ihrer Stelle zurückgeschrieben: Import → Export ist byte-gleich (getestet mit einer Kopie der echten Datei). Die Legenden-Namen kommen aus den Kommentaren, die Tiles aus dieser Tabelle (`SANDBOX_TILES` in `core/src/tilemap.rs`, die einzige Stelle dafür):
+**world.txt der Sandbox** (`world.txt` im Repo `pixel-sandbox`): Import über Datei → „world.txt importieren…“, CLI `import-world` oder MCP `import_world`; Export über Export → „world.txt“, CLI `export-world` oder MCP `export_world`. Die Zeichen bleiben dieselben, die Kommentarzeilen samt Legende werden unverändert an ihrer Stelle zurückgeschrieben: Import → Export ist byte-gleich (getestet mit einer Kopie der echten Datei). Die Legenden-Namen kommen aus den Kommentaren, die Tiles aus dieser Tabelle (`SANDBOX_TILES` in `core/src/tilemap.rs`, die einzige Stelle dafür):
 
 | Zeichen | Tile in tiles32 | Objekt |
 |---|---|---|
@@ -315,14 +315,14 @@ Konfiguration für Claude Code (`.mcp.json` im Projekt):
 {
   "mcpServers": {
     "pixel-editor": {
-      "command": "/home/bastian/Development/pixel-editor/target/release/pixel-editor",
-      "args": ["mcp", "/home/bastian/Development/pixel-art"]
+      "command": "/pfad/zu/pixel-editor/target/release/pixel-editor",
+      "args": ["mcp", "/pfad/zu/pixel-art"]
     }
   }
 }
 ```
 
-oder `claude mcp add pixel-editor -- /home/bastian/Development/pixel-editor/target/release/pixel-editor mcp /home/bastian/Development/pixel-art` (der Arbeitsordner muss existieren; `pixel-art` ist nur ein Beispiel).
+oder `claude mcp add pixel-editor -- /pfad/zu/pixel-editor/target/release/pixel-editor mcp /pfad/zu/pixel-art` (der Arbeitsordner muss existieren; `pixel-art` ist nur ein Beispiel).
 
 ### Für Claude gedacht
 
@@ -432,7 +432,7 @@ Sheets enthalten die Frames in Reihenfolge (höchstens 16 pro Reihe, über `colu
   - Formvorschau auf einer Ebene mit Deckkraft 0,5: sieht beim Ziehen genau aus wie das Ergebnis
   - KI-Markierungen: mehrere per Ziehen und Klick, Notiz tippen und mit Enter speichern, Klick daneben schließt nur das Notizfeld, Klick hinein wählt aus und ändert die Notiz, verschieben, Größe an Kante und Ecke, Rechtsklick entfernt eine, Menü „dieses Frames“, Statuszeile „alle“, andere Frames nicht auf der Leinwand aber in der Zeitleiste, eigene Markierungen je Tab, Strg+Umschalt+K auch mit Fokus in einem Textfeld, Übernahme einer alten `pointer.json`, Neuladen nach `clear_marks`; Bild in `target/marks-screenshot.png`. Am echten Bildschirm wurde die Oberfläche bisher nicht bedient.
 
-Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen nach `target/gui-screenshot.png`. Mit sichtbarem Fenster: `PIXEL_EDITOR_SCREENSHOT=/pfad/bild.png pixel-editor datei.pxe.json` speichert nach 2 s (`PIXEL_EDITOR_SCREENSHOT_DELAY`) ein Bild des eigenen Fensters und beendet das Programm.
+Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen nach `target/gui-screenshot.png`. Mit sichtbarem Fenster: `PIXEL_EDITOR_SCREENSHOT=/pfad/bild.png pixel-editor datei.pxe.json` speichert nach 2 s (`PIXEL_EDITOR_SCREENSHOT_DELAY`) ein Bild des eigenen Fensters und beendet das Programm. Einige Screenshot-Tests nehmen echte Grafik, wenn `PIXEL_EDITOR_TEST_ART` auf einen Art-Ordner zeigt (mit `tiles32.pxe.json`, `toast_warrior/`, `slime/`) und `PIXEL_EDITOR_TEST_WORLD` auf eine `world.txt`; ohne die Variablen zeichnen sie einen Ersatz.
 
 ## Für Claude: Arbeitsweise
 
@@ -457,3 +457,14 @@ Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen n
 - Dither gibt es beim Füllen und bei gefüllten Formen, nicht als Stift-Muster; die Muster sind fest (kein eigener Musterentwurf). Die Dither-Einstellung wird nicht in `settings.json` gemerkt.
 - Kein direkter Import von `.pxs` (Umweg: `pxa build` → PNG-Sheet → `import_png` mit Tile-Größe).
 - Fehlermeldungen des Kerns (auch in der GUI-Statuszeile) sind englisch, weil sie mit dem MCP-Server geteilt werden.
+
+## Lizenz
+
+Lizenziert nach deiner Wahl unter
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) oder <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT-Lizenz ([LICENSE-MIT](LICENSE-MIT) oder <http://opensource.org/licenses/MIT>)
+
+### Beiträge
+
+Sofern du nicht ausdrücklich etwas anderes angibst, steht jeder Beitrag, den du absichtlich zur Aufnahme in dieses Werk einreichst, wie in der Apache-2.0-Lizenz definiert, unter der obigen doppelten Lizenz, ohne zusätzliche Bedingungen.

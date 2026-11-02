@@ -1,7 +1,8 @@
 //! Built-in palettes (same keys as pixelart-studio's `.pxs` palettes).
 
 pub const BUILTIN: &[(&str, &[(char, &str)])] = &[
-    // Sweetie 16 by GrafxKid
+    // Sweetie 16 by GrafxKid, https://lospec.com/palette-list/sweetie-16
+    // (published for free use; no formal license stated)
     (
         "sweetie16",
         &[
@@ -23,7 +24,8 @@ pub const BUILTIN: &[(&str, &[(char, &str)])] = &[
             ('f', "#333c57"),
         ],
     ),
-    // PICO-8 fantasy console, standard indices
+    // PICO-8 fantasy console by Lexaloffle Games, standard indices from the
+    // PICO-8 manual, https://www.lexaloffle.com/pico-8.php (no formal license stated)
     (
         "pico8",
         &[
@@ -45,9 +47,10 @@ pub const BUILTIN: &[(&str, &[(char, &str)])] = &[
             ('f', "#ffccaa"),
         ],
     ),
-    // Original Game Boy greens, dark to light
+    // Original Game Boy greens, dark to light: common community approximation
+    // of the DMG screen (no single author, no license stated)
     ("gameboy", &[('0', "#0f380f"), ('1', "#306230"), ('2', "#8bac0f"), ('3', "#9bbc0f")]),
-    // 1-bit
+    // 1-bit, self-made
     ("mono", &[('0', "#000000"), ('1', "#ffffff")]),
 ];
 
