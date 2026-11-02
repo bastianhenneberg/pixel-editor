@@ -189,6 +189,10 @@ Neue Tiles bekommen beim ersten Setzen die nächste freie Taste (`0–9`, `a–z
 
 Gespeichert wird atomar wie Dokumente; der Verlauf liegt ebenfalls in `.pxe-history/<datei>/` (Zustände als `states/<id>.tilemap.json`).
 
+## Projekt-Anweisungen (`.pxe-instructions.md`)
+
+Optional im Arbeitsordner des MCP-Servers (`pixel-editor mcp <workdir>`): freies Markdown mit den Vorgaben des Projekts, z. B. Leinwandgrößen, Ordner je Figur, Marker. Der Server hängt den Inhalt beim Start an seine Anweisungen an (höchstens 16 KB, der Rest wird mit Hinweis abgeschnitten). Der Editor selbst wertet die Datei nicht aus.
+
 ## Verlauf (`.pxe-history/`)
 
 Neben jedem Dokument legen MCP-Server und Editor `.pxe-history/<dateiname>/` an: `journal.json` (Einträge mit Zeit, Autor: Name des MCP-Clients wie `Claude`/`Codex` (ältere Journale `claude`), `user` für GUI-Speicherungen, Beschreibung, Art `edit`/`progress`/`focus` und Ort der Änderung `focus: {frame, layer, bbox, region}`, damit der Editor folgen kann; `gui.pid` vom laufenden Editor, `gui.log` mit seiner Fehlerausgabe, wenn er über `open`/`open_editor` gestartet wurde), `views/<pid>.json` (was jeder laufende Editor gerade zeigt, für `get_user_view`), `marks.json` (die „KI zeigen“-Markierungen des Dokuments: `{"next": 3, "marks": [{"n": 1, "frame": {index, name, address}, "layer": {index, name}, "rect": {x, y, w, h} oder null für den ganzen Frame, "note": "…", "time_ms", "pid", "dirty"}]}`; ohne Markierungen fehlt die Datei; eine ältere `pointer.json` mit einem einzelnen Zeiger wird beim Lesen als #1 übernommen und dann ersetzt) und `states/` (Zustand nach jedem Eintrag, höchstens 300) sowie `snapshots/` mit benannten Schnappschüssen. Der Ordner kann gelöscht werden; dann beginnt der Verlauf neu. Für Git: in `.gitignore` aufnehmen.

@@ -436,7 +436,7 @@ Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen n
 
 ## Für Claude: Arbeitsweise
 
-1. `create_document` (Figuren 48×48, Begleithund 48×36, Schleim 32×32, Tiles 32×32, Angriffe größer wie 104×56 oder 80×96 mit gesperrtem Marker `origin` an den Füßen; ein Dokument je Animation, ein Ordner je Figur; Spiel-Viewport 640×360), Farben und Ebenen benennen, Teile als Regionen anlegen (`set_region`).
+1. `create_document` in den Maßen und Ordnern des Projekts (üblich: ein Dokument je Animation, ein Ordner je Figur), Farben und Ebenen benennen, Teile als Regionen anlegen (`set_region`). Die Vorgaben eines Projekts (Leinwandgrößen, Ordner, Marker wie `origin`, Viewport) stehen in `.pxe-instructions.md` im Arbeitsordner: Der MCP-Server liest die Datei beim Start und hängt sie unter „Project instructions“ an seine Anweisungen an. Sie ist freies Markdown, fehlt sie, gelten nur die eingebauten, neutralen Anweisungen; über 16 KB wird sie mit Hinweis abgeschnitten. Änderungen wirken nach einem Neustart des Servers.
 2. Flächen mit `set_rows`, Formen mit `draw_*`/`fill`, Details mit `set_pixels`, immer mit Ziel (Ebene, Frame, Region).
 3. Den zurückgegebenen Diff prüfen, `render_preview` ansehen, mit `get_rows` Details prüfen. Bei Korrekturwünschen nur die genannte Region ändern; vor größeren Umbauten `snapshot`. Bei Tiles zusätzlich `render_preview` mit `tiled: true` und `check_seams`: das Tile muss an seinen eigenen Rändern weiterlaufen.
 4. Animation: `add_frame(copy_from)` + kleine Änderungen. Bezieht sich der Nutzer auf „das hier“, erst `get_user_view` aufrufen. Wiederkehrende Frames mit `linked: true` anlegen, dann `set_frame_duration` und `set_tag` (Bereich + Richtung).

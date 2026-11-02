@@ -91,6 +91,8 @@ struct Server {
     /// "Claude", "Codex", ... ("KI" until known). Used as journal author and
     /// note prefix, so the GUI can say who changed what.
     author: std::cell::RefCell<String>,
+    /// INSTRUCTIONS plus the workdir's `.pxe-instructions.md`, read once at start.
+    instructions: String,
 }
 
 /// Display name of an MCP client: "claude-code"/"claude…" -> "Claude",
@@ -112,7 +114,8 @@ fn author_from_client(name: Option<&str>) -> String {
 
 impl Server {
     fn new(workdir: PathBuf) -> Server {
-        Server { workdir, author: std::cell::RefCell::new(author_from_client(None)) }
+        let instructions = instructions_for(&workdir);
+        Server { workdir, author: std::cell::RefCell::new(author_from_client(None)), instructions }
     }
 
     fn author(&self) -> String {
@@ -137,7 +140,7 @@ impl Server {
                     "protocolVersion": version,
                     "capabilities": {"tools": {"listChanged": false}},
                     "serverInfo": {"name": SERVER_NAME, "version": env!("CARGO_PKG_VERSION")},
-                    "instructions": INSTRUCTIONS,
+                    "instructions": self.instructions,
                 })
             }
             "ping" => json!({}),
@@ -2756,6 +2759,40 @@ fn expand_names(d: &Document, rows: &[String], _a: &Value) -> Result<Vec<String>
     Ok(rows.to_vec())
 }
 
+/// Project-specific instructions next to the documents (sizes, folders, markers).
+const PROJECT_INSTRUCTIONS_FILE: &str = ".pxe-instructions.md";
+/// Longer project instructions are cut off here (at a char boundary).
+const PROJECT_INSTRUCTIONS_MAX: usize = 16 * 1024;
+
+/// The built-in instructions, followed by `<workdir>/.pxe-instructions.md`
+/// under a heading if the file exists. A missing or unreadable file is no error.
+fn instructions_for(workdir: &Path) -> String {
+    let path = workdir.join(PROJECT_INSTRUCTIONS_FILE);
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return INSTRUCTIONS.to_string();
+    };
+    let text = text.trim();
+    if text.is_empty() {
+        return INSTRUCTIONS.to_string();
+    }
+    let mut out = format!("{INSTRUCTIONS}\n\n## Project instructions ({PROJECT_INSTRUCTIONS_FILE})\n\n");
+    if text.len() > PROJECT_INSTRUCTIONS_MAX {
+        let mut end = PROJECT_INSTRUCTIONS_MAX;
+        while !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        out.push_str(&text[..end]);
+        out.push_str(&format!(
+            "\n\n[{PROJECT_INSTRUCTIONS_FILE} is {} bytes; cut off after {PROJECT_INSTRUCTIONS_MAX}. Read the file for the rest.]",
+            text.len()
+        ));
+        eprintln!("{} is longer than {PROJECT_INSTRUCTIONS_MAX} bytes, cut off", path.display());
+    } else {
+        out.push_str(text);
+    }
+    out
+}
+
 const INSTRUCTIONS: &str = "Pixel-art documents (.pxe.json or .aseprite) in the workdir, edited together by \
 the user and the AI assistant (you; the editor names you after your MCP clientInfo, e.g. Claude or Codex). \
 Pixels are palette keys (single characters, '.' = transparent); colors also have names (e.g. '9 harness') \
@@ -2765,10 +2802,10 @@ per frame. CONSISTENCY RULES: every pixel write needs an explicit target (layer 
 never changes anything outside it; locked layers/frames/regions refuse writes; every write returns a diff \
 (count, bbox, rows before/after), accepts dry_run and a note, and is recorded in the history (undo, \
 snapshots). Change only what the user named. Typical loop: get_document / list_regions -> get_rows of the \
-area -> edit with a region or clip -> check the returned diff -> render_preview. Art direction: characters \
-48x48, the companion dog 48x36, the slime 32x32; tiles 32x32. Attack animations use bigger canvases \
-(104x56, 80x96) with a locked marker region 'origin' at the feet. One document per animation, in a folder \
-per character (e.g. toast_warrior/walk_side.pxe.json); repeated frames inside an animation are linked cels. \
+area -> edit with a region or clip -> check the returned diff -> render_preview. Sizes and conventions of \
+the project (canvas sizes, folders, markers) come from the workdir's .pxe-instructions.md, appended below \
+when it exists. A common layout is one document per animation in a folder per character (e.g. \
+hero/walk.pxe.json); repeated frames inside an animation are linked cels. \
 The user may watch the file in the pixel-editor GUI, which follows your edits live and shows you as their \
 author: use focus to show where you are about to work and pace_ms on writes so they can watch it being \
 drawn. When the user says 'this', 'here', 'the marks' or 'what I selected', call get_user_view: it shows the \
@@ -2889,7 +2926,7 @@ fn tool_list() -> Value {
     };
     json!([
         tool("list_documents", "List .pxe.json and .aseprite documents in the workdir with size, layers, frames, tags and regions, and tilemaps (.tilemap.json) with size and tileset.", json!({}), &[]),
-        tool("create_document", "Create a new document with one layer and one frame. Name ending in .aseprite creates an Aseprite file. Art direction: characters 48x48 (companion dog 48x36, slime 32x32), tiles 32x32, attack animations bigger (104x56, 80x96) with a locked marker 'origin' at the feet; one document per animation in a folder per character.",
+        tool("create_document", "Create a new document with one layer and one frame. Name ending in .aseprite creates an Aseprite file. Canvas sizes and folder conventions of the project are in the server instructions (from the workdir's .pxe-instructions.md, if any).",
             json!({
                 "name": {"type": "string", "description": "file name (\".pxe.json\" is appended unless it ends in .pxe.json/.aseprite/.ase), may include subdirectories"},
                 "width": int("width in pixels"), "height": int("height in pixels"),

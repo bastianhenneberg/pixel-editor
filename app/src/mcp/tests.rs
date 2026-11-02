@@ -52,12 +52,7 @@ fn protocol_and_tools() {
     assert_eq!(init["result"]["protocolVersion"], "2025-03-26");
     let instructions = init["result"]["instructions"].as_str().unwrap();
     for part in [
-        "characters 48x48",
-        "dog 48x36",
-        "slime 32x32",
-        "tiles 32x32",
-        "104x56, 80x96",
-        "'origin'",
+        ".pxe-instructions.md",
         "linked cels",
         "pace_ms",
         "get_user_view",
@@ -74,7 +69,9 @@ fn protocol_and_tools() {
     ] {
         assert!(instructions.contains(part), "instructions lack {part:?}: {instructions}");
     }
-    assert!(!instructions.contains("64x64"));
+    for game in ["48x48", "48x36", "slime", "104x56", "toast_warrior", "## Project instructions"] {
+        assert!(!instructions.contains(game), "built-in instructions name {game:?}: {instructions}");
+    }
     assert!(instructions.contains("the AI assistant (you;"), "{instructions}");
     assert_eq!(instructions.matches("Claude").count(), 1, "only as an example author name");
     assert!(instructions.contains("'KI zeigen'"), "{instructions}");
@@ -1232,5 +1229,44 @@ fn set_layer_opacity_and_reference() {
     assert!(
         err(&s, "set_reference", json!({"path": "held.aseprite", "image": "skizze.png"})).contains(".pxe.json only")
     );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn instructions_of(s: &Server) -> String {
+    let init = s.handle(&json!({"jsonrpc": "2.0", "id": 0, "method": "initialize", "params": {}})).unwrap();
+    init["result"]["instructions"].as_str().unwrap().to_string()
+}
+
+#[test]
+fn project_instructions_file() {
+    let dir = std::env::temp_dir().join(format!("pxe-mcp-instr-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // missing: just the built-in text, no error
+    let plain = instructions_of(&Server::new(dir.canonicalize().unwrap()));
+    assert_eq!(plain, INSTRUCTIONS);
+    // present: appended under a heading, read at start
+    std::fs::write(dir.join(".pxe-instructions.md"), "Characters 48x48, tiles 32x32.\n").unwrap();
+    let s = Server::new(dir.canonicalize().unwrap());
+    let text = instructions_of(&s);
+    assert!(text.starts_with(INSTRUCTIONS), "{text}");
+    assert!(
+        text.ends_with("## Project instructions (.pxe-instructions.md)\n\nCharacters 48x48, tiles 32x32."),
+        "{text}"
+    );
+    // too big: cut at the limit (char boundary) with a note
+    let big = "ä".repeat(PROJECT_INSTRUCTIONS_MAX); // 2 bytes each
+    std::fs::write(dir.join(".pxe-instructions.md"), &big).unwrap();
+    let text = instructions_of(&Server::new(dir.canonicalize().unwrap()));
+    let appended = text.split("## Project instructions (.pxe-instructions.md)\n\n").nth(1).unwrap();
+    assert!(appended.starts_with(&"ä".repeat(PROJECT_INSTRUCTIONS_MAX / 2)), "kept up to the limit");
+    assert!(!appended.contains(&"ä".repeat(PROJECT_INSTRUCTIONS_MAX / 2 + 1)), "cut at the limit");
+    assert!(
+        appended.contains(&format!("is {} bytes; cut off after {PROJECT_INSTRUCTIONS_MAX}", big.len())),
+        "{appended}"
+    );
+    // empty file: nothing appended
+    std::fs::write(dir.join(".pxe-instructions.md"), "  \n").unwrap();
+    assert_eq!(instructions_of(&Server::new(dir.canonicalize().unwrap())), INSTRUCTIONS);
     std::fs::remove_dir_all(&dir).unwrap();
 }
