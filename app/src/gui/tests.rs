@@ -3069,3 +3069,341 @@ fn shading_screenshot_of_the_toast() {
     assert_eq!(io::load(&src).unwrap(), doc, "original unchanged");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---- Farbe ersetzen, Dither, Kontur -------------------------------------------
+
+/// A 16x8 document, three frames (1 linked to 0) in a tag "walk", two layers:
+/// '2' blocks on layer 0, a '2' on layer 1.
+fn recolor_app() -> Harness<'static, EditorApp> {
+    let mut app = doc_app(16, 8);
+    app.preview.settings.open = false;
+    let d = &mut app.doc;
+    d.set_points(0, 0, &pixel_core::draw::rect(1, 1, 3, 3, true), b'2');
+    d.add_frame(1, Some(0), true).unwrap();
+    d.add_frame(2, Some(0), false).unwrap();
+    d.set_tag(pixel_core::Tag::new("walk", 1, 2)).unwrap();
+    let top = d.add_layer("oben", 1);
+    d.set(top, 2, 8, 4, b'2');
+    let mut h = harness(app);
+    h.run_steps(3);
+    h
+}
+
+fn count_key(d: &Document, l: usize, f: usize, k: u8) -> usize {
+    d.cel(l, f).iter().filter(|c| **c == k).count()
+}
+
+#[test]
+fn replace_color_dialog_scopes_and_undo() {
+    use super::recolor::{Edit, RecolorDialog};
+    use super::transform::Scope;
+    let _gpu = gpu_lock();
+    let mut h = recolor_app();
+    h.state_mut().color = b'2';
+    menu(&mut h, "Bild");
+    h.get_by_label("Farbe ersetzen…").click();
+    h.run_steps(2);
+    let dlg = h.state().recolor_dialog.expect("dialog open");
+    assert_eq!(dlg.scope, Scope::Cel, "no selection: the cel");
+    let Edit::Replace { from, .. } = dlg.edit else { panic!() };
+    assert_eq!(from, b'2');
+    // 2 > 5 on the cel: the preview counts before anything changes
+    h.state_mut().recolor_dialog = Some(RecolorDialog { edit: Edit::Replace { from: b'2', to: b'5' }, ..dlg });
+    h.run_steps(2);
+    h.get_by_label("Vorschau: 9 Pixel in 1 Cel");
+    assert_eq!(count_key(&h.state().doc, 0, 0, b'2'), 9);
+    h.get_by_label("Ersetzen").click();
+    h.run_steps(2);
+    assert!(h.state().recolor_dialog.is_none());
+    let d = &h.state().doc;
+    assert_eq!((count_key(d, 0, 0, b'5'), count_key(d, 0, 1, b'5')), (9, 9), "the linked frame shares the cel");
+    assert_eq!(count_key(d, 0, 2, b'2'), 9, "frame 2 untouched");
+    let last = h.state().history.undo_steps().last().unwrap().to_string();
+    assert!(last.starts_with("Farbe ersetzen 2 > 5: 9 Pixel"), "{last}");
+    h.key_press_modifiers(Modifiers::COMMAND, egui::Key::Z);
+    h.step();
+    assert_eq!(count_key(&h.state().doc, 0, 0, b'2'), 9, "one undo step");
+
+    // the tag on all layers: frame 1 (= linked cel 0) and frame 2, layer "oben" too
+    let tag = RecolorDialog { edit: Edit::Replace { from: b'2', to: b'9' }, scope: Scope::Tag, one_layer: false };
+    h.state_mut().goto_frame(1);
+    h.state_mut().recolor_dialog = Some(tag);
+    h.run_steps(2);
+    h.get_by_label("Vorschau: 19 Pixel in 3 Cels");
+    // only the current layer: the '2' on "oben" stays; a locked frame is skipped
+    h.state_mut().recolor_dialog = Some(RecolorDialog { one_layer: true, ..tag });
+    h.state_mut().doc.frames[2].locked = true;
+    h.state_mut().rev += 1;
+    h.run_steps(2);
+    h.get_by_label("Ersetzen").click();
+    h.run_steps(2);
+    let d = &h.state().doc;
+    assert_eq!((count_key(d, 0, 1, b'9'), count_key(d, 0, 2, b'2'), d.get(1, 2, 8, 4)), (9, 9, b'2'));
+    assert!(h.state().status.contains("übersprungen"), "{}", h.state().status);
+    h.state_mut().doc.frames[2].locked = false;
+
+    // a mask selection: only the selected pixels, and the palette's context
+    // entry opens the dialog for that color with the selection as scope
+    h.state_mut().goto_frame(2);
+    let mask = vec![true, false, false, true];
+    h.state_mut().selection = Some(Selection::with_mask(pixel_core::Rect::new(1, 1, 2, 2), Some(mask)));
+    h.state_mut().open_replace(b'2');
+    let dlg = h.state().recolor_dialog.unwrap();
+    assert_eq!(dlg.scope, Scope::Selection);
+    h.state_mut().recolor_dialog = Some(RecolorDialog { edit: Edit::Replace { from: b'2', to: b'c' }, ..dlg });
+    h.run_steps(2);
+    h.get_by_label("Ersetzen").click();
+    h.run_steps(2);
+    let d = &h.state().doc;
+    assert_eq!((d.get(0, 2, 1, 1), d.get(0, 2, 2, 1), d.get(0, 2, 2, 2)), (b'c', b'2', b'c'));
+}
+
+#[test]
+fn dither_fill_shapes_mask_symmetry_and_tiles() {
+    use pixel_core::recolor::Pattern;
+    let _gpu = gpu_lock();
+    let mut h = harness(doc_app(16, 8));
+    h.run_steps(3);
+    let get = |h: &Harness<'_, EditorApp>, x: i32, y: i32| h.state().doc.get(0, 0, x, y);
+    h.key_press(egui::Key::G);
+    h.step();
+    h.state_mut().color = b'2';
+    h.run_steps(1);
+    h.get_by_label("Dither").click();
+    h.run_steps(1);
+    assert!(h.state().dither.on);
+    h.state_mut().dither.second = b'1';
+    // the fill is a checkerboard aligned to the canvas
+    click_px(&mut h, 5, 5);
+    for y in 0..8 {
+        for x in 0..16 {
+            assert_eq!(get(&h, x, y), if (x + y) % 2 == 0 { b'2' } else { b'1' }, "({x}, {y})");
+        }
+    }
+    assert!(h.state().history.undo_steps().last().unwrap().contains("Dither Schachbrett 50 %"));
+    // a filled rectangle with 25 %, the second color from the ramp
+    h.state_mut().doc.set_ramps(vec![pixel_core::Ramp::new("rot", b"123")]).unwrap();
+    h.key_press(egui::Key::U);
+    h.step();
+    h.state_mut().filled = true;
+    h.state_mut().dither.pattern = Pattern::Quarter;
+    h.state_mut().color = b'3';
+    h.run_steps(1);
+    h.get_by_label("Rampe dunkler").click();
+    h.run_steps(1);
+    assert_eq!(h.state().dither.second, b'2');
+    drag_px(&mut h, (0, 0), (7, 7));
+    for y in 0..8 {
+        for x in 0..8 {
+            let want = if Pattern::Quarter.first(x, y) { b'3' } else { b'2' };
+            assert_eq!(get(&h, x, y), want, "({x}, {y})");
+        }
+    }
+    // an outline rectangle does not dither
+    h.state_mut().filled = false;
+    drag_px(&mut h, (9, 1), (14, 6));
+    assert_eq!((get(&h, 9, 1), get(&h, 10, 1)), (b'3', b'3'));
+    // a mask selection limits the fill; symmetry mirrors it
+    h.state_mut().doc = Document::new(16, 8, Document::builtin_palette("sweetie16").unwrap()).unwrap();
+    h.state_mut().rev += 1;
+    h.state_mut().selection = Some(Selection::with_mask(pixel_core::Rect::new(0, 0, 2, 1), Some(vec![true, false])));
+    h.key_press(egui::Key::G);
+    h.step();
+    h.state_mut().dither.pattern = Pattern::LinesH;
+    click_px(&mut h, 0, 0);
+    assert_eq!((get(&h, 0, 0), get(&h, 1, 0), get(&h, 0, 1)), (b'3', TRANSPARENT, TRANSPARENT));
+    h.state_mut().selection = None;
+    h.state_mut().doc.set_points(0, 0, &pixel_core::draw::line(4, 0, 4, 7), b'9');
+    h.state_mut().doc.set_points(0, 0, &pixel_core::draw::line(11, 0, 11, 7), b'9');
+    h.state_mut().rev += 1;
+    h.state_mut().symmetry =
+        super::transform::Symmetry { mode: super::transform::SymMode::Vertical, x2: None, y2: None };
+    click_px(&mut h, 2, 3);
+    // left strip x 0..3 and its mirror x 12..15 both get the lines, the middle stays
+    for x in [1, 3, 12, 14] {
+        assert_eq!((get(&h, x, 2), get(&h, x, 3)), (b'3', b'2'), "x {x}");
+    }
+    assert_eq!(get(&h, 7, 3), TRANSPARENT);
+    h.state_mut().symmetry.mode = super::transform::SymMode::Off;
+    // Kachel-Modus: a fill across the edge keeps one canvas-aligned pattern
+    h.state_mut().tile_mode = super::tiled::TileMode::Both;
+    h.state_mut().doc = Document::new(8, 8, Document::builtin_palette("sweetie16").unwrap()).unwrap();
+    h.state_mut().doc.set_points(0, 0, &pixel_core::draw::line(3, 0, 3, 7), b'9');
+    h.state_mut().rev += 1;
+    h.state_mut().fit_pending = true;
+    h.run_steps(3);
+    h.state_mut().dither.pattern = Pattern::Checker;
+    click_px(&mut h, 9, 2); // a copy right of the image: real pixel (1, 2)
+    for y in 0..8 {
+        for x in (0..3).chain(4..8) {
+            assert_eq!(get(&h, x, y), if (x + y) % 2 == 0 { b'3' } else { b'2' }, "({x}, {y})");
+        }
+    }
+}
+
+#[test]
+fn outline_dialog_outside_and_inside() {
+    use super::recolor::{Edit, RecolorDialog};
+    use super::transform::Scope;
+    use pixel_core::recolor::OutlineMode;
+    let _gpu = gpu_lock();
+    let mut h = recolor_app();
+    h.state_mut().color = b'0';
+    menu(&mut h, "Bild");
+    h.get_by_label("Kontur (Outline)…").click();
+    h.run_steps(2);
+    // außen, 4er: the 3x3 block gets 12 pixels around it, corners free
+    h.get_by_label("Vorschau: 12 Pixel in 1 Cel");
+    h.get_by_label("8er").click();
+    h.run_steps(1);
+    h.get_by_label("Vorschau: 16 Pixel in 1 Cel");
+    h.get_by_label("Kontur ziehen").click();
+    h.run_steps(2);
+    let d = &h.state().doc;
+    assert_eq!((d.get(0, 0, 0, 0), d.get(0, 0, 4, 2), d.get(0, 0, 2, 2)), (b'0', b'0', b'2'));
+    assert_eq!(count_key(d, 0, 0, b'0'), 16);
+    assert!(h.state().history.undo_steps().last().unwrap().starts_with("Kontur außen"));
+    // innen on frame 2 (all layers): the block's edge and the single pixel on "oben"
+    h.state_mut().goto_frame(2);
+    let Some(RecolorDialog { edit: Edit::Outline(o), .. }) = ({
+        h.state_mut().open_outline();
+        h.state().recolor_dialog
+    }) else {
+        panic!()
+    };
+    let o = pixel_core::recolor::Outline { mode: OutlineMode::Inside, color: b'c', ..o };
+    h.state_mut().recolor_dialog =
+        Some(RecolorDialog { edit: Edit::Outline(o), scope: Scope::Frame, one_layer: false });
+    h.run_steps(2);
+    h.get_by_label("Vorschau: 9 Pixel in 2 Cels");
+    h.get_by_label("Kontur ziehen").click();
+    h.run_steps(2);
+    let d = &h.state().doc;
+    assert_eq!((d.get(0, 2, 1, 1), d.get(0, 2, 2, 2), d.get(1, 2, 8, 4)), (b'c', b'2', b'c'));
+}
+
+/// `target/dither-screenshot.png`: every pattern in its own band, drawn
+/// with the filled rectangle, the document shown in the Kachel-Modus.
+#[test]
+fn dither_screenshot_of_all_patterns() {
+    use pixel_core::recolor::Pattern;
+    let _gpu = gpu_lock();
+    let n = Pattern::MENU.len() as i32;
+    let mut app = doc_app(8 * n as u32, 24);
+    app.preview.settings.open = false;
+    app.tile_mode = super::tiled::TileMode::Both;
+    let mut h = harness(app);
+    h.run_steps(3);
+    h.key_press(egui::Key::U);
+    h.step();
+    h.state_mut().filled = true;
+    h.state_mut().color = b'0';
+    h.run_steps(1);
+    h.get_by_label("Dither").click();
+    h.run_steps(1);
+    h.state_mut().dither.second = b'4';
+    for (i, p) in Pattern::MENU.into_iter().enumerate() {
+        h.state_mut().dither.pattern = p;
+        let x = 8 * i as i32;
+        drag_px(&mut h, (x, 0), (x + 7, 23));
+        assert_eq!(h.state().doc.get(0, 0, x + 1, 1), p.pick(x + 1, 1, b'0', b'4'), "{p:?}");
+    }
+    // seamless: each band's pattern continues across the top/bottom edge,
+    // as the height (24) is a multiple of every pattern's period (2 or 4)
+    let d = h.state().doc.clone();
+    for (i, p) in Pattern::MENU.into_iter().enumerate() {
+        let x = 8 * i as i32 + 3;
+        assert_eq!(d.get(0, 0, x, 23) == b'0', p.first(x, -1), "{p:?}");
+    }
+    let labels: Vec<String> = Pattern::MENU.iter().map(|p| p.label()).collect();
+    h.state_mut().status = format!("von links: {}", labels.join(" | "));
+    h.hover_at(px_center(&h, 2, -3));
+    h.run_steps(3);
+    let shot = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/dither-screenshot.png");
+    h.render().unwrap().save(&shot).unwrap();
+    eprintln!("saved {}", shot.display());
+}
+
+/// `target/outline-compare.png`: a COPY of slime/idle frame 0 twice side by
+/// side; the right one gets an outside outline through the Bild menu.
+#[test]
+fn outline_compare_screenshot_of_the_slime() {
+    let _gpu = gpu_lock();
+    let src = std::path::Path::new(env!("HOME")).join("Development/pixelart-studio/art/slime/idle.pxe.json");
+    let Ok(slime) = io::load(&src) else {
+        eprintln!("slime not found, no screenshot");
+        return;
+    };
+    let (w, ht) = (slime.width as i32, slime.height as i32);
+    let mut doc = Document::new(2 * w as u32 + 4, ht as u32, slime.palette.clone()).unwrap();
+    for y in 0..ht {
+        for x in 0..w {
+            let k = slime.top_key(0, x, y);
+            doc.set(0, 0, x, y, k);
+            doc.set(0, 0, x + w + 4, y, k);
+        }
+    }
+    let mut app = EditorApp::new(None);
+    app.doc = doc;
+    app.preview.settings.open = false;
+    let mut h = harness(app);
+    h.run_steps(3);
+    h.key_press(egui::Key::M);
+    h.step();
+    drag_px(&mut h, (w + 3, 0), (2 * w + 3, ht - 1));
+    let outline = slime.palette.iter().find(|p| p.name == "outline").map_or(b'o', |p| p.key);
+    h.state_mut().color = outline;
+    menu(&mut h, "Bild");
+    h.get_by_label("Kontur (Outline)…").click();
+    h.run_steps(2);
+    h.get_by_label("8er").click();
+    h.run_steps(1);
+    h.get_by_label("Kontur ziehen").click();
+    h.run_steps(2);
+    let d = &h.state().doc;
+    let left = (0..ht).flat_map(|y| (0..w).map(move |x| (x, y))).filter(|&(x, y)| d.get(0, 0, x, y) == outline).count();
+    let right = (0..ht)
+        .flat_map(|y| (w + 3..2 * w + 4).map(move |x| (x, y)))
+        .filter(|&(x, y)| d.get(0, 0, x, y) == outline)
+        .count();
+    assert!(right > left, "{right} vs {left}");
+    h.state_mut().selection = None;
+    h.state_mut().status = format!("links vorher · rechts nachher: Kontur außen, 8er, {} Pixel", right - left);
+    h.hover_at(px_center(&h, w + 2, ht - 1));
+    h.run_steps(3);
+    let shot = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/outline-compare.png");
+    h.render().unwrap().save(&shot).unwrap();
+    eprintln!("saved {}", shot.display());
+    assert_eq!(io::load(&src).unwrap(), slime, "original unchanged");
+}
+
+/// `target/replace-screenshot.png`: the Farbe-ersetzen dialog with its count.
+#[test]
+fn replace_dialog_screenshot() {
+    use super::recolor::{Edit, RecolorDialog};
+    use super::transform::Scope;
+    let _gpu = gpu_lock();
+    let src = std::path::Path::new(env!("HOME")).join("Development/pixelart-studio/art/slime/idle.pxe.json");
+    let mut app = match io::load(&src) {
+        Ok(doc) => {
+            let mut app = EditorApp::new(None);
+            app.doc = doc;
+            app
+        }
+        Err(_) => doc_app(32, 32),
+    };
+    app.preview.settings.open = false;
+    let mut h = harness(app);
+    h.run_steps(3);
+    let from = h.state().doc.palette.iter().find(|p| p.name == "body").map_or(b'2', |p| p.key);
+    let to = h.state().doc.palette.iter().find(|p| p.name == "blush").map_or(b'3', |p| p.key);
+    h.state_mut().recolor_dialog =
+        Some(RecolorDialog { edit: Edit::Replace { from, to }, scope: Scope::All, one_layer: false });
+    h.run_steps(3);
+    let n: usize = (0..h.state().doc.frames.len()).map(|f| count_key(&h.state().doc, 0, f, from)).sum();
+    assert!(n > 0);
+    h.get_by_label(&format!("Vorschau: {n} Pixel in {} Cels", h.state().doc.frames.len()));
+    let shot = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/replace-screenshot.png");
+    h.render().unwrap().save(&shot).unwrap();
+    eprintln!("saved {}", shot.display());
+}

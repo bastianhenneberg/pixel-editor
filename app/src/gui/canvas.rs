@@ -148,8 +148,9 @@ impl EditorApp {
         self.zoom = new;
     }
 
-    /// Pixels of the shape being dragged (line/rect/ellipse), not yet committed.
-    fn shape_preview(&self) -> Option<(Vec<(i32, i32)>, u8)> {
+    /// Pixels of the shape being dragged (line/rect/ellipse), not yet
+    /// committed, with their keys (a filled shape may dither).
+    fn shape_preview(&self) -> Option<Vec<(i32, i32, u8)>> {
         let g = self.canvas.gesture.as_ref()?;
         let (s, e) = (g.start, g.last);
         let pts = match self.tool {
@@ -158,7 +159,7 @@ impl EditorApp {
             Tool::Ellipse => draw::ellipse_in_box(s.0, s.1, e.0, e.1, self.filled),
             _ => return None,
         };
-        Some((self.paint_points(pts), g.key))
+        Some(self.tool_plan(&self.paint_points(pts), g.key).pixels)
     }
 
     /// Rebuild textures when the document, frame or onion setting changed.
@@ -185,11 +186,10 @@ impl EditorApp {
             }
             None => render::composite(&self.doc, self.frame),
         };
-        if let Some((pts, k)) = &preview {
-            let c = self.doc.color_of(*k).map_or([0, 0, 0, 0], |c| c.0);
-            for &(x, y) in pts {
+        if let Some(pts) = &preview {
+            for &(x, y, k) in pts {
                 if self.doc.in_bounds(x, y) {
-                    img.put(x as u32, y as u32, c);
+                    img.put(x as u32, y as u32, self.doc.color_of(k).map_or([0, 0, 0, 0], |c| c.0));
                 }
             }
         }
@@ -600,9 +600,18 @@ impl EditorApp {
                             .flat_map(|s| self.flood(s.0, s.1))
                             .filter(|&(x, y)| self.may_paint(x, y) && seen.insert((x, y)))
                             .collect();
-                        let desc =
-                            format!("Füllen {} Pixel mit {} · {}", pts.len(), self.doc.key_label(key), self.here());
-                        self.edit(desc, |d| d.set_points(layer, frame, &pts, key));
+                        let with = match self.active_dither(key) {
+                            Some((pat, a, b)) => format!(
+                                "Dither {} aus {} und {}",
+                                pat.label(),
+                                self.doc.key_label(a),
+                                self.doc.key_label(b)
+                            ),
+                            None => self.doc.key_label(key),
+                        };
+                        let plan = self.tool_plan(&pts, key);
+                        let desc = format!("Füllen {} Pixel mit {with} · {}", pts.len(), self.here());
+                        self.edit(desc, |d| plan.apply(d, layer, frame));
                     }
                 }
                 Tool::Pencil | Tool::Eraser | Tool::Shade => {
@@ -665,8 +674,15 @@ impl EditorApp {
                 }
             };
             let pts = self.paint_points(pts);
-            let desc = format!("{} {} · {}", self.tool.label(), self.doc.key_label(g.key), self.here());
-            self.edit(desc, |d| d.set_points(layer, frame, &pts, g.key));
+            let with = match self.active_dither(g.key) {
+                Some((pat, a, b)) => {
+                    format!("Dither {} aus {} und {}", pat.label(), self.doc.key_label(a), self.doc.key_label(b))
+                }
+                None => self.doc.key_label(g.key),
+            };
+            let plan = self.tool_plan(&pts, g.key);
+            let desc = format!("{} {with} · {}", self.tool.label(), self.here());
+            self.edit(desc, |d| plan.apply(d, layer, frame));
         }
     }
 

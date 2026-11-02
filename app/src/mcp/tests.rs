@@ -116,6 +116,8 @@ fn protocol_and_tools() {
         "check_seams",
         "set_ramps",
         "shade",
+        "replace_color",
+        "outline",
     ] {
         assert!(names.contains(&required), "missing tool {required}");
     }
@@ -965,5 +967,137 @@ fn tiled_preview_and_seam_check() {
     assert!(one.contains("No seam stands out") && !one.contains("frame 1"), "{one}");
     let e = err(&s, "check_seams", json!({"path": "tile", "threshold": 2}));
     assert!(e.contains("0..1"), "{e}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn replace_color_scopes_locks_and_history() {
+    let (s, dir) = server("replace");
+    ok(&s, "create_document", json!({"name": "r", "width": 4, "height": 2}));
+    ok(&s, "set_rows", json!({"path": "r", "layer": 0, "frame": 0, "rows": ["1121", "1.11"]}));
+    ok(&s, "add_frame", json!({"path": "r", "copy_from": 0}));
+    ok(&s, "add_frame", json!({"path": "r", "copy_from": 0, "linked": true}));
+    ok(&s, "add_layer", json!({"path": "r", "name": "top"}));
+    ok(&s, "set_rows", json!({"path": "r", "layer": "top", "frame": 1, "rows": ["...1"]}));
+    // one cel by default; dry run first
+    let t =
+        ok(&s, "replace_color", json!({"path": "r", "layer": 0, "frame": 1, "from": "1", "to": "3", "dry_run": true}));
+    assert!(t.starts_with("DRY RUN") && t.contains("6 pixels in 1 cels"), "{t}");
+    assert_eq!(load(&dir, "r.pxe.json").rows(0, 1), ["1121", "1.11"]);
+    // a rect of one cel
+    let t = ok(
+        &s,
+        "replace_color",
+        json!({"path": "r", "layer": 0, "frame": 1, "rect": {"x": 0, "y": 0, "w": 2, "h": 2}, "from": "1", "to": "3"}),
+    );
+    assert!(t.contains("3 pixels in 1 cels"), "{t}");
+    assert_eq!(load(&dir, "r.pxe.json").rows(0, 1), ["3321", "3.11"]);
+    // a linked cel needs edit_linked, as every write
+    let e = err(&s, "replace_color", json!({"path": "r", "layer": 0, "frame": 0, "from": "1", "to": "3"}));
+    assert!(e.contains("edit_linked"), "{e}");
+    // all frames, all layers; a locked region keeps its pixel (frames 0/2
+    // share a cel, frame 1 has its own) and is counted
+    ok(&s, "set_region", json!({"path": "r", "name": "keep", "x": 3, "y": 1, "w": 1, "h": 1, "locked": true}));
+    let t = ok(&s, "replace_color", json!({"path": "r", "scope": "all", "from": "1", "to": "5"}));
+    assert!(t.contains("5 cels; 2 pixels in locked regions left unchanged"), "{t}");
+    let d = load(&dir, "r.pxe.json");
+    assert_eq!(
+        (d.rows(0, 0), d.rows(0, 2)),
+        (vec!["5525".to_string(), "5.51".into()], vec!["5525".to_string(), "5.51".into()])
+    );
+    assert_eq!((d.rows(0, 1)[1].as_str(), d.rows(1, 1)[0].as_str()), ("3.51", "...5"));
+    // only one layer of a frame
+    let t = ok(
+        &s,
+        "replace_color",
+        json!({"path": "r", "scope": "frame", "frame": 1, "layer": "top", "from": "5", "to": "."}),
+    );
+    assert!(t.contains("layer \"top\""), "{t}");
+    assert_eq!(load(&dir, "r.pxe.json").rows(1, 1)[0], "....");
+    let h = ok(&s, "history", json!({"path": "r"}));
+    assert!(h.contains("Claude: replace_color 5 -> . frame f1, layer \"top\""), "{h}");
+    assert!(err(&s, "replace_color", json!({"path": "r", "from": "2", "to": "2", "layer": 0, "frame": 1}))
+        .contains("same color"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn fill_and_rect_with_dither() {
+    let (s, dir) = server("dither");
+    ok(&s, "create_document", json!({"name": "t", "width": 8, "height": 4}));
+    let t = ok(
+        &s,
+        "fill",
+        json!({"path": "t", "layer": 0, "frame": 0, "x": 0, "y": 0, "dither": {"pattern": "checker", "colors": ["2", "3"]}}),
+    );
+    assert!(t.contains("dither checker of 2 and 3"), "{t}");
+    assert_eq!(load(&dir, "t.pxe.json").rows(0, 0), ["23232323", "32323232", "23232323", "32323232"]);
+    // a filled rect with 25 % over transparent (second color default '.')
+    ok(&s, "clear", json!({"path": "t", "layer": 0, "frame": 0}));
+    ok(
+        &s,
+        "draw_rect",
+        json!({"path": "t", "layer": 0, "frame": 0, "x": 0, "y": 0, "w": 8, "h": 4, "filled": true, "key": "9", "dither": {"pattern": "25"}}),
+    );
+    assert_eq!(load(&dir, "t.pxe.json").rows(0, 0), ["9...9...", "..9...9.", "9...9...", "..9...9."]);
+    // the pattern follows the canvas: a fill inside a clip continues it
+    ok(&s, "clear", json!({"path": "t", "layer": 0, "frame": 0}));
+    ok(
+        &s,
+        "fill",
+        json!({"path": "t", "layer": 0, "frame": 0, "x": 5, "y": 1, "clip": {"x": 4, "y": 0, "w": 4, "h": 4}, "dither": {"pattern": "lines_h", "colors": ["a", "b"]}}),
+    );
+    assert_eq!(load(&dir, "t.pxe.json").rows(0, 0), ["....aaaa", "....bbbb", "....aaaa", "....bbbb"]);
+    let e = err(
+        &s,
+        "fill",
+        json!({"path": "t", "layer": 0, "frame": 0, "x": 0, "y": 0, "dither": {"pattern": "stripes", "colors": ["a"]}}),
+    );
+    assert!(e.contains("unknown pattern") && e.contains("bayer1..bayer15"), "{e}");
+    let e = err(
+        &s,
+        "draw_rect",
+        json!({"path": "t", "layer": 0, "frame": 0, "x": 0, "y": 0, "w": 2, "h": 2, "key": "1", "dither": {"pattern": "75"}}),
+    );
+    assert!(e.contains("filled"), "{e}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn outline_outside_inside_and_rect() {
+    let (s, dir) = server("outline");
+    ok(&s, "create_document", json!({"name": "o", "width": 5, "height": 5}));
+    ok(
+        &s,
+        "set_rows",
+        json!({"path": "o", "layer": 0, "frame": 0, "x": 0, "y": 1, "rows": [".....", "..1..", "....."]}),
+    );
+    let t = ok(&s, "outline", json!({"path": "o", "layer": 0, "frame": 0, "color": "0", "dry_run": true}));
+    assert!(t.starts_with("DRY RUN") && t.contains("outline outside 0 4-connected") && t.contains("4 pixels"), "{t}");
+    ok(&s, "outline", json!({"path": "o", "layer": 0, "frame": 0, "color": "0", "connectivity": 8}));
+    assert_eq!(load(&dir, "o.pxe.json").rows(0, 0), [".....", ".000.", ".010.", ".000.", "....."]);
+    // inside: the ring's own edge; the canvas edge counts as outside
+    ok(&s, "outline", json!({"path": "o", "layer": 0, "frame": 0, "color": "c", "mode": "inside"}));
+    assert_eq!(load(&dir, "o.pxe.json").rows(0, 0), [".....", ".ccc.", ".c1c.", ".ccc.", "....."]);
+    // a rect: the shape is what lies inside it, the outline may go 1 px around it
+    ok(&s, "clear", json!({"path": "o", "layer": 0, "frame": 0}));
+    ok(&s, "set_rows", json!({"path": "o", "layer": 0, "frame": 0, "x": 0, "y": 2, "rows": [".12.."]}));
+    let t = ok(
+        &s,
+        "outline",
+        json!({"path": "o", "layer": 0, "frame": 0, "rect": {"x": 0, "y": 0, "w": 2, "h": 5}, "color": "0", "only_transparent": true}),
+    );
+    assert!(t.contains("only transparent"), "{t}");
+    assert_eq!(load(&dir, "o.pxe.json").rows(0, 0)[1..4], [".0...", "012..", ".0..."]);
+    let e = err(&s, "outline", json!({"path": "o", "layer": 0, "frame": 0, "color": "0", "connectivity": 6}));
+    assert!(e.contains("4 or 8"), "{e}");
+    let e = err(
+        &s,
+        "outline",
+        json!({"path": "o", "layer": 0, "frame": 0, "color": "0", "mode": "inside", "only_transparent": true}),
+    );
+    assert!(e.contains("outside"), "{e}");
+    let h = ok(&s, "history", json!({"path": "o"}));
+    assert!(h.contains("Claude: outline outside 0"), "{h}");
     std::fs::remove_dir_all(&dir).unwrap();
 }

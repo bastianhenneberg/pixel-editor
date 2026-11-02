@@ -28,6 +28,7 @@ use pixel_core::diff::{self, rows_block};
 use pixel_core::document::{Direction, Ramp, Rect, Region, RegionKind, Tag, KEY_ORDER};
 use pixel_core::export::{self, ExportOptions, Target};
 use pixel_core::journal::{Focus, Journal};
+use pixel_core::recolor::{self, Area, Outline, OutlineMode, Pattern};
 use pixel_core::render::PreviewOptions;
 use pixel_core::seams;
 use pixel_core::transform::{self, Op};
@@ -577,12 +578,32 @@ impl Server {
                 Ok(format!("line: {}", paint(d, s, &pts, k)))
             }),
             "draw_rect" => self.pixel_write(a, "draw_rect", |d, s| {
-                let k = key_of(d, a.get("key"))?;
+                let dither = dither_arg(d, a)?;
+                let filled = bool_arg(a, "filled", false);
+                if dither.is_some() && !filled {
+                    return Err("dither needs filled: true".into());
+                }
+                let k = match (&dither, a.get("key")) {
+                    (Some((_, k, _)), _) => *k,
+                    (None, key) => key_of(d, key)?,
+                };
                 let (x, y, w, h) = (int_of(a, "x")?, int_of(a, "y")?, int_of(a, "w")?, int_of(a, "h")?);
                 if w < 1 || h < 1 {
                     return Err(format!("w and h must be >= 1 (got w={w}, h={h})"));
                 }
-                let pts = draw::rect(x, y, x + w - 1, y + h - 1, bool_arg(a, "filled", false));
+                let pts = draw::rect(x, y, x + w - 1, y + h - 1, filled);
+                if let Some((p, a, b)) = dither {
+                    let off = pts.iter().filter(|(x, y)| !d.in_bounds(*x, *y)).count();
+                    recolor::dither_points(d, s.layer, s.frame, &pts, p, a, b).apply(d, s.layer, s.frame);
+                    return Ok(format!(
+                        "rect: {} pixels, dither {} of {} and {}{}",
+                        pts.len(),
+                        p.id(),
+                        d.key_label(a),
+                        d.key_label(b),
+                        off_canvas(off)
+                    ));
+                }
                 Ok(format!("rect: {}", paint(d, s, &pts, k)))
             }),
             "draw_ellipse" => self.pixel_write(a, "draw_ellipse", |d, s| {
@@ -595,7 +616,11 @@ impl Server {
                 Ok(format!("ellipse: {}", paint(d, s, &pts, k)))
             }),
             "fill" => self.pixel_write(a, "fill", |d, s| {
-                let k = key_of(d, a.get("key"))?;
+                let dither = dither_arg(d, a)?;
+                let k = match (&dither, a.get("key")) {
+                    (Some((_, k, _)), _) => *k,
+                    (None, key) => key_of(d, key)?,
+                };
                 let (x, y) = (int_of(a, "x")?, int_of(a, "y")?);
                 if !d.in_bounds(x, y) {
                     return Err(format!("({x}, {y}) is outside the {}x{} canvas", d.width, d.height));
@@ -609,8 +634,13 @@ impl Server {
                     .into_iter()
                     .filter(|(px, py)| s.clip.is_none_or(|c| c.contains(*px, *py)))
                     .collect();
-                d.set_points(s.layer, s.frame, &region, k);
-                Ok(format!("fill from ({x}, {y}): {} -> {}", d.key_label(old), d.key_label(k)))
+                let (pattern, a_key, b_key) = dither.unwrap_or((Pattern::Checker, k, k));
+                recolor::dither_points(d, s.layer, s.frame, &region, pattern, a_key, b_key).apply(d, s.layer, s.frame);
+                let with = match dither {
+                    Some((p, a, b)) => format!("dither {} of {} and {}", p.id(), d.key_label(a), d.key_label(b)),
+                    None => d.key_label(k),
+                };
+                Ok(format!("fill from ({x}, {y}): {} -> {with}", d.key_label(old)))
             }),
             "clear" => self.pixel_write(a, "clear", |d, s| {
                 let r = s.clip.unwrap_or(Rect::new(0, 0, d.width, d.height));
@@ -621,6 +651,7 @@ impl Server {
             }),
             "copy_region" | "move_region" => self.copy_or_move(a, name == "move_region"),
             "transform" => self.transform_tool(a),
+            "replace_color" | "outline" => self.recolor_tool(a, name),
             "mirror_document" => self.mirror_document(a),
             "list_regions" => {
                 let (_, doc, _) = self.load(a)?;
@@ -1491,30 +1522,7 @@ impl Server {
                         "scope {scope} transforms whole frames; region/clip/rect belong to scope region/rect"
                     ));
                 }
-                let (frames, label) = self.scope_frames(&doc, a, scope)?;
-                let layers: Vec<usize> = match index_or_name(a.get("layer")) {
-                    Some(l) => vec![doc.find_layer(&l)?],
-                    None => (0..doc.layers.len()).collect(),
-                };
-                for &l in &layers {
-                    for &f in &frames {
-                        if let Some(why) = doc.edit_blocked(l, f) {
-                            return Err(format!(
-                                "{why}; nothing was written (unlock it, or pass layer to leave other layers alone)"
-                            ));
-                        }
-                        let outside: Vec<usize> =
-                            doc.layers[l].linked_frames(f).into_iter().filter(|g| !frames.contains(g)).collect();
-                        if !outside.is_empty() && !bool_arg(a, "edit_linked", false) {
-                            return Err(format!(
-                                "the cel of layer {:?} on frame {} is linked with frames {outside:?} outside the scope; \
-                                 transforming it would change them too. Pass edit_linked: true, or unlink it first (link_cel unlink: true)",
-                                doc.layers[l].name,
-                                doc.frame_label(f)
-                            ));
-                        }
-                    }
-                }
+                let (frames, layers, label) = self.whole_frames(&doc, a, scope)?;
                 let cels = transform::unique_cels(&doc, &layers, &frames);
                 let mut clipped = 0;
                 for &(l, f) in &cels {
@@ -1543,6 +1551,152 @@ impl Server {
             args["note"] = json!(format!("{}: transform {} {what}", self.author(), op.id()));
         }
         self.finish_write(&args, &path, &before, doc, &scopes, "transform", detail, true)
+    }
+
+    /// Frames and layers of a whole-frame scope (frame, frames, tag, all;
+    /// all layers or only `layer`) and a label. Refuses locked cels and
+    /// cels linked to frames outside the scope (unless edit_linked).
+    fn whole_frames(&self, doc: &Document, a: &Value, scope: &str) -> Result<(Vec<usize>, Vec<usize>, String), String> {
+        let (frames, label) = self.scope_frames(doc, a, scope)?;
+        let layers: Vec<usize> = match index_or_name(a.get("layer")) {
+            Some(l) => vec![doc.find_layer(&l)?],
+            None => (0..doc.layers.len()).collect(),
+        };
+        for &l in &layers {
+            for &f in &frames {
+                if let Some(why) = doc.edit_blocked(l, f) {
+                    return Err(format!(
+                        "{why}; nothing was written (unlock it, or pass layer to leave other layers alone)"
+                    ));
+                }
+                let outside: Vec<usize> =
+                    doc.layers[l].linked_frames(f).into_iter().filter(|g| !frames.contains(g)).collect();
+                if !outside.is_empty() && !bool_arg(a, "edit_linked", false) {
+                    return Err(format!(
+                        "the cel of layer {:?} on frame {} is linked with frames {outside:?} outside the scope; \
+                         changing it would change them too. Pass edit_linked: true, or unlink it first (link_cel unlink: true)",
+                        doc.layers[l].name,
+                        doc.frame_label(f)
+                    ));
+                }
+            }
+        }
+        Ok((frames, layers, label))
+    }
+
+    /// replace_color and outline: plan the edit on each cel of the scope
+    /// (rect/region/cel of one cel, or whole frames like transform) and
+    /// write it. Pixels in locked regions stay and are counted.
+    fn recolor_tool(&self, a: &Value, tool: &str) -> Result<Out, String> {
+        let (path, doc, _) = self.load(a)?;
+        let has_area = a.get("region").is_some() || a.get("clip").is_some() || a.get("rect").is_some();
+        let scope = match a.get("scope").and_then(Value::as_str) {
+            Some(s) => s,
+            None if a.get("region").is_some() => "region",
+            None if has_area => "rect",
+            None => "cel",
+        };
+        let edit = match tool {
+            "replace_color" => {
+                let from = key_of(&doc, a.get("from")).map_err(|e| format!("from: {e}"))?;
+                let to = key_of(&doc, a.get("to")).map_err(|e| format!("to: {e}"))?;
+                if from == to {
+                    return Err("from and to are the same color".into());
+                }
+                Edit::Replace(from, to)
+            }
+            _ => {
+                let eight = match a.get("connectivity").map(|v| v.as_i64()) {
+                    None | Some(Some(4)) => false,
+                    Some(Some(8)) => true,
+                    _ => return Err("connectivity must be 4 or 8".into()),
+                };
+                let mode = OutlineMode::parse(a.get("mode").and_then(Value::as_str).unwrap_or("outside"))?;
+                let only_transparent = bool_arg(a, "only_transparent", false);
+                if only_transparent && mode == OutlineMode::Inside {
+                    return Err("only_transparent works with mode outside (inside, every pixel is colored)".into());
+                }
+                Edit::Outline(Outline { color: key_of(&doc, a.get("color"))?, mode, eight, only_transparent })
+            }
+        };
+        let canvas = Rect::new(0, 0, doc.width, doc.height);
+        let (cels, area, what) = match scope {
+            "rect" | "region" | "cel" => {
+                let s = self.target(&doc, a, "layer", "frame")?;
+                let area = match (scope, s.clip) {
+                    ("cel", None) => canvas,
+                    ("cel", Some(_)) => return Err("scope cel works on the whole cel; drop region/clip/rect".into()),
+                    (_, Some(c)) => c,
+                    (_, None) => {
+                        return Err(format!(
+                            "scope {scope} needs {}",
+                            if scope == "rect" { "rect/clip {x,y,w,h}" } else { "region" }
+                        ))
+                    }
+                };
+                let what = format!(
+                    "{} {} [{}]",
+                    doc.frame_label(s.frame),
+                    doc.layers[s.layer].name,
+                    a.get("region").and_then(Value::as_str).map_or(area.describe(), str::to_string)
+                );
+                (vec![(s.layer, s.frame)], (scope != "cel").then_some(area), what)
+            }
+            "frame" | "frames" | "tag" | "all" => {
+                if has_area {
+                    return Err(format!(
+                        "scope {scope} works on whole frames; region/clip/rect belong to scope region/rect"
+                    ));
+                }
+                let (frames, layers, label) = self.whole_frames(&doc, a, scope)?;
+                let layer_label = if layers.len() == 1 && doc.layers.len() > 1 {
+                    format!("layer {:?}", doc.layers[layers[0]].name)
+                } else {
+                    "all layers".to_string()
+                };
+                (transform::unique_cels(&doc, &layers, &frames), None, format!("{label}, {layer_label}"))
+            }
+            s => return Err(format!("unknown scope {s:?} (rect, region, cel, frame, frames, tag, all)")),
+        };
+        let before = doc.clone();
+        let mut doc = doc;
+        let plan_area = Area::rect(area.unwrap_or(canvas));
+        // an outside outline may lie one pixel around the area
+        let clip = area.map(|r| match edit {
+            Edit::Outline(o) if o.mode == OutlineMode::Outside => {
+                transform::clip_rect(Rect::new(r.x - 1, r.y - 1, r.w + 2, r.h + 2), doc.width, doc.height).unwrap_or(r)
+            }
+            _ => r,
+        });
+        let (mut changed, mut protected, mut scopes) = (0, 0, Vec::new());
+        for &(layer, frame) in &cels {
+            let plan = match edit {
+                Edit::Replace(from, to) => recolor::replace_points(&before, layer, frame, plan_area, from, to, true),
+                Edit::Outline(o) => recolor::outline_points(&before, layer, frame, plan_area, o, true),
+            };
+            protected += plan.protected;
+            changed += plan.apply(&mut doc, layer, frame);
+            scopes.push(CelScope { layer, frame, clip });
+        }
+        let title = match edit {
+            Edit::Replace(from, to) => format!("{} -> {}", before.key_label(from), before.key_label(to)),
+            Edit::Outline(o) => format!(
+                "{} {} {}-connected{}",
+                o.mode.id(),
+                before.key_label(o.color),
+                if o.eight { 8 } else { 4 },
+                if o.only_transparent { ", only transparent" } else { "" }
+            ),
+        };
+        let mut detail = format!("{tool} {title}: {what}: {changed} pixels in {} cels", cels.len());
+        if protected > 0 {
+            detail += &format!("; {protected} pixels in locked regions left unchanged");
+        }
+        let mut args = a.clone();
+        if args.get("note").and_then(Value::as_str).is_none_or(|n| n.trim().is_empty()) {
+            args["note"] = json!(format!("{}: {tool} {title} {what}", self.author()));
+        }
+        self.finish_write(&args, &path, &before, doc, &scopes, tool, detail, false)
     }
 
     /// The frames of a whole-frame transform scope and a label for them.
@@ -2181,6 +2335,36 @@ fn paint(d: &mut Document, s: CelScope, pts: &[(i32, i32)], key: u8) -> String {
     format!("{} pixels with {}{}", pts.len(), d.key_label(key), off_canvas(off))
 }
 
+/// The `dither` argument {pattern, colors: [a, b]}: pattern and both keys
+/// (b defaults to transparent; a defaults to `key`).
+fn dither_arg(d: &Document, a: &Value) -> Result<Option<(Pattern, u8, u8)>, String> {
+    let Some(v) = a.get("dither").filter(|v| !v.is_null()) else { return Ok(None) };
+    let pattern = Pattern::parse(v.get("pattern").and_then(Value::as_str).unwrap_or("checker"))?;
+    let colors: Vec<&Value> = match v.get("colors") {
+        Some(Value::Array(c)) => c.iter().collect(),
+        Some(_) => return Err("dither.colors must be an array [first, second]".into()),
+        None => Vec::new(),
+    };
+    if colors.len() > 2 {
+        return Err("dither.colors takes two colors".into());
+    }
+    let first = match colors.first() {
+        Some(k) => key_of(d, Some(k)).map_err(|e| format!("dither.colors[0]: {e}"))?,
+        None => key_of(d, a.get("key")).map_err(|e| format!("dither needs colors [a, b] or key: {e}"))?,
+    };
+    let second = match colors.get(1) {
+        Some(k) => key_of(d, Some(k)).map_err(|e| format!("dither.colors[1]: {e}"))?,
+        None => TRANSPARENT,
+    };
+    Ok(Some((pattern, first, second)))
+}
+
+#[derive(Clone, Copy)]
+enum Edit {
+    Replace(u8, u8),
+    Outline(Outline),
+}
+
 fn palette_line(doc: &Document) -> String {
     doc.palette.iter().map(|p| format!("{}={}", p.label(), p.color)).collect::<Vec<_>>().join(" ")
 }
@@ -2480,6 +2664,10 @@ mirror_document(src, dst) writes a mirrored copy with tags, durations, linked ce
 Shading: a document can have color ramps (palette keys dark to light, e.g. crust 3>8>9>a; set_ramps, shown by \
 get_document); shade(pixels|rect|region, steps +n lighter / -n darker) moves pixels along their ramp and leaves \
 colors outside any ramp alone. \
+Recoloring: replace_color(from, to) and outline(color, mode outside|inside, connectivity 4|8, only_transparent) \
+take the same scopes as transform (rect/region/cel of one layer+frame, or frame/frames/tag/all); fill and draw_rect \
+(filled) accept dither {pattern checker|25|75|bayer1..15|lines_h|lines_d, colors [a, b]}, aligned to the canvas so \
+neighbouring fills and tiles of 4n px stay seamless. \
 Tiles must repeat seamlessly: render_preview with tiled: true shows a frame 3x3, check_seams reports hard edges where \
 the right/bottom edge meets the left/top one. \
 Environments are tilemaps (.tilemap.json): a grid of one-character keys whose legend maps each key to a tile (a frame \
@@ -2508,6 +2696,37 @@ fn tool_list() -> Value {
     let boolean = |d: &str| json!({"type": "boolean", "description": d});
     let note = json!({"type": "string", "description": "history description; default generated (\"<assistant>: <tool> <frame> <layer> ...\", e.g. \"Claude: ...\" or \"Codex: ...\")"});
     let dry = boolean("only report what would change; write nothing");
+    let dither = json!({"type": "object", "description": "fill with a two-color pattern aligned to the canvas (seamless next to other fills and in tiles of 4n px)", "properties": {"pattern": {"type": "string", "description": "checker (50 %), 25, 75 (share of the first color), bayer1..bayer15 (Bayer 4x4, n/16 first color), lines_h, lines_d"}, "colors": {"type": "array", "items": {"type": "string"}, "description": "[first, second] palette keys or color names, e.g. two ramp steps; second default '.'; first default key"}}});
+    // the scope of replace_color and outline (as transform)
+    let scoped = |extra: Value| -> Value {
+        let mut m = Map::new();
+        m.insert("path".into(), path.clone());
+        m.insert("scope".into(), json!({"type": "string", "enum": ["rect", "region", "cel", "frame", "frames", "tag", "all"], "description": "rect (rect/clip) / region (region) / cel: one cel (layer + frame); frame / frames / tag / all: whole frames, all layers or only layer. Default: region or rect when given, else cel"}));
+        m.insert("layer".into(), json!({"type": ["integer", "string"], "description": "layer (required for rect/region/cel; for whole frames: only this layer)"}));
+        m.insert(
+            "frame".into(),
+            json!({"type": ["integer", "string"], "description": "frame (rect/region/cel/frame)"}),
+        );
+        m.insert(
+            "region".into(),
+            json!({"type": "string", "description": "scope region: this region's rect on that frame"}),
+        );
+        m.insert("clip".into(), json!({"type": "object", "description": "scope rect: {x, y, w, h}", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "w": {"type": "integer"}, "h": {"type": "integer"}}}));
+        m.insert("rect".into(), json!({"type": "object", "description": "same as clip", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "w": {"type": "integer"}, "h": {"type": "integer"}}}));
+        m.insert("frames".into(), json!({"type": "array", "items": {"type": ["integer", "string"]}, "description": "scope frames: these frames"}));
+        m.insert("from".into(), json!({"type": ["integer", "string"], "description": "scope frames: first frame"}));
+        m.insert(
+            "to".into(),
+            json!({"type": ["integer", "string"], "description": "scope frames: last frame (inclusive)"}),
+        );
+        m.insert("tag".into(), json!({"type": "string", "description": "scope tag: the frames of this tag"}));
+        m.insert("edit_linked".into(), boolean("allow changing cels linked to frames outside the target"));
+        m.insert("dry_run".into(), dry.clone());
+        m.insert("note".into(), note.clone());
+        m.insert("pace_ms".into(), int("show the change row by row in an open editor, this many ms apart"));
+        m.extend(extra.as_object().unwrap().clone());
+        Value::Object(m)
+    };
     // explicit target for every pixel write
     let write = |extra: Value| -> Value {
         let mut m = Map::new();
@@ -2580,16 +2799,16 @@ fn tool_list() -> Value {
         tool("draw_line", "Bresenham line, endpoints inclusive, 1 px wide.", write(json!({
                 "x0": int("start x"), "y0": int("start y"), "x1": int("end x"), "y1": int("end y"), "key": key})),
             &w_req(&["x0", "y0", "x1", "y1", "key"])),
-        tool("draw_rect", "Rectangle outline (1 px) or filled.", write(json!({
+        tool("draw_rect", "Rectangle outline (1 px) or filled (optionally with a dither pattern).", write(json!({
                 "x": int("left"), "y": int("top"), "w": int("width"), "h": int("height"), "key": key,
-                "filled": boolean("default false")})),
-            &w_req(&["x", "y", "w", "h", "key"])),
+                "filled": boolean("default false"), "dither": dither.clone()})),
+            &w_req(&["x", "y", "w", "h"])),
         tool("draw_ellipse", "Ellipse outline (1 px) or filled, centred on pixel (cx, cy) with radii rx, ry: covers x cx-rx..cx+rx and y cy-ry..cy+ry. Circle: rx = ry.", write(json!({
                 "cx": int("centre x"), "cy": int("centre y"), "rx": int("horizontal radius"), "ry": int("vertical radius"), "key": key,
                 "filled": boolean("default false")})),
             &w_req(&["cx", "cy", "rx", "ry", "key"])),
-        tool("fill", "Flood fill (4-neighbourhood) of the same-key area around (x, y); never spreads outside the region/clip.", write(json!({"x": int("x"), "y": int("y"), "key": key})),
-            &w_req(&["x", "y", "key"])),
+        tool("fill", "Flood fill (4-neighbourhood) of the same-key area around (x, y); never spreads outside the region/clip. With dither the area gets a two-color pattern instead of key.", write(json!({"x": int("x"), "y": int("y"), "key": key, "dither": dither.clone()})),
+            &w_req(&["x", "y"])),
         tool("clear", "Make the target transparent: the region/clip, or the whole cel.", write(json!({})), &w_req(&[])),
         tool("copy_region", "Copy the pixels of a region (or clip rect) to an offset and/or another frame/layer. mode over (default): transparent source pixels keep the destination; replace: copy them too.", write(json!({
                 "dx": int("x offset"), "dy": int("y offset"),
@@ -2618,6 +2837,14 @@ fn tool_list() -> Value {
                 "edit_linked": boolean("allow changing cels linked to frames outside the target"),
                 "dry_run": dry.clone(), "note": note.clone(),
                 "pace_ms": int("show the change row by row in an open editor, this many ms apart")}), &["path", "op", "scope"]),
+        tool("replace_color", "Replace one color by another everywhere in the scope (with diff and history). Pixels in locked regions stay and are counted; locked layers/frames refuse.", scoped(json!({
+                "from": {"type": "string", "description": "palette key or color name to replace ('.' = transparent)"},
+                "to": {"type": "string", "description": "palette key or color name it becomes ('.' = transparent)"}})), &["path", "from", "to"]),
+        tool("outline", "Draw a 1-px outline around the non-transparent pixels of each cel in the scope (with diff and history). mode outside (default): on the pixels around the shape (may lie 1 px outside a rect/region); inside: on the shape's own edge pixels (the canvas edge counts as outside). connectivity 4 (default, corners stay free) or 8 (diagonals too). only_transparent (outside only): pixels that already have a color stay. Pixels in locked regions stay and are counted.", scoped(json!({
+                "color": {"type": "string", "description": "palette key or color name of the outline"},
+                "mode": {"type": "string", "enum": ["outside", "inside"]},
+                "connectivity": {"type": "integer", "enum": [4, 8]},
+                "only_transparent": boolean("outside only: draw only on transparent pixels (default false)")})), &["path", "color"]),
         tool("mirror_document", "Write a mirrored copy of a document (e.g. walk_left from walk_right): every frame mirrored around the canvas centre; tags, durations, linked cels, layers, locks and regions are kept, region rects and markers are mirrored too. The source is not changed.", json!({
                 "src": {"type": "string", "description": "source document path relative to the workdir"},
                 "dst": {"type": "string", "description": "new document name (\".pxe.json\" is appended unless given; .aseprite works too)"},

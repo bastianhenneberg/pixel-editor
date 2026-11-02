@@ -33,6 +33,7 @@ impl EditorApp {
         if matches!(self.tool, Tool::Rect | Tool::Ellipse) {
             ui.checkbox(&mut self.filled, "gefüllt");
         }
+        self.dither_panel(ui);
         if matches!(self.tool, Tool::Pencil | Tool::Eraser) {
             ui.checkbox(&mut self.pixel_perfect, "Pixel-Perfect").on_hover_text(
                 "Entfernt beim Freihandzeichnen die doppelten Eckpixel (L-Ecken), damit Linien 1 Pixel dünn bleiben",
@@ -113,21 +114,34 @@ impl EditorApp {
             ui.label(self.doc.key_label(current));
         });
         ui.add_space(4.0);
-        let (mut picked, mut toggled) = (None, None);
+        let (mut picked, mut toggled, mut replace) = (None, None, None);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::splat(3.0);
             let r = swatch(ui, None, 22.0, current == TRANSPARENT).on_hover_text("'.' transparent");
             if r.clicked() {
                 picked = Some(TRANSPARENT);
             }
+            r.context_menu(|ui| {
+                if ui.button("Diese Farbe ersetzen durch …").clicked() {
+                    replace = Some(TRANSPARENT);
+                    ui.close();
+                }
+            });
             for p in &self.doc.palette {
                 let tip = if p.name.is_empty() {
                     format!("Taste '{}' · {}", p.key as char, p.color)
                 } else {
                     format!("Taste '{}' · {} · {}", p.key as char, p.name, p.color)
                 };
-                let r = swatch(ui, Some(p.color), 22.0, current == p.key)
-                    .on_hover_text(format!("{tip}\nStrg+Klick = für eine Rampe markieren"));
+                let r = swatch(ui, Some(p.color), 22.0, current == p.key).on_hover_text(format!(
+                    "{tip}\nStrg+Klick = für eine Rampe markieren\nRechtsklick = Farbe ersetzen"
+                ));
+                r.context_menu(|ui| {
+                    if ui.button("Diese Farbe ersetzen durch …").clicked() {
+                        replace = Some(p.key);
+                        ui.close();
+                    }
+                });
                 if let Some(n) = self.ramp_pick.iter().position(|k| *k == p.key) {
                     pick_badge(ui, r.rect, n + 1);
                 }
@@ -142,6 +156,9 @@ impl EditorApp {
         });
         if let Some(k) = picked {
             self.color = k;
+        }
+        if let Some(k) = replace {
+            self.open_replace(k);
         }
         if let Some(k) = toggled {
             match self.ramp_pick.iter().position(|q| *q == k) {
@@ -859,7 +876,7 @@ pub fn direction_label(d: Direction) -> &'static str {
 }
 
 /// A clickable color swatch; `None` draws the transparency checker.
-fn swatch(ui: &mut egui::Ui, color: Option<Rgba>, size: f32, selected: bool) -> egui::Response {
+pub(super) fn swatch(ui: &mut egui::Ui, color: Option<Rgba>, size: f32, selected: bool) -> egui::Response {
     let (rect, resp) = ui.allocate_exact_size(Vec2::splat(size), Sense::click());
     let p = ui.painter();
     let h = size / 2.0;

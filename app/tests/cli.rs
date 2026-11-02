@@ -201,3 +201,41 @@ fn mcp_server_shades_along_a_ramp() {
     );
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The real binary as MCP server: replace_color, outline and a dither fill
+/// end to end, each recorded in the history.
+#[test]
+fn mcp_server_replaces_outlines_and_dithers() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("pxe-cli-recolor-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let doc = r##"{"version":1,"width":4,"height":3,"palette":[{"key":"1","color":"#3fc46e"},
+        {"key":"2","color":"#ff004d"},{"key":"o","color":"#16242a"}],
+        "layers":[{"name":"l"}],"frames":[{"name":"a"},{"name":"b"}],
+        "cels":[{"layer":0,"frame":0,"rows":["....",".1..","...."]},{"layer":0,"frame":1,"rows":["....","....","...."]}]}"##;
+    std::fs::write(dir.join("t.pxe.json"), doc).unwrap();
+    let calls = [
+        r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{"name":"claude-code"}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"replace_color","arguments":{"path":"t","scope":"all","from":"1","to":"2"}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"outline","arguments":{"path":"t","layer":0,"frame":"a","color":"o"}}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"fill","arguments":{"path":"t","layer":0,"frame":"b","x":0,"y":0,"dither":{"pattern":"checker","colors":["1","2"]}}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"history","arguments":{"path":"t"}}}"#,
+    ];
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pixel-editor"))
+        .args(["mcp", dir.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all((calls.join("\n") + "\n").as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("replace_color 1 -> 2: all frames, all layers: 1 pixels in 2 cels"), "{text}");
+    assert!(text.contains("outline outside o 4-connected") && text.contains("dither checker of 1 and 2"), "{text}");
+    assert!(text.contains("Claude: outline outside o") && text.contains("Claude: replace_color 1 -> 2"), "{text}");
+    let saved = std::fs::read_to_string(dir.join("t.pxe.json")).unwrap();
+    assert!(saved.contains(r#"".o..""#) && saved.contains(r#""o2o.""#), "{saved}");
+    assert!(saved.contains("1212") && saved.contains("2121"), "{saved}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

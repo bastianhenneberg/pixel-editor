@@ -14,6 +14,7 @@ pub mod import;
 pub mod io;
 pub mod journal;
 pub mod palettes;
+pub mod recolor;
 pub mod render;
 pub mod seams;
 pub mod tilemap;

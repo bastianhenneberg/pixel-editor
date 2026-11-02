@@ -26,6 +26,16 @@ pub enum Scope {
     All,
 }
 
+/// The cels of a scope (see `EditorApp::scope_cels`).
+pub struct ScopeCels {
+    pub cels: Vec<(usize, usize)>,
+    /// Why locked cels were left out.
+    pub skipped: Vec<String>,
+    /// "Frame 3", "Tag walk · Ebene body", ...
+    pub what: String,
+    pub frames: Vec<usize>,
+}
+
 /// Keyboard shortcut of an op: Alt + letter (Shift+H is taken).
 pub fn op_key(op: Op) -> (Key, Modifiers, &'static str) {
     match op {
@@ -153,40 +163,12 @@ impl EditorApp {
         }
         self.commit_floating();
         let (l, f) = (self.layer, self.frame);
-        let frames: Vec<usize> = match scope {
-            Scope::Cel | Scope::Frame => vec![f],
-            Scope::Tag => match self.current_tag() {
-                Some(t) => (self.doc.tags[t].from..=self.doc.tags[t].to).collect(),
-                None => {
-                    self.status = "Der aktuelle Frame gehört zu keinem Tag".into();
-                    return;
-                }
-            },
-            _ => (0..self.doc.frames.len()).collect(),
-        };
-        let layers: Vec<usize> = if scope == Scope::Cel { vec![l] } else { (0..self.doc.layers.len()).collect() };
-        // locked layers/frames are left alone and named
-        let mut skipped = Vec::new();
-        let mut cels = Vec::new();
-        for (cl, cf) in transform::unique_cels(&self.doc, &layers, &frames) {
-            match self.doc.edit_blocked(cl, cf) {
-                Some(why) => {
-                    if !skipped.contains(&why) {
-                        skipped.push(why)
-                    }
-                }
-                None => cels.push((cl, cf)),
+        let ScopeCels { cels, skipped, what, frames } = match self.scope_cels(scope, false) {
+            Ok(s) => s,
+            Err(e) => {
+                self.status = e;
+                return;
             }
-        }
-        if cels.is_empty() {
-            self.status = format!("Gesperrt: {}", skipped.join(", "));
-            return;
-        }
-        let what = match scope {
-            Scope::Cel => format!("Cel {}", self.here()),
-            Scope::Frame => format!("Frame {}", self.doc.frame_label(f)),
-            Scope::Tag => format!("Tag {}", self.doc.tags[self.current_tag().unwrap()].name),
-            _ => "alle Frames".to_string(),
         };
         let linked_out: usize = cels
             .iter()
@@ -218,6 +200,52 @@ impl EditorApp {
         }
         self.status = status;
         self.canvas.invalidate();
+    }
+
+    /// The cels a whole-cel edit of `scope` touches (each linked cel once):
+    /// the current cel, or all layers (only the current one with
+    /// `one_layer`) of the current frame, the tag's frames or all frames.
+    /// Locked layers/frames are left out and named in `skipped`; Err when
+    /// nothing is left. `Scope::Selection` gives the current cel (the
+    /// caller limits the edit to the selection).
+    pub(super) fn scope_cels(&self, scope: Scope, one_layer: bool) -> Result<ScopeCels, String> {
+        let (l, f) = (self.layer, self.frame);
+        let frames: Vec<usize> = match scope {
+            Scope::Selection | Scope::Cel | Scope::Frame => vec![f],
+            Scope::Tag => match self.current_tag() {
+                Some(t) => (self.doc.tags[t].from..=self.doc.tags[t].to).collect(),
+                None => return Err("Der aktuelle Frame gehört zu keinem Tag".into()),
+            },
+            Scope::All => (0..self.doc.frames.len()).collect(),
+        };
+        let single = one_layer || matches!(scope, Scope::Selection | Scope::Cel);
+        let layers: Vec<usize> = if single { vec![l] } else { (0..self.doc.layers.len()).collect() };
+        // locked layers/frames are left alone and named
+        let mut skipped = Vec::new();
+        let mut cels = Vec::new();
+        for (cl, cf) in transform::unique_cels(&self.doc, &layers, &frames) {
+            match self.doc.edit_blocked(cl, cf) {
+                Some(why) => {
+                    if !skipped.contains(&why) {
+                        skipped.push(why)
+                    }
+                }
+                None => cels.push((cl, cf)),
+            }
+        }
+        if cels.is_empty() {
+            return Err(format!("Gesperrt: {}", skipped.join(", ")));
+        }
+        let mut what = match scope {
+            Scope::Selection | Scope::Cel => format!("Cel {}", self.here()),
+            Scope::Frame => format!("Frame {}", self.doc.frame_label(f)),
+            Scope::Tag => format!("Tag {}", self.doc.tags[self.current_tag().unwrap()].name),
+            Scope::All => "alle Frames".to_string(),
+        };
+        if one_layer && !matches!(scope, Scope::Selection | Scope::Cel) {
+            what += &format!(" · Ebene {}", self.doc.layers[l].name);
+        }
+        Ok(ScopeCels { cels, skipped, what, frames })
     }
 
     fn transform_selection(&mut self, op: Op) {
@@ -308,6 +336,8 @@ impl EditorApp {
             ui.menu_button(tag_label, |ui| self.op_buttons(ui, Scope::Tag, false))
         });
         ui.menu_button("Alle Frames", |ui| self.op_buttons(ui, Scope::All, false));
+        ui.separator();
+        self.recolor_menu_entries(ui);
         ui.separator();
         if ui.button("Animation gespiegelt duplizieren…").clicked() {
             self.mirror_dialog = Some(self.mirror_default_path().display().to_string());

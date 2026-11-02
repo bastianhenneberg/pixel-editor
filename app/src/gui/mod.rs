@@ -6,6 +6,7 @@ mod map;
 mod marks;
 mod panels;
 mod preview;
+mod recolor;
 mod select;
 mod settings;
 mod share;
@@ -233,6 +234,10 @@ pub struct EditorApp {
     tile_memory: std::collections::BTreeMap<String, tiled::TileMode>,
     /// "Animation gespiegelt duplizieren": the destination path being typed.
     mirror_dialog: Option<String>,
+    /// "Farbe ersetzen" / "Kontur" dialog.
+    recolor_dialog: Option<recolor::RecolorDialog>,
+    /// Dither option of Füllen and the filled shapes.
+    dither: recolor::Dither,
     /// The last used tool of each toolbar group.
     group_tool: [Tool; toolbar::GROUPS.len()],
     /// The open tool group flyout.
@@ -347,6 +352,8 @@ impl EditorApp {
             tile_mode: Default::default(),
             tile_memory: Default::default(),
             mirror_dialog: None,
+            recolor_dialog: None,
+            dither: Default::default(),
             group_tool: toolbar::GROUPS.map(|(_, tools)| tools[0]),
             flyout: None,
             preview: Default::default(),
@@ -1406,6 +1413,7 @@ impl eframe::App for EditorApp {
         self.dialogs(&ctx);
         self.map_dialog_ui(&ctx);
         self.mirror_dialog_ui(&ctx);
+        self.recolor_dialog_ui(&ctx);
         self.update_title(&ctx);
         self.publish_view();
         if self.autoshot.as_mut().is_some_and(|s| s.tick(&ctx, now)) {

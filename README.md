@@ -155,6 +155,19 @@ Ein nicht quadratischer Bereich, um 90° gedreht, belegt das gedrehte Rechteck a
 
 Für Claude: `set_ramps` legt die Rampen fest, `get_document` zeigt sie, `shade` schattiert Pixel, ein Rechteck oder eine Region (siehe Werkzeuge).
 
+## Farbe ersetzen, Dither, Kontur
+
+**Farbe ersetzen…** (Menü Bild, oder **Rechtsklick auf eine Palettenfarbe** > „Diese Farbe ersetzen durch …“): Farbe A wird durch Farbe B ersetzt (beide auch transparent; „Tauschen“ dreht sie um). Der Dialog wählt den Bereich wie die Untermenüs von Spiegeln/Drehen: **Auswahl** (genau die gewählten Pixel, auch Masken-Formen), **Cel**, **Frame (alle Ebenen)**, **Frames des Tags**, **Alle Frames**; bei den drei letzten optional „nur Ebene …“. Die **Vorschau** zählt die betroffenen Pixel und Cels, bevor etwas geschrieben wird. Gesperrte Ebenen und Frames werden übersprungen und genannt, Pixel in gesperrten Regionen bleiben und werden gezählt. Verknüpfte Cels werden einmal geändert (und damit in allen verknüpften Frames). Ein Rückgängig-Schritt.
+
+**Dither** (Werkzeugfeld bei **Füllen** und bei **Rechteck/Ellipse „gefüllt“**): statt einer Farbe ein Muster aus der aktuellen Farbe und einer **2. Farbe** (aus der Palette, transparent, oder per „Rampe dunkler“/„Rampe heller“ die Nachbarstufe der Farbrampe). Muster: Schachbrett 50 %, 25 %, 75 %, Bayer 4×4 in den Stufen 2/16, 6/16, 10/16, 14/16, Linien horizontal und diagonal. Das Muster ist **an der Leinwand ausgerichtet** (Pixel x, y bekommt immer dieselbe der beiden Farben) und wiederholt sich alle 2 oder 4 Pixel: Füllungen nebeneinander gehen nahtlos ineinander über, und Tiles mit einer Kantenlänge von 4·n Pixeln (32×32) kacheln nahtlos. Auswahl (auch Masken), Symmetrie, Kachel-Modus und gesperrte Regionen wirken wie beim normalen Füllen; die Formvorschau beim Ziehen zeigt das Muster. Rechtsklick füllt wie immer transparent, ohne Muster.
+
+**Kontur (Outline)…** (Menü Bild): zieht eine 1-Pixel-Kontur in einer gewählten Farbe um die nicht-transparenten Pixel, je Cel des Bereichs (Auswahl, Cel, Frame, Tag, alle Frames, optional nur eine Ebene, wie oben):
+- **außen**: auf die Pixel rund um die Form (bei einer Auswahl die gewählten Pixel; die Kontur darf dann 1 Pixel über die Auswahl hinausgehen), **innen**: auf die Randpixel der Form selbst (der Leinwandrand zählt als außen).
+- **4er-Nachbarschaft**: nur gerade Nachbarn, die Ecken bleiben frei (typische Pixelart-Kontur); **8er**: auch diagonal, geschlossene Ecken.
+- **Nur transparente Pixel füllen** (nur bei außen): vorhandene Farbe bleibt stehen, z. B. wo die Kontur einer Auswahl über anderes Gezeichnetes läuft.
+
+Für Claude: `replace_color`, `outline` (Bereiche wie `transform`) und `dither` an `fill`/`draw_rect` (siehe Werkzeuge).
+
 ## Kachel-Modus (Tiles nahtlos zeichnen)
 
 Wie der „Tiled Mode“ von Aseprite: Die Leinwand zeigt das Bild wiederholt, damit man beim Zeichnen sieht, ob ein Tile nahtlos kachelt.
@@ -248,6 +261,7 @@ Tastenkürzel (soweit sinnvoll wie in Aseprite):
 | Linksklick | mit der gewählten Farbe zeichnen |
 | Rechtsklick | mit Transparenz zeichnen (bei jedem Malwerkzeug); beim Schattieren eine Stufe dunkler |
 | Strg+Klick auf eine Palettenfarbe | für eine neue Farbrampe markieren (siehe „Saubere Linien und Schattieren“) |
+| Rechtsklick auf eine Palettenfarbe | „Diese Farbe ersetzen durch …“ (siehe „Farbe ersetzen, Dither, Kontur“) |
 | Alt + Klick | Farbe aufnehmen |
 | Mausrad | zoomen in ganzen Stufen, um den Mauszeiger herum |
 | Mittlere Maustaste / Leertaste + ziehen | verschieben |
@@ -312,6 +326,9 @@ oder `claude mcp add pixel-editor -- /home/bastian/Development/pixel-editor/targ
 | `set_pixels`, `set_rows`, `draw_line`, `draw_rect`, `draw_ellipse`, `fill`, `clear` | Pixel schreiben; immer `layer` + `frame`, optional `region`/`clip`, `edit_linked`, `dry_run`, `note` |
 | `copy_region`, `move_region(region \| clip, dx?, dy?, to_frame?, to_layer?, mode?)` | Bereich kopieren/verschieben, auch in andere Frames/Ebenen; `move_region` verschiebt das Rechteck der Region auf diesem Frame mit |
 | `transform(path, op, scope, layer?, frame?, region? \| rect?, frames? \| from/to?, tag?)` | spiegeln/drehen: `op` `flip_h`, `flip_v`, `rot90` (rechts), `rot180`, `rot270` (links); `scope` `rect`/`region`/`cel` (eine Ebene + Frame) oder `frame`/`frames`/`tag`/`all` (ganze Frames um die Leinwandmitte, alle Ebenen oder nur `layer`; Regionen wandern mit). Abgeschnittene Pixel werden gezählt. Diff, `dry_run`, `note`, `pace_ms`, Verlauf wie die anderen Schreibwerkzeuge; Cels, die mit Frames außerhalb verknüpft sind, brauchen `edit_linked` |
+| `replace_color(path, from, to, scope?, layer?, frame?, region? \| rect?, frames? \| from/to?, tag?)` | Farbe `from` überall im Bereich durch `to` ersetzen (Tasten oder Farbnamen, `.` = transparent). `scope` wie bei `transform`; ohne `scope` gilt `region`/`rect`, wenn angegeben, sonst `cel`. Pixel in gesperrten Regionen bleiben und werden gezählt. Diff, `dry_run`, `note`, Verlauf |
+| `outline(path, color, mode?, connectivity?, only_transparent?, scope?, …)` | 1-px-Kontur um die nicht-transparenten Pixel jedes Cels im Bereich: `mode` `outside` (Standard) / `inside`, `connectivity` 4 (Standard) / 8, `only_transparent` (nur außen) lässt farbige Pixel stehen. Bereiche wie `replace_color`; bei `rect`/`region` darf die Kontur außen 1 px darüber hinaus |
+| `fill(…, dither?)`, `draw_rect(…, filled: true, dither?)` | `dither: {pattern, colors: [a, b]}` füllt mit einem Muster: `checker` (50 %), `25`, `75`, `bayer1`…`bayer15` (Bayer 4×4, n/16 erste Farbe), `lines_h`, `lines_d`; `colors` Tasten oder Farbnamen, z. B. zwei Rampenstufen (zweite Standard `.`, erste Standard `key`). An der Leinwand ausgerichtet, Periode 2 bzw. 4 |
 | `mirror_document(src, dst, op?)` | gespiegelte Kopie (z. B. `walk_left` aus `walk_right`): alle Frames, Tags, Dauern, verknüpfte Cels und Regionen (Rechtecke mitgespiegelt); das Original bleibt |
 | `list_regions`, `set_region(name, kind?, x/y/w/h, frame? \| from/to \| tag, layer?, locked?, color?, hide?, rename?)`, `delete_region` | Regionen und Marker (`kind: "marker"`, nur x/y) |
 | `add_layer`, `set_layer(…, locked?)`, `delete_layer` | Ebenen |
@@ -388,6 +405,9 @@ Sheets enthalten die Frames in Reihenfolge (höchstens 16 pro Reihe, über `colu
   - Zeitleiste scrubben (Ziehen über die Nummern und Cels, Pause, Klemmen am Rand, Klick wählt weiter), Mausrad über den Nummern
   - Kachel-Modus: Stift über den Rand, Klick in eine Kopie, Rechteck über den unteren Rand, Füllen um den Rand herum, Symmetrie mit Wrap, Rechteck-Auswahl über den Rand, Alt+T, Merken je Dokument und Wiederherstellen beim Öffnen, Start im Modus bei Tile-Namen, Vorlage Tile 32×32, Menü Ansicht, gekachelte Vorschau; Bild mit einer Kopie von `tiles32` (Frame `path`, ein Strich über den rechten Rand) in `target/tiled-screenshot.png`
   - Karten: Öffnen als Karten-Tab, Legenden-Eintrag per Klick als Pinsel, Stift mit neuem Tile (Taste entsteht), Strich über mehrere Zellen, Rechtsklick entfernt, Rechteck (U), Füllen (G), Pipette (I), Strg+Z/Strg+Umschalt+Z, Kartengröße, Strg+S mit Journal; Tileset per „Tileset im Tab öffnen“, Zeichnen dort ändert die Karte live (ungespeichert), MCP-`set_tiles` wird nachgeladen (Notiz, Rückgängig); Bild mit Kopien von `tiles32`/`tree64` und der importierten Kopie von `world.txt` in `target/tilemap-screenshot.png`, `render_preview` der ganzen Welt in `target/tilemap-world.png`
+  - Farbe ersetzen: Dialog aus dem Menü Bild, Vorschau-Zahl vor dem Schreiben, Cel, Tag mit und ohne „nur Ebene“, gesperrter Frame übersprungen, Masken-Auswahl, ein Rückgängig-Schritt; Bild in `target/replace-screenshot.png`. Der Eintrag im Rechtsklick-Menü der Palette ist nur über `open_replace` geprüft (kittest findet die Farbfelder nicht per Name)
+  - Dither: Füllen (Schachbrett, Leinwand-ausgerichtet), Rechteck gefüllt mit 25 % und 2. Farbe per „Rampe dunkler“, Rechteck-Umriss ohne Muster, Masken-Auswahl, Symmetrie, Kachel-Modus (Klick in eine Kopie); Bild aller Muster im Kachel-Modus in `target/dither-screenshot.png`
+  - Kontur: außen 4er/8er mit Vorschau-Zahl, innen auf allen Ebenen eines Frames; Vergleich vorher/nachher an einer Kopie von `slime/idle` (Auswahl der rechten Hälfte, außen, 8er) in `target/outline-compare.png`
   - KI-Markierungen: mehrere per Ziehen und Klick, Notiz tippen und mit Enter speichern, Klick daneben schließt nur das Notizfeld, Klick hinein wählt aus und ändert die Notiz, verschieben, Größe an Kante und Ecke, Rechtsklick entfernt eine, Menü „dieses Frames“, Statuszeile „alle“, andere Frames nicht auf der Leinwand aber in der Zeitleiste, eigene Markierungen je Tab, Strg+Umschalt+K auch mit Fokus in einem Textfeld, Übernahme einer alten `pointer.json`, Neuladen nach `clear_marks`; Bild in `target/marks-screenshot.png`. Am echten Bildschirm wurde die Oberfläche bisher nicht bedient.
 
 Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen nach `target/gui-screenshot.png`. Mit sichtbarem Fenster: `PIXEL_EDITOR_SCREENSHOT=/pfad/bild.png pixel-editor datei.pxe.json` speichert nach 2 s (`PIXEL_EDITOR_SCREENSHOT_DELAY`) ein Bild des eigenen Fensters und beendet das Programm.
@@ -411,5 +431,6 @@ Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen n
 - Tags sind Bereiche wie in Aseprite. Eine beliebige Reihenfolge entsteht über angehängte verknüpfte Frames (GUI „Folge“, MCP `set_tag frames`).
 - Palette: Tasten lassen sich in der GUI nicht umbenennen oder umsortieren (Farbnamen schon).
 - Farbrampen werden nur in `.pxe.json` gespeichert; `.aseprite` hat keinen Platz dafür (die GUI weist beim Speichern darauf hin, MCP `save_as` ebenfalls). Rampen-Farben verschiebt man per Knopf, nicht per Ziehen. Schattieren nutzt kein Pixel-Perfect (es soll jedes überstrichene Pixel treffen).
+- Dither gibt es beim Füllen und bei gefüllten Formen, nicht als Stift-Muster; die Muster sind fest (kein eigener Musterentwurf). Die Dither-Einstellung wird nicht in `settings.json` gemerkt.
 - Kein direkter Import von `.pxs` (Umweg: `pxa build` → PNG-Sheet → `import_png` mit Tile-Größe).
 - Fehlermeldungen des Kerns (auch in der GUI-Statuszeile) sind englisch, weil sie mit dem MCP-Server geteilt werden.
