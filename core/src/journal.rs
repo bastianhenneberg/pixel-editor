@@ -77,8 +77,36 @@ pub struct Snapshot {
 }
 
 /// Stable content hash of a document (FNV-1a over its JSON form).
-pub fn doc_hash(doc: &Document) -> String {
-    format!("{:016x}", crate::export::fnv64(&io::to_json(doc)))
+pub fn doc_hash<S: State>(doc: &S) -> String {
+    format!("{:016x}", crate::export::fnv64(&doc.state_json()))
+}
+
+/// What the journal can keep: documents and tilemaps.
+pub trait State: Sized {
+    /// File extension of the state files.
+    const EXT: &'static str;
+    fn state_json(&self) -> String;
+    fn load_state(path: &Path) -> Result<Self, String>;
+}
+
+impl State for Document {
+    const EXT: &'static str = ".pxe.json";
+    fn state_json(&self) -> String {
+        io::to_json(self)
+    }
+    fn load_state(path: &Path) -> Result<Self, String> {
+        io::load(path)
+    }
+}
+
+impl State for crate::tilemap::TileMap {
+    const EXT: &'static str = crate::tilemap::EXTENSION;
+    fn state_json(&self) -> String {
+        crate::tilemap::to_json(self)
+    }
+    fn load_state(path: &Path) -> Result<Self, String> {
+        crate::tilemap::load(path)
+    }
 }
 
 fn now() -> u64 {
@@ -112,19 +140,25 @@ impl Journal {
     }
 
     /// Record `doc` as the state after an edit described by `note`.
-    pub fn record(&self, doc: &Document, author: &str, note: &str) -> Result<Entry, String> {
+    pub fn record<S: State>(&self, doc: &S, author: &str, note: &str) -> Result<Entry, String> {
         self.record_full(Some(doc), author, note, "edit", None, None)
     }
 
     /// An undoable edit with its location (the GUI jumps there).
-    pub fn record_edit(&self, doc: &Document, author: &str, note: &str, focus: Option<Focus>) -> Result<Entry, String> {
+    pub fn record_edit<S: State>(
+        &self,
+        doc: &S,
+        author: &str,
+        note: &str,
+        focus: Option<Focus>,
+    ) -> Result<Entry, String> {
         self.record_full(Some(doc), author, note, "edit", focus, None)
     }
 
     /// An intermediate state of a paced edit (shown live, not a history step).
-    pub fn record_progress(
+    pub fn record_progress<S: State>(
         &self,
-        doc: &Document,
+        doc: &S,
         author: &str,
         note: &str,
         focus: Option<Focus>,
@@ -134,16 +168,22 @@ impl Journal {
 
     /// A view hint without any change ("now working on fist_left").
     pub fn record_focus(&self, author: &str, note: &str, focus: Focus) -> Result<Entry, String> {
-        self.record_full(None, author, note, "focus", Some(focus), None)
+        self.record_full::<Document>(None, author, note, "focus", Some(focus), None)
     }
 
-    fn record_with_base(&self, doc: &Document, author: &str, note: &str, base: Option<u64>) -> Result<Entry, String> {
+    fn record_with_base<S: State>(
+        &self,
+        doc: &S,
+        author: &str,
+        note: &str,
+        base: Option<u64>,
+    ) -> Result<Entry, String> {
         self.record_full(Some(doc), author, note, "edit", None, base)
     }
 
-    fn record_full(
+    fn record_full<S: State>(
         &self,
-        doc: Option<&Document>,
+        doc: Option<&S>,
         author: &str,
         note: &str,
         kind: &str,
@@ -156,8 +196,8 @@ impl Journal {
         let id = entries.last().map_or(1, |e| e.id + 1);
         let (state, hash) = match doc {
             Some(doc) => {
-                let state = format!("{id:06}.pxe.json");
-                io::write_atomic(&states.join(&state), io::to_json(doc).as_bytes())?;
+                let state = format!("{id:06}{}", S::EXT);
+                io::write_atomic(&states.join(&state), doc.state_json().as_bytes())?;
                 (state, doc_hash(doc))
             }
             None => (String::new(), String::new()),
@@ -187,7 +227,7 @@ impl Journal {
     /// Make sure the journal knows the current state; records it as
     /// `note` if the last entry differs (first edit, or changes made
     /// outside the editor/MCP).
-    pub fn ensure_current(&self, doc: &Document, note: &str) -> Result<(), String> {
+    pub fn ensure_current<S: State>(&self, doc: &S, note: &str) -> Result<(), String> {
         let hash = doc_hash(doc);
         if self.entries().iter().rev().find(|e| e.is_step()).is_none_or(|e| e.hash != hash) {
             self.record(doc, "system", note)?;
@@ -196,7 +236,7 @@ impl Journal {
     }
 
     /// The newest edit entry whose state equals `doc`.
-    pub fn entry_for(&self, doc: &Document) -> Option<Entry> {
+    pub fn entry_for<S: State>(&self, doc: &S) -> Option<Entry> {
         let hash = doc_hash(doc);
         self.entries().into_iter().rev().find(|e| e.is_step() && e.hash == hash)
     }
@@ -216,13 +256,13 @@ impl Journal {
         self.entries().into_iter().filter(|e| e.id > id).collect()
     }
 
-    pub fn load_state(&self, e: &Entry) -> Result<Document, String> {
-        io::load(&self.dir.join("states").join(&e.state))
+    pub fn load_state<S: State>(&self, e: &Entry) -> Result<S, String> {
+        S::load_state(&self.dir.join("states").join(&e.state))
     }
 
     /// Step back `steps` edits from the current state and record the undo.
     /// Returns the restored document and the entry that was undone to.
-    pub fn undo(&self, current: &Document, steps: usize, author: &str) -> Result<(Document, Entry), String> {
+    pub fn undo<S: State>(&self, current: &S, steps: usize, author: &str) -> Result<(S, Entry), String> {
         self.ensure_current(current, "changes outside the journal")?;
         // only undoable steps count (not progress or focus entries)
         let entries: Vec<Entry> = self.entries().into_iter().filter(|e| e.is_step()).collect();
@@ -232,7 +272,7 @@ impl Journal {
             return Err(format!("cannot undo {steps} step(s): only {pos} earlier state(s) in the history"));
         }
         let target = entries[pos - steps].clone();
-        let doc = self.load_state(&target)?;
+        let doc: S = self.load_state(&target)?;
         let undone: Vec<&str> = entries[pos - steps + 1..=pos].iter().map(|e| e.note.as_str()).collect();
         let note = format!("undo: {}", undone.join(" / "));
         self.record_with_base(&doc, author, &note, Some(target.base))?;

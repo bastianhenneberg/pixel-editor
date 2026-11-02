@@ -2,6 +2,7 @@
 
 mod canvas;
 mod follow;
+mod map;
 mod marks;
 mod panels;
 mod preview;
@@ -259,6 +260,10 @@ pub struct EditorApp {
     /// The note being typed for the selected mark.
     note_draft: String,
 
+    /// The map of a tilemap tab (the document fields are unused then).
+    map: Option<Box<map::MapTab>>,
+    /// "Neue Karte" / "world.txt importieren".
+    map_dialog: Option<map::MapDialog>,
     /// Open documents; the fields above describe `tabs[active]` (see `tabs`).
     tabs: Vec<tabs::Tab>,
     active: usize,
@@ -355,6 +360,8 @@ impl EditorApp {
             marks_mtime: None,
             mark_sel: None,
             note_draft: String::new(),
+            map: None,
+            map_dialog: None,
             tabs: vec![Default::default()],
             active: 0,
             workdir: None,
@@ -512,8 +519,12 @@ impl EditorApp {
 
     /// Load `path` into the active tab (false: error in the status line).
     fn open(&mut self, path: &Path) -> bool {
+        if pixel_core::tilemap::is_tilemap_path(path) {
+            return self.open_map(path);
+        }
         match io::load_with_warnings(path) {
             Ok((doc, warnings)) => {
+                self.map = None;
                 self.history.clear();
                 self.saved_doc = Some(doc.clone());
                 self.unsaved_steps.clear();
@@ -562,6 +573,12 @@ impl EditorApp {
     }
 
     fn save(&mut self) {
+        if let Some(m) = self.map.as_mut() {
+            if let Err(e) = m.save() {
+                m.status = format!("Fehler beim Speichern: {e}");
+            }
+            return;
+        }
         match self.path.clone() {
             Some(p) => self.save_to(&p),
             None => self.save_as(),
@@ -654,7 +671,7 @@ impl EditorApp {
 
     /// Request an action that would discard unsaved changes.
     fn request(&mut self, action: Pending) {
-        if self.dirty {
+        if self.tab_dirty(self.active) {
             self.confirm = Some(action);
         } else {
             self.perform(action);
@@ -671,6 +688,10 @@ impl EditorApp {
     fn perform(&mut self, action: Pending) {
         match action {
             Pending::CloseTab => self.close_tab(self.active),
+            Pending::Reload if self.map.is_some() => {
+                let p = self.map.as_ref().unwrap().path.clone();
+                self.open_map(&p);
+            }
             Pending::Reload => {
                 if let Some(p) = self.path.clone() {
                     let (frame, layer) = (self.frame, self.layer);
@@ -938,13 +959,16 @@ impl EditorApp {
                         } else {
                             self.save();
                         }
-                        if !(if all { self.any_dirty() } else { self.dirty }) {
+                        if !(if all { self.any_dirty() } else { self.tab_dirty(self.active) }) {
                             self.perform(action.clone());
                         }
                         close = true;
                     }
                     if ui.button("Verwerfen").clicked() {
                         self.dirty = false;
+                        if let Some(m) = self.map.as_mut() {
+                            m.dirty = false;
+                        }
                         self.perform(action.clone());
                         close = true;
                     }
@@ -1037,7 +1061,7 @@ impl EditorApp {
                         .map(|rd| {
                             rd.flatten()
                                 .map(|e| e.path())
-                                .filter(|p| p.to_string_lossy().ends_with(io::EXTENSION))
+                                .filter(|p| io::is_document_path(p) || pixel_core::tilemap::is_tilemap_path(p))
                                 .collect()
                         })
                         .unwrap_or_default();
@@ -1085,6 +1109,7 @@ impl EditorApp {
                 if ui.button("Neu…  (Strg+N)").clicked() {
                     self.new_document();
                 }
+                self.map_file_entries(ui);
                 if ui.button("Öffnen…  (Strg+O)").clicked() {
                     self.open_dialog();
                 }
@@ -1222,7 +1247,7 @@ impl EditorApp {
 
     fn update_title(&mut self, ctx: &egui::Context) {
         let name = self.tab_label(self.active);
-        let title = format!("{}{} – pixel-editor", if self.dirty { "• " } else { "" }, name);
+        let title = format!("{}{} – pixel-editor", if self.tab_dirty(self.active) { "• " } else { "" }, name);
         if title != self.title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.title = title;
@@ -1263,6 +1288,17 @@ impl eframe::App for EditorApp {
         ctx.request_repaint_after(follow::POLL);
         if self.follow.banner_text().is_some() || !self.follow.flashes.is_empty() {
             ctx.request_repaint(); // animate flash and banner
+        }
+        if self.map.is_some() {
+            self.map_shortcuts(&ctx);
+            egui::Panel::top("menu").show(ui, |ui| self.map_menu_bar(ui));
+            self.map_ui(ui, &ctx, now);
+            self.save_settings(&ctx);
+            self.dialogs(&ctx);
+            self.map_dialog_ui(&ctx);
+            self.update_title(&ctx);
+            self.publish_view();
+            return;
         }
         self.shortcuts(&ctx);
         self.advance_playback(&ctx, now);
@@ -1344,6 +1380,7 @@ impl eframe::App for EditorApp {
         self.save_settings(&ctx);
 
         self.dialogs(&ctx);
+        self.map_dialog_ui(&ctx);
         self.mirror_dialog_ui(&ctx);
         self.update_title(&ctx);
         self.publish_view();

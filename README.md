@@ -1,6 +1,6 @@
 # pixel-editor
 
-Nativer Pixelart- und Animationseditor in Rust. Man kann ihn von Hand bedienen (Bedienkonzept wie Aseprite), und Claude kann ihn über MCP steuern. Beide arbeiten auf denselben Dateien (`.pxe.json` oder `.aseprite`). Ist eine Datei im Editor offen, sieht man Claudes Änderungen live, weil der Editor sie bei Änderungen auf der Platte neu lädt.
+Nativer Pixelart- und Animationseditor in Rust. Man kann ihn von Hand bedienen (Bedienkonzept wie Aseprite), und Claude kann ihn über MCP steuern. Beide arbeiten auf denselben Dateien (`.pxe.json` oder `.aseprite`, Karten als `.tilemap.json`). Ist eine Datei im Editor offen, sieht man Claudes Änderungen live, weil der Editor sie bei Änderungen auf der Platte neu lädt.
 
 - `core/`: Dokumentmodell (Ebenen × Frames, verknüpfte Cels, Tags), Laden/Speichern (`.pxe.json`, `.aseprite`), Zeichenfunktionen, Rendering, Undo, Exporter. Keine GUI-Abhängigkeiten.
 - `app/`: das Programm `pixel-editor` (GUI mit egui/eframe) und der MCP-Server (`pixel-editor mcp <ordner>`).
@@ -122,6 +122,11 @@ target/release/pixel-editor mcp ~/Development/pixel-art    # MCP-Server für die
 target/release/pixel-editor export figur.pxe.json godot [ausgabeordner] [--scale N] [--godot-res-dir res://…]
 target/release/pixel-editor preview figur.pxe.json vorschau.png [--zoom 8] [--frame f0]
 target/release/pixel-editor render-animation figur.pxe.json walk_down anim.png [--region NAME|x,y,w,h] [--track NAME|x,y,w,h] [--zoom N] [--jump 2]
+target/release/pixel-editor import-world world.txt karten/world.tilemap.json --tileset art/tiles32.pxe.json [--force]
+target/release/pixel-editor export-world karten/world.tilemap.json world.txt
+target/release/pixel-editor export karten/world.tilemap.json godot [ausgabeordner]   # oder world_txt
+target/release/pixel-editor export art/tiles32.pxe.json godot_tileset [ausgabeordner]
+target/release/pixel-editor preview karten/world.tilemap.json welt.png [--zoom N] [--no-grid]
 ```
 
 ## Spiegeln, Drehen, Symmetrie
@@ -146,6 +151,61 @@ Wie der „Tiled Mode“ von Aseprite: Die Leinwand zeigt das Bild wiederholt, d
 - **Vorschau** (P): Knopf „Kacheln“ (auch im Untermenü Ansicht → Kachel-Modus: „Vorschau auch gekachelt“) zeigt das Bild so oft wie der Kachel-Modus, bei ausgeschaltetem Modus 3×3.
 - **Je Dokument gemerkt** (in `~/.config/pixel-editor/settings.json`, `tile_modes`). Dokumente, in deren Namen oder Ordner „tile“ vorkommt (`tiles32.pxe.json`, `tiles/gras.pxe.json`), starten im Modus „Beide“, solange nichts anderes gemerkt ist. **Neu** schaltet ihn mit den Vorlagen „Tile 32×32“/„Tile 16×16“ ein (Schalter „Kachel-Modus“ im Dialog); in einem Tile-Ordner ist die Vorlage Tile 32×32 vorausgewählt.
 - **Für Claude**: `render_preview` mit `tiled: true` zeigt jeden Frame 3×3 (Lineale zählen innerhalb des Tiles, rosa Striche markieren die Nahtstellen, ohne Raster), `check_seams` vergleicht die rechte Spalte mit der linken und die unterste Zeile mit der obersten und meldet harte Kanten (siehe Werkzeuge).
+
+## Karten (Tilemaps): Umgebungen aus Tiles zusammensetzen
+
+Eine Karte (`<name>.tilemap.json`, Format in [FORMAT.md](FORMAT.md#karten-tilemapjson)) stempelt Tiles aus einem Tileset-Dokument (z. B. `tiles32.pxe.json`, ein Tile je Frame) auf ein Raster: Wiese, Weg, Wasser, Mauern, Bäume. Sie ist wie `world.txt` aufgebaut, ein Zeichen je Zelle, und die Legende sagt, welches Tile (per Frame-Name) und welches Objekt (ein größeres Dokument wie `tree64.pxe.json`, das auf der Zelle steht) ein Zeichen zeigt.
+
+**Anlegen und öffnen**: Datei → **Neue Karte…** (Tileset, Dateiname, Größe; gefüllt mit dem ersten Tile) oder **world.txt importieren…**, oder eine `.tilemap.json` öffnen wie jedes Dokument (Strg+O, `pixel-editor karte.tilemap.json`, MCP `open_editor`). Eine Karte ist ein eigener Tab.
+
+**Bedienung im Karten-Tab**:
+
+| Taste / Maus | Funktion |
+|---|---|
+| Klick auf ein Tile in der Palette (links, „Tileset“) | dieses Tile als Pinsel; hat es noch keine Taste, bekommt es beim ersten Setzen die nächste freie (Teil desselben Rückgängig-Schritts) |
+| Klick auf einen Legenden-Eintrag (links, „Legende“) | diese Taste als Pinsel, auch Objekte (`T` Baum) und Platzhalter (`@`) |
+| B / E / U / G / I | Stift / Radierer / Rechteck / Füllen (zusammenhängende gleiche Zellen) / Pipette |
+| Linksklick, ziehen | ganze Tiles setzen (Rechteck: aufziehen, Vorschau als weißer Rahmen) |
+| Rechtsklick, ziehen | Tiles entfernen (bei jedem Werkzeug) |
+| Alt + Klick | Taste der Zelle aufnehmen |
+| Mausrad / + / − / 0 | zoomen (0,25× bis 12×) / einpassen |
+| Mittlere Maustaste / Leertaste + ziehen | verschieben |
+| Strg+' | Kachelraster an/aus |
+| Strg+Z / Strg+Umschalt+Z | Rückgängig / Wiederholen (Verlauf rechts) |
+| Strg+S | speichern (mit Journal-Eintrag wie bei Dokumenten) |
+
+Rechts: Datei, Tileset, **Tileset im Tab öffnen**, Kachelgröße, **Kartengröße** (Breite/Höhe + „Größe übernehmen“, die linke obere Ecke bleibt), Raster, Zoom, Hinweise (fehlendes Tileset, unbekannter Tile-Name, falsche Kachelgröße) und der Verlauf. Die Statuszeile nennt Zelle, Taste mit Name und Tile sowie den Pinsel: `Zelle x 17, y 3 · ~ Wasser (water0) · Pinsel ~ Wasser (water0) · 46×28 Kacheln · Zoom 0.5×`.
+
+**Live**: Ändert sich ein Tile im Tileset, ändert es sich überall auf der Karte. Ist das Tileset in einem anderen Tab offen, zeigt die Karte dessen Pixel schon während des Zeichnens, auch ungespeichert („live aus dem offenen Tab“). Gespeicherte Änderungen am Tileset oder an Objekt-Dokumenten (auch von der KI) und Änderungen an der Karte selbst (MCP `set_tiles` …) lädt der Karten-Tab wie Dokumente nach; geänderte Zellen leuchten kurz gelb, die Notiz steht in der Statuszeile, und der Schritt ist rückgängig zu machen. Bei ungespeicherten eigenen Änderungen erscheint der bekannte Konflikt-Balken.
+
+**world.txt der Sandbox** (`~/Development/pixel-sandbox/world.txt`): Import über Datei → „world.txt importieren…“, CLI `import-world` oder MCP `import_world`; Export über Export → „world.txt“, CLI `export-world` oder MCP `export_world`. Die Zeichen bleiben dieselben, die Kommentarzeilen samt Legende werden unverändert an ihrer Stelle zurückgeschrieben: Import → Export ist byte-gleich (getestet mit einer Kopie der echten Datei). Die Legenden-Namen kommen aus den Kommentaren, die Tiles aus dieser Tabelle (`SANDBOX_TILES` in `core/src/tilemap.rs`, die einzige Stelle dafür):
+
+| Zeichen | Tile in tiles32 | Objekt |
+|---|---|---|
+| `.` | grass | |
+| `,` | grass2 | |
+| `*` | flowers | |
+| `=` | path | |
+| `g` | tallgrass0 | |
+| `~` | water0 | |
+| `#` | wall_top | |
+| `b` | bush | |
+| `T` | grass | tree64.pxe.json (neben dem Tileset) |
+| `^` | grass_high | |
+| `H` | stairs | |
+| `@` | grass | |
+| `s` | grass | |
+
+Zeichen, die dort fehlen, bleiben als Platzhalter (lila Kachel mit dem Zeichen) in der Legende und werden beim Import gemeldet; der Export schreibt sie unverändert zurück und warnt, wenn ein Zeichen in den Kommentaren der Datei nicht erklärt ist. **Der Editor zeigt nur die Basiskacheln.** Weg- und Wasserränder (Dual-Grid-Übergänge), Felswände vor Anhöhen, Mauerfronten, Deko (Blumen, Steine, Pilze), Schmetterlinge, Spieler und Schleime ergänzt das Spiel beim Laden selbst; das baut der Editor bewusst nicht nach.
+
+**Godot-Export** (Menü Export → „Godot“, CLI `export karte.tilemap.json godot`, MCP `export` mit `target: "godot"`), nach `<Kartenordner>/export/<name>/`:
+- `<tileset>_atlas.png`: alle Tiles des Tilesets, 8 je Reihe (Tile i bei Spalte i % 8, Reihe i / 8).
+- `<tileset>_tileset.tres`: Godot-4-`TileSet` mit einer `TileSetAtlasSource`; jedes Tile trägt seinen Frame-Namen in der Custom-Data-Ebene `name` (`tile_data.get_custom_data("name")`).
+- `<name>.tscn`: `Node2D` (Texturfilter Nearest) mit einer `TileMapLayer` „Tiles“ und, falls Objekte vorkommen, „Objects“ (y-sortiert) mit einem `Sprite2D` je Objekt-Zelle (`T_<x>_<y>`, Position = Fußpunkt der Zelle) und dessen PNG.
+- Pfade stehen relativ zur jeweiligen Datei, mit `godot_res_dir` (MCP) bzw. `--godot-res-dir` (CLI) als feste `res://`-Pfade.
+- Nur das Tileset: `export tiles32.pxe.json godot_tileset` (CLI/MCP).
+
+Wohin die Dateien im Spiel gehören, entscheidest du; der Export schreibt nichts in die Sandbox.
 
 ## Bedienung
 
@@ -231,7 +291,7 @@ oder `claude mcp add pixel-editor -- /home/bastian/Development/pixel-editor/targ
 
 | Werkzeug | Zweck |
 |---|---|
-| `list_documents` | `.pxe.json`/`.aseprite` im Arbeitsordner mit Tags und Regionen |
+| `list_documents` | `.pxe.json`/`.aseprite` im Arbeitsordner mit Tags und Regionen, Karten (`.tilemap.json`) mit Größe und Tileset |
 | `create_document(name, width, height, palette?, layer_name?, …)` | neues Dokument; Palette als Name oder Liste `{key, color, name?}` |
 | `get_document(path, layer?, frame?, pixels?, crop?)` | Übersicht + Tastenzeilen |
 | `get_rows(path, layer?, frame?, region? \| x/y/w/h, composite?)` | Ausschnitt lesen |
@@ -251,7 +311,15 @@ oder `claude mcp add pixel-editor -- /home/bastian/Development/pixel-editor/targ
 | `focus(path, frame, layer?, region? \| rect?, note?)`, `open_editor(path)`; `pace_ms` an Schreibwerkzeugen | live zusehen (siehe „KI folgen“) |
 | `get_user_view` | was im Editor gerade offen und ausgewählt ist, samt Pixeln der Auswahl und allen „KI zeigen“-Markierungen mit Notizen (siehe „Was du gerade ansiehst“) |
 | `clear_marks(path, frame?, numbers?)` | „KI zeigen“-Markierungen entfernen: alle des Dokuments, nur die eines Frames oder bestimmte Nummern |
-| `export(path, target, …)` | `png_sheet`, `godot`, `unity`, `gif`, `aseprite` |
+| `export(path, target, …)` | `png_sheet`, `godot`, `unity`, `gif`, `aseprite`, `godot_tileset` (Tileset als Atlas + TileSet); auf einer Karte `godot` (Atlas, TileSet, Szene) oder `world_txt` |
+| `create_tilemap(name, tileset, width, height, fill?)` | neue Karte; nennt alle Tiles des Tilesets |
+| `get_tilemap(path, x?, y?, w?, h?)` | Größe, Tileset, Legende (Taste, Name, Tile, Objekt, Anzahl), noch unbenutzte Tiles, Zellen als Tastenzeilen mit Lineal |
+| `set_tiles(path, cells? \| rows? + x/y \| rect? + tile, dry_run?, note?)` | Zellen setzen: `cells [{x, y, tile}]`, Zeilen aus Tasten (`-` = Zelle lassen, Leerzeichen = leeren) oder ein Rechteck. `tile` ist Taste, Legenden-Name oder Frame-Name des Tilesets (bekommt dann eine neue Taste). Diff (Anzahl, Rechteck, Zeilen vorher/nachher), Verlauf, `undo` |
+| `set_legend(path, key, tile?, object?, name?, remove?)` | Legenden-Eintrag anlegen/ändern/entfernen (nur unbenutzte) |
+| `resize_tilemap(path, width, height, fill?)` | Kartengröße; linke obere Ecke bleibt, abgeschnittene Zellen werden gezählt |
+| `import_world(src, name, tileset)`, `export_world(path, to)` | world.txt der Sandbox hin und zurück (byte-gleich) |
+| `render_preview(path)` auf einer Karte | die ganze Karte mit Objekten, Kachelraster und Zellnummern alle 5 (`preview/<name>_map.png`, Zoom Standard 1) |
+| `history`, `undo` auf einer Karte | wie bei Dokumenten (Schnappschüsse gibt es für Karten nicht) |
 | `save_as(path, to)`, `import_png(…)` | Umwandeln / PNG übernehmen |
 
 Strukturänderungen (Ebenen, Frames, Tags, Palette, Regionen) haben ebenfalls `dry_run` und `note`, werden protokolliert und antworten mit einer Zusammenfassung der Änderungen.
@@ -286,6 +354,7 @@ Sheets enthalten die Frames in Reihenfolge (höchstens 16 pro Reihe, über `colu
 
 ### Was geprüft ist und was nicht
 
+- **Godot-Karten**: mit Godot 4.7.2 headless in einem Wegwerf-Projekt mit der importierten Kopie der Sandbox-Welt geprüft: `--import` ohne Fehler, Szene lädt, `TileMapLayer` mit 1288 Zellen, Atlas-Koordinaten und Tile-Namen (`get_custom_data("name")`: grass, water0, path an den erwarteten Zellen), 40 Bäume als `Sprite2D`.
 - **Godot**: mit Godot 4.7.2 headless in einem Wegwerf-Projekt geprüft. Import ohne Fehler, `load()` der `.tres` mit relativem und mit `res://`-Pfad, Regionen, Loop-Flags, Ping-Pong-Folge, Millisekunden je Frame, Pixelfarben. Godot 4.6 selbst ist nicht installiert; das Format (`format=3`) ist dasselbe.
 - **Aseprite**: Aseprite ist nicht installiert. Geprüft wurden Hin- und Rückweg mit dem eigenen Leser (Pixel identisch, samt Ebenensperre, Palettennamen und Regionen ↔ Slices) und das Lesen der Exporte mit einem unabhängigen Parser, dem Rust-Crate `asefile` (MIT, nur Test-Abhängigkeit). Für indizierte und RGBA-Dateien stimmen dort Größe, Ebenen, Sichtbarkeit, Dauern, Tags, aufgelöste Link-Cels und exakte Pixelfarben. `asefile` 0.3 kennt die Richtung „Ping-Pong rückwärts“ (Aseprite 1.3) noch nicht; das ist dort nicht geprüft. Echte, mit Aseprite erzeugte Dateien lagen nicht vor. Der Import ist nur gegen eigene Dateien und die Beschreibung getestet.
 - **Unity**: **nicht geprüft**, Unity ist nicht installiert. Die `.meta` folgt dem Aufbau von Unity 2022/6000.
@@ -302,6 +371,7 @@ Sheets enthalten die Frames in Reihenfolge (höchstens 16 pro Reihe, über `colu
   - Tabs: öffnen, wechseln (Strg+Tab, Klick), schließen mit Rückfrage, eigener Zustand je Tab, Markierung bei Änderung im Hintergrund ohne Tab-Wechsel, `focus` wechselt den Tab, Öffnen aus einem anderen Prozess über den Socket (`open`/`open_editor`), Wiederherstellen; Bild der Tab-Leiste in `target/tabs-screenshot.png`
   - Zeitleiste scrubben (Ziehen über die Nummern und Cels, Pause, Klemmen am Rand, Klick wählt weiter), Mausrad über den Nummern
   - Kachel-Modus: Stift über den Rand, Klick in eine Kopie, Rechteck über den unteren Rand, Füllen um den Rand herum, Symmetrie mit Wrap, Rechteck-Auswahl über den Rand, Alt+T, Merken je Dokument und Wiederherstellen beim Öffnen, Start im Modus bei Tile-Namen, Vorlage Tile 32×32, Menü Ansicht, gekachelte Vorschau; Bild mit einer Kopie von `tiles32` (Frame `path`, ein Strich über den rechten Rand) in `target/tiled-screenshot.png`
+  - Karten: Öffnen als Karten-Tab, Legenden-Eintrag per Klick als Pinsel, Stift mit neuem Tile (Taste entsteht), Strich über mehrere Zellen, Rechtsklick entfernt, Rechteck (U), Füllen (G), Pipette (I), Strg+Z/Strg+Umschalt+Z, Kartengröße, Strg+S mit Journal; Tileset per „Tileset im Tab öffnen“, Zeichnen dort ändert die Karte live (ungespeichert), MCP-`set_tiles` wird nachgeladen (Notiz, Rückgängig); Bild mit Kopien von `tiles32`/`tree64` und der importierten Kopie von `world.txt` in `target/tilemap-screenshot.png`, `render_preview` der ganzen Welt in `target/tilemap-world.png`
   - KI-Markierungen: mehrere per Ziehen und Klick, Notiz tippen und mit Enter speichern, Klick daneben schließt nur das Notizfeld, Klick hinein wählt aus und ändert die Notiz, verschieben, Größe an Kante und Ecke, Rechtsklick entfernt eine, Menü „dieses Frames“, Statuszeile „alle“, andere Frames nicht auf der Leinwand aber in der Zeitleiste, eigene Markierungen je Tab, Strg+Umschalt+K auch mit Fokus in einem Textfeld, Übernahme einer alten `pointer.json`, Neuladen nach `clear_marks`; Bild in `target/marks-screenshot.png`. Am echten Bildschirm wurde die Oberfläche bisher nicht bedient.
 
 Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen nach `target/gui-screenshot.png`. Mit sichtbarem Fenster: `PIXEL_EDITOR_SCREENSHOT=/pfad/bild.png pixel-editor datei.pxe.json` speichert nach 2 s (`PIXEL_EDITOR_SCREENSHOT_DELAY`) ein Bild des eigenen Fensters und beendet das Programm.
@@ -313,13 +383,15 @@ Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen n
 3. Den zurückgegebenen Diff prüfen, `render_preview` ansehen, mit `get_rows` Details prüfen. Bei Korrekturwünschen nur die genannte Region ändern; vor größeren Umbauten `snapshot`. Bei Tiles zusätzlich `render_preview` mit `tiled: true` und `check_seams`: das Tile muss an seinen eigenen Rändern weiterlaufen.
 4. Animation: `add_frame(copy_from)` + kleine Änderungen. Bezieht sich der Nutzer auf „das hier“, erst `get_user_view` aufrufen. Wiederkehrende Frames mit `linked: true` anlegen, dann `set_frame_duration` und `set_tag` (Bereich + Richtung).
 5. `export` (für das Testspiel `godot`), für Aseprite-Nutzer `aseprite`.
+6. Umgebungen: Karte mit `create_tilemap` oder `import_world`, ansehen mit `get_tilemap` und `render_preview`, ändern mit `set_tiles` (immer den Diff prüfen). Tiles selbst bearbeitet man im Tileset-Dokument; jede Karte zeigt die Änderung sofort.
 
 ## Bekannte Grenzen
 
 - Drehen nur in 90°-Schritten (keine freien Winkel, kein Skalieren). Symmetrie wirkt nicht auf Auswahl-Werkzeuge und Pipette.
-- Kachel-Modus: Schwebende (verschobene oder eingefügte) Pixel wrappen nicht, sie werden am Bildrand abgeschnitten wie ohne Kachel-Modus. „KI zeigen“-Markierungen, Regionen und der Auswahlumriss erscheinen nur auf dem echten Bild in der Mitte. Keine Tilemap (eigener Auftrag).
+- Kachel-Modus: Schwebende (verschobene oder eingefügte) Pixel wrappen nicht, sie werden am Bildrand abgeschnitten wie ohne Kachel-Modus. „KI zeigen“-Markierungen, Regionen und der Auswahlumriss erscheinen nur auf dem echten Bild in der Mitte.
+- Karten: eine Ebene (wie world.txt); Objekte nur über Legenden-Einträge, nicht frei platziert; Objekte zeigen Frame 0 (keine Animation in der Karte, auch nicht `water0..7`). Keine Auswahl/Kopieren, keine Schnappschüsse, kein „KI zeigen“ und kein `get_user_view` für Karten-Tabs. Legenden-Namen ändert man per MCP `set_legend` oder in der Datei, nicht in der GUI. Autotiling (Ränder, Übergänge) macht der Editor nicht, das bleibt beim Spiel.
 - Zeitleiste: Frames werden per Knopf verschoben, nicht per Ziehen. Die Ebenennamen-Spalte scrollt horizontal mit.
-- Keine Ebenengruppen, Blend-Modi, Cel-Deckkraft oder Tilemaps (beim Aseprite-Import gemeldet). Frame-Namen und -Sperren gehen beim Umweg über `.aseprite` verloren (Aseprite kennt sie nicht).
+- Keine Ebenengruppen, Blend-Modi, Cel-Deckkraft; Aseprite-Tilemap-Ebenen werden beim Import übersprungen und gemeldet (Karten sind ein eigenes Format, siehe oben). Frame-Namen und -Sperren gehen beim Umweg über `.aseprite` verloren (Aseprite kennt sie nicht).
 - Tags sind Bereiche wie in Aseprite. Eine beliebige Reihenfolge entsteht über angehängte verknüpfte Frames (GUI „Folge“, MCP `set_tag frames`).
 - Palette: Tasten lassen sich in der GUI nicht umbenennen oder umsortieren (Farbnamen schon).
 - Kein direkter Import von `.pxs` (Umweg: `pxa build` → PNG-Sheet → `import_png` mit Tile-Größe).

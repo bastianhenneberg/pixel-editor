@@ -396,7 +396,7 @@ pub fn to_json(doc: &Document) -> String {
 }
 
 /// Single-line JSON with a space after `:` and `,`.
-fn inline(v: &serde_json::Value) -> String {
+pub(crate) fn inline(v: &serde_json::Value) -> String {
     use serde_json::Value;
     match v {
         Value::Object(m) => {

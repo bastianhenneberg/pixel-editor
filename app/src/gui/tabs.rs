@@ -83,6 +83,7 @@ per_tab! {
     palette_edit_at: Option<(u8, f64)>,
     tag_draft: panels::TagDraft,
     timeline: timeline::TimelineState,
+    map: Option<Box<super::map::MapTab>>,
     marks: crate::view::Marks,
     marks_mtime: Option<std::time::SystemTime>,
     mark_sel: Option<u32>,
@@ -103,7 +104,7 @@ pub struct Tab {
 }
 
 /// The same file? Compares canonical paths where the files exist.
-fn same_file(a: &Path, b: &Path) -> bool {
+pub(super) fn same_file(a: &Path, b: &Path) -> bool {
     let canon = |p: &Path| p.canonicalize().or_else(|_| std::path::absolute(p)).unwrap_or_else(|_| p.to_path_buf());
     a == b || canon(a) == canon(b)
 }
@@ -112,15 +113,24 @@ impl EditorApp {
     /// The document path of tab `i`.
     pub(super) fn tab_path(&self, i: usize) -> Option<&Path> {
         match &self.tabs[i].state {
-            None => self.path.as_deref(),
-            Some(s) => s.path.as_deref(),
+            None => self.map.as_ref().map(|m| m.path.as_path()).or(self.path.as_deref()),
+            Some(s) => s.map.as_ref().map(|m| m.path.as_path()).or(s.path.as_deref()),
         }
     }
 
     pub(super) fn tab_dirty(&self, i: usize) -> bool {
         match &self.tabs[i].state {
-            None => self.dirty,
-            Some(s) => s.dirty,
+            None => self.dirty || self.map.as_ref().is_some_and(|m| m.dirty),
+            Some(s) => s.dirty || s.map.as_ref().is_some_and(|m| m.dirty),
+        }
+    }
+
+    /// The document of a (pixel document) tab: path, document, rev.
+    pub(super) fn tab_doc(&self, i: usize) -> Option<(&Path, &Document, u64)> {
+        match &self.tabs[i].state {
+            None if self.map.is_none() => self.path.as_deref().map(|p| (p, &self.doc, self.rev)),
+            Some(s) if s.map.is_none() => s.path.as_deref().map(|p| (p, &s.doc, s.rev)),
+            _ => None,
         }
     }
 
@@ -135,7 +145,7 @@ impl EditorApp {
         let rel = self.workdir.as_deref().and_then(|w| p.strip_prefix(w).ok()).unwrap_or(p);
         let rel = if rel == p { Path::new(p.file_name().unwrap_or_default()) } else { rel };
         let text = rel.display().to_string();
-        [io::EXTENSION, ".aseprite", ".ase"]
+        [io::EXTENSION, ".aseprite", ".ase", pixel_core::tilemap::EXTENSION]
             .iter()
             .find_map(|ext| text.strip_suffix(ext))
             .map_or(text.clone(), str::to_string)
@@ -148,7 +158,7 @@ impl EditorApp {
 
     /// An empty untitled document nobody touched: opening a file replaces it.
     fn active_is_blank(&self) -> bool {
-        self.path.is_none() && self.rev == 0 && !self.dirty
+        self.path.is_none() && self.rev == 0 && !self.dirty && self.map.is_none()
     }
 
     pub(super) fn switch_tab(&mut self, i: usize) {
@@ -323,7 +333,7 @@ impl EditorApp {
     /// Reopen the tabs this workdir had last time, around the one just
     /// opened (which stays active).
     pub(super) fn restore_tabs(&mut self, saved: &[PathBuf]) {
-        let wanted = self.path.clone();
+        let wanted = self.tab_path(self.active).map(Path::to_path_buf);
         for p in saved.iter().filter(|p| p.exists()) {
             let _ = self.open_tab(p);
         }
@@ -332,8 +342,8 @@ impl EditorApp {
             .into_iter()
             .map(|t| {
                 let p = match &t.state {
-                    None => self.path.as_deref(),
-                    Some(s) => s.path.as_deref(),
+                    None => self.map.as_ref().map(|m| m.path.as_path()).or(self.path.as_deref()),
+                    Some(s) => s.map.as_ref().map(|m| m.path.as_path()).or(s.path.as_deref()),
                 };
                 (order(p), t)
             })

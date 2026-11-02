@@ -4,7 +4,7 @@ Ein Dokument ist eine JSON-Datei mit der Endung `.pxe.json`. Sie ist so aufgebau
 
 Koordinaten: `(0, 0)` ist oben links, x nach rechts, y nach unten.
 
-Der Editor und der MCP-Server lesen und schreiben außerdem `.aseprite`/`.ase` (siehe unten). Welches Format gilt, entscheidet die Dateiendung.
+Der Editor und der MCP-Server lesen und schreiben außerdem `.aseprite`/`.ase` (siehe unten) und Karten (`.tilemap.json`, siehe „Karten“ am Ende). Welches Format gilt, entscheidet die Dateiendung.
 
 ## Beispiel
 
@@ -111,6 +111,50 @@ Umgesetzt nach der öffentlichen Formatbeschreibung (`docs/ase-file-specs.md` im
 **Lesen**: RGBA, Graustufen und indiziert; Slices werden zu Regionen (9-Patch- und Pivot-Daten werden mit Hinweis ignoriert); normale Ebenen (Gruppen werden aufgelöst, ihre Sichtbarkeit vererbt), Frame-Dauern, rohe und komprimierte Cels, Link-Cels, Tags (Richtung, Loop, Farbe), Palette (0x2019, sonst 0x0004/0x0011), Hintergrund-Ebenen (Transparenz-Index gilt dort nicht). Farben werden exakt übernommen; tragen die Paletteneinträge keine gültigen Tasten als Namen, werden Tasten in Palettenreihenfolge vergeben (bei mehr als 89 Farben nur die benutzten).
 
 Nicht abbildbar, beim Lesen als Hinweis gemeldet: Blend-Modi (als normal dargestellt), Cel-Deckkraft und Z-Index (ignoriert), Tilemap-Ebenen (übersprungen), Tag-Wiederholung > 1 (wird zu „einmal“). Frame-Namen und Frame-Sperren gibt es in Aseprite nicht; Frames heißen beim Lesen `f0`, `f1`, … und sind entsperrt. Pixel, Ebenen (samt Sperre), Dauern, verknüpfte Cels, Tags, Palette (samt Tasten und Namen) und Regionen bleiben bei `.pxe.json → .aseprite → .pxe.json` erhalten (getestet, Pixel identisch).
+
+## Karten (`.tilemap.json`)
+
+Eine Karte setzt Kacheln aus einem Tileset-Dokument zu einer Umgebung zusammen. Sie ist aufgebaut wie die `world.txt` der Sandbox: ein Zeichen je Zelle, die Legende sagt, was das Zeichen zeigt.
+
+```json
+{
+  "format": "pixel-editor-tilemap",
+  "version": 1,
+  "tileset": "art/tiles32.pxe.json",
+  "tile_size": [32, 32],
+  "width": 4,
+  "height": 2,
+  "legend": [
+    {"key": ".", "tile": "grass", "name": "Gras"},
+    {"key": "~", "tile": "water0", "name": "Wasser"},
+    {"key": "T", "tile": "grass", "object": "art/tree64.pxe.json", "name": "Baum"},
+    {"key": "@", "name": "Spieler-Start"}
+  ],
+  "rows": [
+    ".~T.",
+    "..@ "
+  ],
+  "world": {"final_newline": true, "lines": [
+      {"at": 0, "text": "; .  Gras   ~  Wasser   T  Baum   @  Spieler-Start"}
+    ]}
+}
+```
+
+| Feld | Bedeutung |
+|---|---|
+| `format`, `version` | `"pixel-editor-tilemap"`, `1`. Neuere Versionen werden abgelehnt. |
+| `tileset` | Pfad des Tileset-Dokuments (`.pxe.json` oder `.aseprite`), **relativ zur Karte**. Jeder Frame ist ein Tile; sein Bild ist das Gesamtbild aller sichtbaren Ebenen dieses Frames. |
+| `tile_size` | `[w, h]` in Pixeln = Leinwandgröße des Tilesets (Standard `[32, 32]`). Passt das Tileset nicht dazu, meldet der Editor das. |
+| `width`, `height` | Größe in Zellen (1–1024). |
+| `legend` | geordnete Liste `{key, tile?, object?, name?}`. `key` ist genau ein druckbares ASCII-Zeichen außer Leerzeichen, `;` (in world.txt ein Kommentar), `"` und `\`. `tile` ist der **Frame-Name** im Tileset (Umsortieren der Frames ändert nichts). `object` ist ein weiteres Dokument (relativ zur Karte), das auf der Zelle steht, z. B. ein 64×64-Baum: unten mittig auf der Zelle oder, falls das Dokument einen Marker `origin` hat, mit diesem Punkt auf der Fußmitte der Zelle; gezeichnet wird Frame 0, untere Reihen vor oberen. Ein Eintrag ohne `tile` und ohne `object` ist ein Platzhalter (lila Kachel mit dem Zeichen). `name` ist frei. |
+| `rows` | genau `height` Zeichenketten mit je `width` Zeichen. Ein Leerzeichen ist eine leere Zelle; jedes andere Zeichen muss in der Legende stehen. |
+| `world` | nur nach einem world.txt-Import: die Kommentar- und Leerzeilen der Datei wörtlich (`text`) mit der Zahl der Kartenzeilen davor (`at`), und ob die Datei mit einem Zeilenumbruch endete. Damit schreibt der Export die Datei byte-gleich zurück. |
+
+Neue Tiles bekommen beim ersten Setzen die nächste freie Taste (`0–9`, `a–z`, `A–Z`, dann Sonderzeichen), wie Farben in der Palette.
+
+**world.txt** (Sandbox): Zeilen, die mit `;` beginnen, und leere Zeilen sind Kommentare, jede andere Zeile ist eine Kartenzeile. Die Legende entsteht beim Import aus den Kommentaren: In einer Kommentarzeile trennen zwei oder mehr Leerzeichen die Teile; ein einzelnes Zeichen gefolgt von einem längeren Text ist ein Paar Taste + Name (`; .  Gras        ,  Gras (Variante)`). Welches Tile eine Taste zeigt, steht in der Tabelle `SANDBOX_TILES` (`core/src/tilemap.rs`, siehe README). Zeichen ohne Eintrag dort bleiben als Platzhalter erhalten und werden gemeldet. Kürzere Zeilen werden rechts mit leeren Zellen aufgefüllt, die der Export wieder weglässt.
+
+Gespeichert wird atomar wie Dokumente; der Verlauf liegt ebenfalls in `.pxe-history/<datei>/` (Zustände als `states/<id>.tilemap.json`).
 
 ## Verlauf (`.pxe-history/`)
 

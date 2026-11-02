@@ -177,8 +177,8 @@ impl Server {
             }
         }
         let full = self.workdir.join(p);
-        if !full.exists() && !io::is_document_path(p) {
-            for ext in [io::EXTENSION, ".aseprite", ".ase"] {
+        if !full.exists() && !io::is_document_path(p) && !pixel_core::tilemap::is_tilemap_path(p) {
+            for ext in [io::EXTENSION, ".aseprite", ".ase", pixel_core::tilemap::EXTENSION] {
                 let with_ext = self.workdir.join(format!("{rel}{ext}"));
                 if with_ext.exists() {
                     return Ok(with_ext);
@@ -511,6 +511,9 @@ impl Server {
     // ---- tools --------------------------------------------------------------
 
     fn call(&self, name: &str, a: &Value) -> Result<Out, String> {
+        if let Some(r) = self.tilemap_call(name, a) {
+            return r;
+        }
         match name {
             "list_documents" => self.list_documents(),
             "get_user_view" => self.get_user_view(),
@@ -1574,11 +1577,25 @@ impl Server {
         collect_docs(&self.workdir, 0, &mut found);
         found.sort();
         if found.is_empty() {
-            return Ok(Out::Text(format!("no .pxe.json or .aseprite files in {}", self.workdir.display())));
+            return Ok(Out::Text(format!(
+                "no .pxe.json, .aseprite or .tilemap.json files in {}",
+                self.workdir.display()
+            )));
         }
         let lines: Vec<String> = found
             .iter()
             .map(|p| match io::load(p) {
+                _ if pixel_core::tilemap::is_tilemap_path(p) => match pixel_core::tilemap::load(p) {
+                    Ok(m) => format!(
+                        "{}  tilemap {}x{} cells, tileset {}, {} legend keys",
+                        self.rel(p),
+                        m.width,
+                        m.height,
+                        m.tileset,
+                        m.legend.len()
+                    ),
+                    Err(e) => format!("{}  (unreadable: {e})", self.rel(p)),
+                },
                 Ok(d) => format!(
                     "{}  {}x{}  {} layers, {} frames, tags: [{}], regions: [{}]",
                     self.rel(p),
@@ -2085,7 +2102,7 @@ fn collect_docs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
             {
                 collect_docs(&p, depth + 1, out);
             }
-        } else if io::is_document_path(&p) {
+        } else if io::is_document_path(&p) || pixel_core::tilemap::is_tilemap_path(&p) {
             out.push(p);
         }
     }
@@ -2384,11 +2401,21 @@ Mirroring/rotating: transform (op flip_h|flip_v|rot90|rot180|rot270; scope rect/
 frame/frames/tag/all around the canvas centre; regions follow). A facing-left animation from a facing-right one: \
 mirror_document(src, dst) writes a mirrored copy with tags, durations, linked cels and regions kept; never redraw it. \
 Tiles must repeat seamlessly: render_preview with tiled: true shows a frame 3x3, check_seams reports hard edges where \
-the right/bottom edge meets the left/top one.";
+the right/bottom edge meets the left/top one. \
+Environments are tilemaps (.tilemap.json): a grid of one-character keys whose legend maps each key to a tile (a frame \
+name of the tileset document, e.g. tiles32.pxe.json) and optionally an object document standing on the cell (tree64). \
+Read with get_tilemap, change cells with set_tiles (diff, dry_run, note, history/undo like pixel writes), keys with \
+set_legend, size with resize_tilemap, look with render_preview. Editing a tile in the tileset changes it everywhere on \
+the map. The sandbox game's world.txt: import_world / export_world (byte-exact round trip; the game adds edges, cliff \
+faces and decor itself). Godot: export target godot on a map (TileSet + TileMapLayer scene) or godot_tileset on a tileset.";
 
 fn tools() -> &'static Value {
     static TOOLS: OnceLock<Value> = OnceLock::new();
-    TOOLS.get_or_init(tool_list)
+    TOOLS.get_or_init(|| {
+        let mut list = tool_list();
+        list.as_array_mut().unwrap().extend(tilemap::tool_defs());
+        list
+    })
 }
 
 fn tool_list() -> Value {
@@ -2441,7 +2468,7 @@ fn tool_list() -> Value {
         v
     };
     json!([
-        tool("list_documents", "List .pxe.json and .aseprite documents in the workdir with size, layers, frames, tags and regions.", json!({}), &[]),
+        tool("list_documents", "List .pxe.json and .aseprite documents in the workdir with size, layers, frames, tags and regions, and tilemaps (.tilemap.json) with size and tileset.", json!({}), &[]),
         tool("create_document", "Create a new document with one layer and one frame. Name ending in .aseprite creates an Aseprite file. Art direction: characters 48x48 (companion dog 48x36, slime 32x32), tiles 32x32, attack animations bigger (104x56, 80x96) with a locked marker 'origin' at the feet; one document per animation in a folder per character.",
             json!({
                 "name": {"type": "string", "description": "file name (\".pxe.json\" is appended unless it ends in .pxe.json/.aseprite/.ase), may include subdirectories"},
@@ -2562,7 +2589,7 @@ fn tool_list() -> Value {
                 "key": {"type": "string", "description": "palette key (one character)"}, "color": {"type": "string"},
                 "name": {"type": "string", "description": "color name, at least 2 characters; \"\" removes it"},
                 "remove": boolean("remove the key")})), &["path", "key"]),
-        tool("render_preview", "Render frames to preview/<name>.png and return the image: per frame a label (index, name, ms, tags), coordinate rulers, the zoomed frame with pixel grid (brighter every 8 px) and region outlines with names, 1x and 2x thumbnails; palette swatches with keys. Nearest-neighbour only. Look at it before calling art done.", json!({
+        tool("render_preview", "Render frames to preview/<name>.png and return the image: per frame a label (index, name, ms, tags), coordinate rulers, the zoomed frame with pixel grid (brighter every 8 px) and region outlines with names, 1x and 2x thumbnails; palette swatches with keys. Nearest-neighbour only. Look at it before calling art done. On a tilemap (.tilemap.json): the whole map with objects, tile grid (grid) and cell numbers, zoom default 1 (preview/<name>_map.png).", json!({
                 "path": path, "frame": {"type": ["integer", "string"], "description": "one frame; default all"},
                 "frames": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "several frames"},
                 "layer": {"type": ["integer", "string"], "description": "show only this layer"},
@@ -2593,8 +2620,8 @@ fn tool_list() -> Value {
                 "numbers": {"type": "array", "items": {"type": "integer"}, "description": "only these mark numbers (#1, #2 ...)"}}), &["path"]),
         tool("open_editor", "Open a document in the pixel-editor GUI on the user's screen. If an editor window for this workdir is running, the document opens there as a tab (or its tab is selected); otherwise a new window starts (detached). The editor follows the assistant's edits live; edits to a background tab mark the tab without switching to it.", json!({
                 "path": path, "dry_run": boolean("only report the command")}), &["path"]),
-        tool("export", "Export for engines/tools. png_sheet: sheet PNG + JSON (pixelart-studio shape). godot: sheet PNG + SpriteFrames .tres (one animation per tag). unity: sheet PNG + .png.meta + .anim.json. gif: one GIF per tag. aseprite: .aseprite file (regions become slices). Default out_dir: export/<name>/.", json!({
-                "path": path, "target": {"type": "string", "enum": ["png_sheet", "godot", "unity", "gif", "aseprite"]},
+        tool("export", "Export for engines/tools. png_sheet: sheet PNG + JSON (pixelart-studio shape). godot: sheet PNG + SpriteFrames .tres (one animation per tag). unity: sheet PNG + .png.meta + .anim.json. gif: one GIF per tag. aseprite: .aseprite file (regions become slices). godot_tileset: a tileset document as atlas PNG (8 tiles per row) + Godot 4 TileSet .tres (tile names in custom data \"name\"). On a tilemap: godot = atlas + TileSet + <name>.tscn with a TileMapLayer and a Sprite2D per object; world_txt = world.txt. Default out_dir: export/<name>/.", json!({
+                "path": path, "target": {"type": "string", "enum": ["png_sheet", "godot", "unity", "gif", "aseprite", "godot_tileset", "world_txt"]},
                 "out_dir": {"type": "string", "description": "directory relative to the workdir"},
                 "scale": int("integer upscale (default 1, gif 4)"), "columns": int("sheet columns (default up to 16 per row)"),
                 "godot_res_dir": {"type": "string", "description": "res:// directory the PNG will live in; default: path relative to the .tres"},
@@ -2635,3 +2662,4 @@ pub(crate) fn test_call(workdir: &Path, name: &str, args: Value) -> (bool, Strin
 
 #[cfg(test)]
 mod tests;
+mod tilemap;

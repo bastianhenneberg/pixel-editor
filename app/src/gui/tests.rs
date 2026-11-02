@@ -2596,3 +2596,212 @@ fn tiled_screenshot_of_the_tileset() {
     eprintln!("saved {}", shot.display());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---- tilemaps ---------------------------------------------------------------
+
+/// A 4x4 tileset with three tiles (grass, water, stone) and a 6x4 map of grass.
+fn map_setup(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let dir = scratch_dir(tag);
+    let mut ts = Document::new(4, 4, Document::builtin_palette("sweetie16").unwrap()).unwrap();
+    for i in 1..3 {
+        ts.add_frame(i, None, false).unwrap();
+    }
+    for (f, (name, key)) in [("grass", b'5'), ("water", b'a'), ("stone", b'd')].into_iter().enumerate() {
+        ts.frames[f].name = name.into();
+        ts.set_points(0, f, &pixel_core::draw::rect(0, 0, 3, 3, true), key);
+    }
+    let ts_path = dir.join("tiles.pxe.json");
+    io::save(&ts, &ts_path).unwrap();
+    let mut map = pixel_core::tilemap::TileMap::new("tiles.pxe.json", 4, 4, 6, 4).unwrap();
+    let g = map.key_for_tile("grass").unwrap();
+    map.fill_rect(pixel_core::Rect::new(0, 0, 6, 4), g);
+    let map_path = dir.join("m.tilemap.json");
+    pixel_core::tilemap::save(&map, &map_path).unwrap();
+    (ts_path, map_path)
+}
+
+fn cell_click(h: &mut Harness<'_, EditorApp>, x: i32, y: i32, button: PointerButton) {
+    let p = h.state().map.as_ref().unwrap().cell_center(x, y);
+    h.hover_at(p);
+    h.step();
+    press_btn(h, p, button, true);
+    h.step();
+    press_btn(h, p, button, false);
+    h.step();
+}
+
+fn cell_drag(h: &mut Harness<'_, EditorApp>, a: (i32, i32), b: (i32, i32)) {
+    let m = h.state().map.as_ref().unwrap();
+    let (a, b) = (m.cell_center(a.0, a.1), m.cell_center(b.0, b.1));
+    drag_screen(h, a, b);
+}
+
+fn map_rows(h: &Harness<'_, EditorApp>) -> Vec<String> {
+    h.state().map.as_ref().unwrap().map.rows()
+}
+
+#[test]
+fn tilemap_tools_undo_and_save() {
+    use super::map::{Brush, MapTool};
+    let _gpu = gpu_lock();
+    let (_, path) = map_setup("map-tools");
+    let mut h = harness(EditorApp::new(Some(path.clone())));
+    h.run_steps(3);
+    assert!(h.state().map.is_some(), "a .tilemap.json opens as a map tab");
+    assert_eq!(h.state().tab_label(0), "m");
+    // the palette shows the legend and every tile; clicking a legend entry picks it
+    assert!(h.query_by_label("Tileset (3 Tiles)").is_some());
+    h.get_by_label_contains("0 grass  ×").click();
+    h.run_steps(2);
+    assert_eq!(h.state().map.as_ref().unwrap().brush, Brush::Key(b'0'));
+
+    // pen with a tile that has no key yet: the key is added with the stroke
+    h.state_mut().map.as_mut().unwrap().brush = Brush::Tile("water".into());
+    cell_click(&mut h, 1, 1, PointerButton::Primary);
+    assert_eq!(map_rows(&h)[1], "010000");
+    assert_eq!(h.state().map.as_ref().unwrap().map.entry(b'1').unwrap().tile.as_deref(), Some("water"));
+    assert!(h.state().tab_dirty(0));
+    // a stroke over several cells
+    cell_drag(&mut h, (0, 3), (3, 3));
+    assert_eq!(map_rows(&h)[3], "111100");
+    // right button erases
+    cell_click(&mut h, 1, 1, PointerButton::Secondary);
+    assert_eq!(map_rows(&h)[1], "0 0000");
+    // rectangle
+    h.key_press(egui::Key::U);
+    h.step();
+    assert_eq!(h.state().map.as_ref().unwrap().tool, MapTool::Rect);
+    h.state_mut().map.as_mut().unwrap().brush = Brush::Tile("stone".into());
+    cell_drag(&mut h, (5, 0), (4, 1));
+    assert_eq!(map_rows(&h)[0], "000022");
+    assert_eq!(map_rows(&h)[1], "0 0022");
+    // fill replaces the connected area
+    h.key_press(egui::Key::G);
+    h.step();
+    cell_click(&mut h, 0, 0, PointerButton::Primary);
+    assert_eq!(map_rows(&h)[0], "222222");
+    assert_eq!(map_rows(&h)[2], "222222");
+    assert_eq!(map_rows(&h)[3], "111122");
+    // pipette picks a key, undo/redo
+    h.key_press(egui::Key::I);
+    h.step();
+    cell_click(&mut h, 0, 3, PointerButton::Primary);
+    assert_eq!(h.state().map.as_ref().unwrap().brush, Brush::Key(b'1'));
+    h.key_press_modifiers(Modifiers::COMMAND, egui::Key::Z);
+    h.step();
+    assert_eq!(map_rows(&h)[0], "000022");
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, egui::Key::Z);
+    h.step();
+    assert_eq!(map_rows(&h)[0], "222222");
+    // resize in the properties
+    h.state_mut().map.as_mut().unwrap().size_draft_for_test([8, 4]);
+    h.get_by_label("Größe übernehmen").click();
+    h.run_steps(2);
+    assert_eq!(map_rows(&h)[0], "222222  ");
+    // save: the file and the journal
+    h.key_press_modifiers(Modifiers::COMMAND, egui::Key::S);
+    h.step();
+    assert!(!h.state().tab_dirty(0));
+    let saved = pixel_core::tilemap::load(&path).unwrap();
+    assert_eq!(saved.rows()[3], "111122  ");
+    let j = pixel_core::journal::Journal::for_document(&path);
+    assert!(j.entries().last().unwrap().note.starts_with("Benutzer: "), "{:?}", j.entries().last());
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn tilemap_follows_the_tileset_tab_and_external_edits() {
+    let _gpu = gpu_lock();
+    let (ts_path, path) = map_setup("map-live");
+    let mut h = harness(EditorApp::new(Some(path.clone())));
+    h.run_steps(3);
+    let grass_px = |h: &Harness<'_, EditorApp>| h.state().map.as_ref().unwrap().assets.tileset.images[0].get(1, 1);
+    let before = grass_px(&h);
+    // "Tileset im Tab öffnen", then paint into the tileset without saving
+    h.get_by_label("Tileset im Tab öffnen").click();
+    h.run_steps(3);
+    assert!(h.state().map.is_none(), "the tileset tab is in front");
+    assert_eq!(h.state().tabs.len(), 2);
+    h.state_mut().goto_frame(0);
+    h.state_mut().layer = 0;
+    h.state_mut().color = b'2';
+    click_px(&mut h, 1, 1);
+    assert!(h.state().dirty);
+    h.state_mut().switch_tab(0);
+    h.run_steps(3);
+    assert_ne!(grass_px(&h), before, "the map shows the unsaved tile from the other tab");
+    let live_red = grass_px(&h);
+    // the same tile everywhere on the map: render it the way the canvas does
+    assert!(h.state().map.as_ref().unwrap().map.cells.iter().all(|c| *c == b'0'));
+    // an edit from outside (MCP) is reloaded with its note and is undoable
+    let (ok, t) = crate::mcp::test_call(
+        path.parent().unwrap(),
+        "set_tiles",
+        serde_json::json!({"path": "m", "cells": [{"x": 2, "y": 2, "tile": "stone"}], "note": "Claude: Stein"}),
+    );
+    assert!(ok, "{t}");
+    std::thread::sleep(Duration::from_millis(150));
+    poll(&mut h);
+    assert_eq!(map_rows(&h)[2], "001000");
+    assert!(
+        h.state().map.as_ref().unwrap().status.contains("Claude: Stein"),
+        "{}",
+        h.state().map.as_ref().unwrap().status
+    );
+    assert_eq!(grass_px(&h), live_red, "still the live tileset after the reload");
+    // saving the tileset tab: the map keeps the saved tile
+    h.state_mut().switch_tab(1);
+    h.key_press_modifiers(Modifiers::COMMAND, egui::Key::S);
+    h.step();
+    h.state_mut().switch_tab(0);
+    std::thread::sleep(Duration::from_millis(150));
+    poll(&mut h);
+    assert_eq!(io::load(&ts_path).unwrap().get(0, 0, 1, 1), b'2');
+    assert_eq!(grass_px(&h), live_red);
+    h.key_press_modifiers(Modifiers::COMMAND, egui::Key::Z);
+    h.step();
+    assert_eq!(map_rows(&h)[2], "000000", "undo of the external edit");
+    std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn tilemap_screenshot_of_the_world() {
+    let _gpu = gpu_lock();
+    let home = std::path::Path::new(env!("HOME"));
+    let art = home.join("Development/pixelart-studio/art");
+    let world = home.join("Development/pixel-sandbox/world.txt");
+    let (Ok(_), Ok(text)) = (io::load(&art.join("tiles32.pxe.json")), std::fs::read_to_string(&world)) else {
+        eprintln!("tiles32 or world.txt not found, no screenshot");
+        return;
+    };
+    // copies: the originals stay untouched
+    let dir = scratch_dir("map-shot");
+    std::fs::create_dir_all(dir.join("art")).unwrap();
+    for f in ["tiles32.pxe.json", "tree64.pxe.json"] {
+        std::fs::copy(art.join(f), dir.join("art").join(f)).unwrap();
+    }
+    let (map, _) = pixel_core::tilemap::import_world(&text, "art/tiles32.pxe.json", (32, 32)).unwrap();
+    let path = dir.join("world.tilemap.json");
+    pixel_core::tilemap::save(&map, &path).unwrap();
+    let mut h = harness(EditorApp::new(Some(path.clone())));
+    h.run_steps(3);
+    assert!(
+        h.state().map.as_ref().unwrap().assets.warnings.is_empty(),
+        "{:?}",
+        h.state().map.as_ref().unwrap().assets.warnings
+    );
+    // pick "water0" in the palette by its legend entry, hover a cell
+    h.get_by_label_contains("~ Wasser").click();
+    h.run_steps(2);
+    // half size, the start area in view
+    h.state_mut().map.as_mut().unwrap().zoom = 1;
+    h.state_mut().map.as_mut().unwrap().pan_for_test(egui::vec2(170.0, 60.0));
+    h.run_steps(2);
+    let p = h.state().map.as_ref().unwrap().cell_center(17, 3);
+    h.hover_at(p);
+    h.run_steps(3);
+    let shot = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/tilemap-screenshot.png");
+    h.render().unwrap().save(&shot).unwrap();
+    eprintln!("saved {}", shot.display());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

@@ -133,3 +133,33 @@ fn open_cli_adds_a_tab_to_the_running_window() {
     assert!(!art.join("hero/.pxe-history/walk.pxe.json/gui.log").exists(), "no window started");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn world_txt_and_tilemap_cli() {
+    let dir = std::env::temp_dir().join(format!("pxe-cli-world-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let ts = r##"{"version":1,"width":2,"height":2,"palette":[{"key":"1","color":"#00ff00"}],
+        "layers":[{"name":"l"}],"frames":[{"name":"grass"},{"name":"path"}],
+        "cels":[{"layer":0,"frame":0,"rows":["11","11"]}]}"##;
+    std::fs::write(dir.join("tiles.pxe.json"), ts).unwrap();
+    let world = "; .  Gras   =  Weg\n.=.\n...\n";
+    std::fs::write(dir.join("world.txt"), world).unwrap();
+    let run = |args: &[&str]| {
+        let r = Command::new(env!("CARGO_BIN_EXE_pixel-editor")).current_dir(&dir).args(args).output().unwrap();
+        assert!(r.status.success(), "{args:?}: {}", String::from_utf8_lossy(&r.stderr));
+        String::from_utf8_lossy(&r.stdout).into_owned()
+    };
+    let out = run(&["import-world", "world.txt", "maps/w.tilemap.json", "--tileset", "tiles.pxe.json"]);
+    assert!(out.contains("3x2 Kacheln"), "{out}");
+    let map = std::fs::read_to_string(dir.join("maps/w.tilemap.json")).unwrap();
+    assert!(map.contains("\"tileset\": \"../tiles.pxe.json\""), "{map}");
+    run(&["export-world", "maps/w.tilemap.json", "back.txt"]);
+    assert_eq!(std::fs::read_to_string(dir.join("back.txt")).unwrap(), world);
+    let out = run(&["export", "maps/w.tilemap.json", "godot", "godot"]);
+    assert!(out.contains("tiles_tileset.tres") && out.contains("w.tscn"), "{out}");
+    run(&["preview", "maps/w.tilemap.json", "w.png", "--zoom", "2"]);
+    assert!(dir.join("w.png").exists());
+    let out = run(&["export", "tiles.pxe.json", "godot_tileset", "ts"]);
+    assert!(out.contains("tiles_atlas.png"), "{out}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

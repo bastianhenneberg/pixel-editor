@@ -16,6 +16,7 @@ pub mod journal;
 pub mod palettes;
 pub mod render;
 pub mod seams;
+pub mod tilemap;
 pub mod transform;
 
 pub use color::Rgba;

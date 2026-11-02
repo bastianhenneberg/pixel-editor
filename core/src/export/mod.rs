@@ -2,6 +2,7 @@
 
 mod gif;
 mod godot;
+pub mod godot_tiles;
 mod unity;
 
 use std::path::{Path, PathBuf};

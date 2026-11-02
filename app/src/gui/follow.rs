@@ -165,6 +165,13 @@ impl EditorApp {
     /// Check document and journal; apply external changes (every tab, see
     /// `sync_all`).
     pub(super) fn poll_disk(&mut self) {
+        if let Some(m) = self.map.as_mut() {
+            if m.poll(self.follow.now) {
+                self.rev += 1;
+                self.status = m.status.clone();
+            }
+            return;
+        }
         let Some(path) = self.path.clone() else { return };
         self.poll_marks(&path);
         let journal = Journal::for_document(&path);

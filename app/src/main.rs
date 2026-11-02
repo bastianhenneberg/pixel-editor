@@ -7,7 +7,9 @@ mod view;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
+use pixel_core::export::godot_tiles;
 use pixel_core::export::{self, ExportOptions, Target};
+use pixel_core::tilemap::{self, Assets, Tileset};
 use pixel_core::{io, render};
 
 const USAGE: &str = "\
@@ -21,8 +23,16 @@ Aufruf:
                                           öffnen, sonst ein neues Fenster starten (losgelöst)
   pixel-editor mcp <ARBEITSORDNER>        MCP-Server über stdio starten
   pixel-editor export <DATEI> <ZIEL> [AUSGABEORDNER] [--scale N] [--godot-res-dir res://…]
-                                          ZIEL: png_sheet | godot | unity | gif
-  pixel-editor preview <DATEI> <AUS.png> [--zoom N] [--frame F]
+                                          ZIEL: png_sheet | godot | unity | gif | aseprite | godot_tileset
+                                          (godot_tileset: Atlas-PNG + TileSet .tres eines Tilesets);
+                                          bei einer Karte (.tilemap.json): godot (Atlas, TileSet, .tscn)
+                                          oder world_txt
+  pixel-editor preview <DATEI> <AUS.png> [--zoom N] [--frame F] [--no-grid]
+                                          (bei einer Karte: die ganze Karte mit Kachelraster)
+  pixel-editor import-world <world.txt> <KARTE.tilemap.json> --tileset <TILESET.pxe.json> [--force]
+                                          world.txt der Sandbox als Karte übernehmen
+  pixel-editor export-world <KARTE.tilemap.json> <world.txt>
+                                          Karte als world.txt schreiben (Kommentare bleiben erhalten)
   pixel-editor render-animation <DATEI> <TAG> <AUS.png> [--zoom N] [--region NAME|x,y,w,h]
                                           [--track NAME|x,y,w,h] [--jump N]
                                           Animation als Filmstreifen + Onion + Differenz, Analyse auf stdout
@@ -39,7 +49,8 @@ fn positional(args: &[String]) -> Vec<String> {
         if skip {
             skip = false;
         } else if a.starts_with("--") {
-            skip = true;
+            // switches without a value
+            skip = !matches!(a.as_str(), "--force" | "--no-grid" | "--dry-run");
         } else {
             out.push(a.clone());
         }
@@ -47,8 +58,90 @@ fn positional(args: &[String]) -> Vec<String> {
     out
 }
 
+/// Export a map or a tileset for Godot (and a map as world.txt).
+fn cli_export_tiles(file: &Path, target: &str, out: Option<&String>, res_dir: Option<String>) -> Result<(), String> {
+    let stem = if tilemap::is_tilemap_path(file) { tilemap::stem(file) } else { io::stem(file) };
+    let out = match out {
+        Some(d) => PathBuf::from(d),
+        None => file.parent().unwrap_or(Path::new(".")).join("export").join(&stem),
+    };
+    let files = match (tilemap::is_tilemap_path(file), target) {
+        (true, "godot") => {
+            let map = tilemap::load(file)?;
+            let assets = Assets::load(&map, file);
+            let ts_name = io::stem(&map.tileset_path(file));
+            let (files, warnings) = godot_tiles::export_map(&map, &assets, &ts_name, &out, &stem, res_dir.as_deref())?;
+            for w in warnings {
+                eprintln!("Hinweis: {w}");
+            }
+            files
+        }
+        (true, "world_txt" | "world") => {
+            let map = tilemap::load(file)?;
+            let (text, warnings) = tilemap::export_world(&map);
+            for w in warnings {
+                eprintln!("Hinweis: {w}");
+            }
+            std::fs::create_dir_all(&out).map_err(|e| e.to_string())?;
+            let path = out.join("world.txt");
+            io::write_atomic(&path, text.as_bytes())?;
+            vec![path]
+        }
+        (true, t) => return Err(format!("Karten exportieren nach godot oder world_txt, nicht {t:?}")),
+        (false, _) => godot_tiles::export_tileset(&Tileset::load(file)?, &out, &stem, res_dir.as_deref())?,
+    };
+    for f in files {
+        println!("{}", f.display());
+    }
+    Ok(())
+}
+
+fn cli_import_world(args: &[String]) -> Result<(), String> {
+    let pos = positional(args);
+    let [world, out, ..] = pos.as_slice() else { return Err(USAGE.into()) };
+    let ts = flag(args, "--tileset").ok_or("--tileset <TILESET.pxe.json> fehlt")?;
+    let out = PathBuf::from(out);
+    if !tilemap::is_tilemap_path(&out) {
+        return Err(format!("{} muss auf {} enden", out.display(), tilemap::EXTENSION));
+    }
+    if out.exists() && !args.iter().any(|a| a == "--force") {
+        return Err(format!("{} gibt es schon (--force überschreibt)", out.display()));
+    }
+    let tileset = Tileset::load(Path::new(&ts))?;
+    let text = std::fs::read_to_string(world).map_err(|e| format!("{world}: {e}"))?;
+    let rel = tilemap::relative_to_map(&out, Path::new(&ts));
+    let (map, notes) = tilemap::import_world(&text, &rel, (tileset.tile_w, tileset.tile_h))?;
+    if let Some(dir) = out.parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    }
+    tilemap::save(&map, &out)?;
+    for n in notes.iter().chain(&Assets::load(&map, &out).warnings) {
+        eprintln!("Hinweis: {n}");
+    }
+    println!("{} ({}x{} Kacheln, {} Legenden-Einträge)", out.display(), map.width, map.height, map.legend.len());
+    Ok(())
+}
+
+fn cli_export_world(args: &[String]) -> Result<(), String> {
+    let pos = positional(args);
+    let [map, out, ..] = pos.as_slice() else { return Err(USAGE.into()) };
+    let map = tilemap::load(Path::new(map))?;
+    let (text, warnings) = tilemap::export_world(&map);
+    for w in warnings {
+        eprintln!("Hinweis: {w}");
+    }
+    io::write_atomic(Path::new(out), text.as_bytes())?;
+    println!("{out}");
+    Ok(())
+}
+
 fn cli_export(args: &[String]) -> Result<(), String> {
     let pos = positional(args);
+    if let [f, t, ..] = pos.as_slice() {
+        if tilemap::is_tilemap_path(Path::new(f)) || t == "godot_tileset" {
+            return cli_export_tiles(Path::new(f), t, pos.get(2), flag(args, "--godot-res-dir"));
+        }
+    }
     let (file, target) = match pos.as_slice() {
         [f, t, ..] => (PathBuf::from(f), Target::parse(t)?),
         _ => return Err(USAGE.into()),
@@ -73,6 +166,18 @@ fn cli_export(args: &[String]) -> Result<(), String> {
 fn cli_preview(args: &[String]) -> Result<(), String> {
     let pos = positional(args);
     let [file, out, ..] = pos.as_slice() else { return Err(USAGE.into()) };
+    if tilemap::is_tilemap_path(Path::new(file)) {
+        let map = tilemap::load(Path::new(file))?;
+        let assets = Assets::load(&map, Path::new(file));
+        for w in &assets.warnings {
+            eprintln!("Hinweis: {w}");
+        }
+        let zoom = flag(args, "--zoom").and_then(|z| z.parse().ok()).unwrap_or(1);
+        let grid = !args.iter().any(|a| a == "--no-grid");
+        tilemap::preview(&map, &assets, zoom, grid).save_png(Path::new(out))?;
+        println!("{out}");
+        return Ok(());
+    }
     let doc = io::load(Path::new(file))?;
     let frames = match flag(args, "--frame") {
         Some(f) => vec![doc.find_frame(&f)?],
@@ -133,6 +238,8 @@ fn main() -> ExitCode {
         Some("export") => cli_export(&args[1..]),
         Some("preview") => cli_preview(&args[1..]),
         Some("render-animation") => cli_render_animation(&args[1..]),
+        Some("import-world") => cli_import_world(&args[1..]),
+        Some("export-world") => cli_export_world(&args[1..]),
         Some("--workdir") => match args.get(1) {
             Some(dir) => gui::run(args.get(2).map(PathBuf::from), Some(PathBuf::from(dir))),
             None => Err(USAGE.into()),
