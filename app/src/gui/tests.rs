@@ -3752,3 +3752,108 @@ fn shape_preview_uses_the_layer_opacity() {
     assert_ne!(&after[..3], &full[..3], "the drawn edge shows at half opacity");
     assert_eq!(during, after, "the preview looks exactly like the result");
 }
+
+/// A workdir with a document and an on_save hook; the consent goes to a
+/// file in the test folder.
+fn hook_app(name: &str, script: &str) -> (std::path::PathBuf, EditorApp) {
+    let dir = scratch_dir(&format!("hook-{name}")).canonicalize().unwrap();
+    let _ = std::fs::remove_file(dir.join("runs.log"));
+    let _ = std::fs::remove_dir_all(dir.join("config"));
+    write_gui_hook(&dir, script);
+    let path = dir.join("hero.pxe.json");
+    io::save(&Document::new(16, 16, Document::builtin_palette("sweetie16").unwrap()).unwrap(), &path).unwrap();
+    let mut app = EditorApp::new(Some(path));
+    app.hook.trust = crate::hook::TrustStore::at(dir.join("config/trusted.json"));
+    app.workdir = Some(dir.clone());
+    app.hook_check_workdir();
+    (dir, app)
+}
+
+fn write_gui_hook(dir: &std::path::Path, script: &str) {
+    let cfg = serde_json::json!({"on_save": ["sh", "-c", script], "label": "Export"});
+    std::fs::write(dir.join(crate::hook::PROJECT_FILE), cfg.to_string()).unwrap();
+}
+
+fn paint_and_save(h: &mut Harness<'_, EditorApp>, x: i32) {
+    h.state_mut().doc.set_points(0, 0, &[(x, 0)], b'2');
+    h.state_mut().dirty = true;
+    h.key_press_modifiers(Modifiers::COMMAND, egui::Key::S);
+    h.run_steps(2);
+}
+
+fn wait_hook(h: &mut Harness<'_, EditorApp>) {
+    let runner = h.state().hook.runner().cloned().expect("a hook ran");
+    assert!(runner.wait_idle(Duration::from_secs(10)));
+    h.run_steps(2);
+}
+
+/// Trust once, then every save runs the hook; the status bar says so
+/// (`target/hook-status-screenshot.png`).
+#[test]
+fn on_save_hook_asks_once_then_runs() {
+    let _gpu = gpu_lock();
+    let (dir, app) = hook_app("trust", "sleep 0.4; echo \"{file}\" >> runs.log");
+    let mut h = harness(app);
+    h.run_steps(3);
+    // asked when the folder is opened, with the command
+    h.get_by_label("Diesem Ordner vertrauen?");
+    assert!(h.query_by_label_contains("sh -c").is_some(), "the command is shown");
+    h.get_by_label("Vertrauen").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Diesem Ordner vertrauen?").is_none());
+    assert!(dir.join("config/trusted.json").exists(), "consent stored outside the workdir");
+    paint_and_save(&mut h, 1);
+    assert!(h.query_by_label_contains("Export läuft").is_some(), "running is shown at once");
+    wait_hook(&mut h);
+    assert_eq!(std::fs::read_to_string(dir.join("runs.log")).unwrap(), "hero.pxe.json\n");
+    assert!(h.query_by_label_contains("Export ok (").is_some(), "ok with its duration");
+    let img = h.render().expect("offscreen render");
+    img.save(std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/hook-status-screenshot.png")).unwrap();
+    // a second app on the same folder does not ask again
+    let mut again = EditorApp::new(None);
+    again.hook.trust = crate::hook::TrustStore::at(dir.join("config/trusted.json"));
+    again.workdir = Some(dir.clone());
+    again.hook_check_workdir();
+    assert!(again.hook_asking().is_none());
+    // a changed command asks again
+    write_gui_hook(&dir, "echo changed >> runs.log");
+    paint_and_save(&mut h, 2);
+    h.get_by_label("Diesem Ordner vertrauen?");
+    h.get_by_label("Nicht ausführen").click();
+    h.run_steps(2);
+    assert!(h.query_by_label("Diesem Ordner vertrauen?").is_none());
+    paint_and_save(&mut h, 3);
+    assert!(h.query_by_label("Diesem Ordner vertrauen?").is_none(), "declined: not asked again this session");
+    wait_hook(&mut h);
+    assert_eq!(std::fs::read_to_string(dir.join("runs.log")).unwrap(), "hero.pxe.json\n", "nothing new ran");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn on_save_hook_error_shows_output() {
+    let _gpu = gpu_lock();
+    let (dir, app) = hook_app("fail", "echo 'sheet walk_side fehlt' >&2; exit 1");
+    let mut h = harness(app);
+    h.run_steps(3);
+    h.get_by_label("Vertrauen").click();
+    h.run_steps(2);
+    paint_and_save(&mut h, 1);
+    wait_hook(&mut h);
+    h.get_by_label("Export Fehler").click();
+    h.run_steps(2);
+    h.get_by_label("Ausgabe von on_save");
+    assert!(h.query_by_label_contains("Fehler (Exit-Code 1)").is_some());
+    // the command (it contains the text) and the output below it
+    assert_eq!(h.query_all_by_label_contains("sheet walk_side fehlt").count(), 2, "stderr is shown");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn untrusted_hook_without_window_answer_does_not_run() {
+    let (dir, mut app) = hook_app("noanswer", "echo run >> runs.log");
+    assert!(app.hook_asking().is_some());
+    app.hook_after_save(&dir.join("hero.pxe.json"));
+    assert!(app.hook.runner().is_none(), "nothing runs before the user agrees");
+    assert!(!dir.join("runs.log").exists());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

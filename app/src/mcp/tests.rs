@@ -1,4 +1,5 @@
 use super::*;
+use std::time::Duration;
 
 fn call(s: &Server, name: &str, args: Value) -> (bool, String) {
     let r = s
@@ -121,6 +122,7 @@ fn protocol_and_tools() {
         "move_frames",
         "set_reference",
         "set_layer",
+        "hook_status",
     ] {
         assert!(names.contains(&required), "missing tool {required}");
     }
@@ -1268,5 +1270,121 @@ fn project_instructions_file() {
     // empty file: nothing appended
     std::fs::write(dir.join(".pxe-instructions.md"), "  \n").unwrap();
     assert_eq!(instructions_of(&Server::new(dir.canonicalize().unwrap())), INSTRUCTIONS);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A workdir with a document, a `.pxe-project.json` running `script` via
+/// sh, and a server whose consent lives in the test folder.
+fn hook_server(name: &str, script: &str) -> (PathBuf, Server, crate::hook::TrustStore, String) {
+    let dir = std::env::temp_dir().join(format!("pxe-mcp-hook-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dir = dir.canonicalize().unwrap();
+    write_hook(&dir, script);
+    let trust = crate::hook::TrustStore::at(dir.join("config/trusted.json"));
+    let s = Server::with_trust(dir.clone(), trust.clone());
+    s.handle(&json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
+        "params": {"clientInfo": {"name": "claude-code"}}}));
+    let created = ok(&s, "create_document", json!({"name": "hero", "width": 16, "height": 16}));
+    (dir, s, trust, created)
+}
+
+fn write_hook(dir: &Path, script: &str) {
+    let cfg = json!({"on_save": ["sh", "-c", script], "label": "Export"});
+    std::fs::write(dir.join(crate::hook::PROJECT_FILE), cfg.to_string()).unwrap();
+}
+
+fn trust_hook(dir: &Path, trust: &crate::hook::TrustStore) {
+    let crate::hook::Trust::Untrusted(cfg) = trust.check(dir) else { panic!("hook should be untrusted first") };
+    trust.trust(dir, &cfg).unwrap();
+}
+
+fn put_pixel(s: &Server, x: i32) -> String {
+    ok(s, "set_pixels", json!({"path": "hero", "layer": 0, "frame": 0, "pixels": [{"x": x, "y": 0, "key": "1"}]}))
+}
+
+#[test]
+fn on_save_hook_runs_debounced_after_writes() {
+    let (dir, s, trust, _) = hook_server("run", "echo \"{file}\" >> runs.log");
+    assert!(s.hooks.wait_idle(Duration::from_secs(5)));
+    assert!(!dir.join("runs.log").exists(), "untrusted: create_document ran nothing");
+    trust_hook(&dir, &trust);
+    // ten writes in a row: one run
+    for x in 0..10 {
+        let text = put_pixel(&s, x);
+        assert!(text.ends_with("on_save started (Export; hook_status shows the result)"), "{text}");
+    }
+    assert!(s.hooks.wait_idle(Duration::from_secs(10)));
+    assert_eq!(std::fs::read_to_string(dir.join("runs.log")).unwrap(), "hero.pxe.json\n");
+    assert_eq!(s.hooks.status().runs, 1);
+    let st = ok(&s, "hook_status", json!({"path": "hero"}));
+    assert!(st.contains("hook Export (sh -c"), "{st}");
+    assert!(st.contains("trusted"), "{st}");
+    assert!(st.contains("last run for hero.pxe.json: ok in"), "{st}");
+    // reading, history and snapshots save no document: no hook
+    for (tool, args) in [
+        ("get_document", json!({"path": "hero"})),
+        ("snapshot", json!({"path": "hero", "name": "v1"})),
+        ("history", json!({"path": "hero"})),
+        (
+            "set_pixels",
+            json!({"path": "hero", "layer": 0, "frame": 0, "pixels": [{"x": 0, "y": 1, "key": "1"}], "dry_run": true}),
+        ),
+    ] {
+        let text = ok(&s, tool, args);
+        assert!(!text.contains("on_save"), "{tool}: {text}");
+    }
+    // undo writes the document again
+    assert!(ok(&s, "undo", json!({"path": "hero"})).contains("on_save started"));
+    assert!(s.hooks.wait_idle(Duration::from_secs(10)));
+    assert_eq!(s.hooks.status().runs, 2);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn on_save_hook_needs_trust_for_this_command() {
+    let (dir, s, trust, first) = hook_server("trust", "echo run >> runs.log");
+    assert!(first.contains("on_save not run: the hook in .pxe-project.json (sh -c"), "{first}");
+    assert!(!put_pixel(&s, 0).contains("on_save"), "told once");
+    let st = ok(&s, "hook_status", json!({}));
+    assert!(st.contains("is NOT trusted"), "{st}");
+    trust_hook(&dir, &trust);
+    assert!(put_pixel(&s, 2).contains("on_save started"));
+    assert!(s.hooks.wait_idle(Duration::from_secs(10)));
+    assert_eq!(std::fs::read_to_string(dir.join("runs.log")).unwrap(), "run\n");
+    // a changed command is not trusted any more and is reported again
+    write_hook(&dir, "echo other >> runs.log");
+    assert!(put_pixel(&s, 3).contains("on_save not run"));
+    assert!(s.hooks.wait_idle(Duration::from_secs(5)));
+    assert_eq!(std::fs::read_to_string(dir.join("runs.log")).unwrap(), "run\n");
+    // a broken project file is reported, nothing runs
+    std::fs::write(dir.join(crate::hook::PROJECT_FILE), "{\"on_save\": \"sh\"}").unwrap();
+    assert!(put_pixel(&s, 4).contains("on_save not run: .pxe-project.json: on_save must be a list"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn on_save_hook_failure_shows_in_status() {
+    let (dir, s, trust, _) = hook_server("fail", "echo exporting {file}; echo 'no such sheet' >&2; exit 2");
+    assert!(ok(&s, "hook_status", json!({})).contains("no run in this session"));
+    trust_hook(&dir, &trust);
+    put_pixel(&s, 0);
+    assert!(s.hooks.wait_idle(Duration::from_secs(10)));
+    let st = ok(&s, "hook_status", json!({"path": "hero.pxe.json"}));
+    assert!(st.contains("FAILED (exit 2)"), "{st}");
+    assert!(st.contains("output:\nexporting hero.pxe.json\nno such sheet"), "{st}");
+    assert!(ok(&s, "hook_status", json!({"path": "other"})).contains("no run for other in this session"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn no_hook_no_note() {
+    let dir = std::env::temp_dir().join(format!("pxe-mcp-nohook-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let s = claude_server(&dir);
+    let text = ok(&s, "create_document", json!({"name": "hero", "width": 8, "height": 8}));
+    assert!(!text.contains("on_save"), "{text}");
+    assert!(ok(&s, "hook_status", json!({})).starts_with("no on_save hook"));
     std::fs::remove_dir_all(&dir).unwrap();
 }

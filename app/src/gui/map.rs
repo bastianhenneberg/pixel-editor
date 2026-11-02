@@ -656,6 +656,8 @@ impl EditorApp {
     /// Everything of a map tab below the menu bar.
     pub(super) fn map_ui(&mut self, ui: &mut egui::Ui, ctx: &egui::Context, now: f64) {
         self.sync_live_tileset();
+        let runner = self.hook.runner().cloned();
+        let mut show_hook = false;
         let Some(m) = self.map.as_mut() else { return };
         m.textures(ctx);
         egui::Panel::bottom("map-status").show(ui, |ui| {
@@ -667,8 +669,14 @@ impl EditorApp {
             parts.push(format!("Pinsel {}", m.brush_label()));
             parts.push(format!("{}×{} Kacheln · Zoom {}×", m.map.width, m.map.height, m.scale()));
             ui.strong(parts.join(" · "));
-            ui.label(&m.status);
+            ui.horizontal(|ui| {
+                ui.label(&m.status);
+                show_hook = super::hook::badge(ui, runner.as_ref());
+            });
         });
+        if show_hook {
+            self.hook.show_output = !self.hook.show_output;
+        }
         if m.conflict {
             egui::Panel::top("map-conflict").show(ui, |ui| {
                 ui.horizontal(|ui| {

@@ -2,6 +2,7 @@
 
 mod canvas;
 mod follow;
+mod hook;
 mod map;
 mod marks;
 mod panels;
@@ -289,6 +290,8 @@ pub struct EditorApp {
     /// processes find the window for it (`crate::ipc`).
     workdir: Option<PathBuf>,
     ipc: Option<crate::ipc::Server>,
+    /// The workdir's on-save hook (see `hook`).
+    hook: hook::HookState,
     debug_keys: bool,
 }
 
@@ -389,6 +392,7 @@ impl EditorApp {
             active: 0,
             workdir: None,
             ipc: None,
+            hook: Default::default(),
             debug_keys: std::env::var_os("PIXEL_EDITOR_DEBUG_KEYS").is_some_and(|v| v != "0"),
         }
     }
@@ -620,8 +624,12 @@ impl EditorApp {
 
     fn save(&mut self) {
         if let Some(m) = self.map.as_mut() {
-            if let Err(e) = m.save() {
-                m.status = format!("Fehler beim Speichern: {e}");
+            match m.save() {
+                Ok(()) => {
+                    let path = m.path.clone();
+                    self.hook_after_save(&path);
+                }
+                Err(e) => m.status = format!("Fehler beim Speichern: {e}"),
             }
             return;
         }
@@ -672,6 +680,7 @@ impl EditorApp {
                 if self.doc.reference.is_some() && pixel_core::aseprite::is_aseprite_path(&path) {
                     self.status += " · die Referenz steht nur in .pxe.json, nicht in .aseprite";
                 }
+                self.hook_after_save(&path);
             }
             Err(e) => self.status = format!("Fehler beim Speichern: {e}"),
         }
@@ -1346,6 +1355,7 @@ impl eframe::App for EditorApp {
             self.save_settings(&ctx);
             self.dialogs(&ctx);
             self.map_dialog_ui(&ctx);
+            self.hook_windows(&ctx);
             self.update_title(&ctx);
             self.publish_view();
             return;
@@ -1402,6 +1412,9 @@ impl eframe::App for EditorApp {
                 ui.label(format!("{}×{} · Zoom {}×", self.doc.width, self.doc.height, self.zoom));
                 ui.separator();
                 ui.label(&self.status);
+                if hook::badge(ui, self.hook.runner()) {
+                    self.hook.show_output = !self.hook.show_output;
+                }
             });
         });
         if self.external_conflict {
@@ -1434,6 +1447,7 @@ impl eframe::App for EditorApp {
         self.mirror_dialog_ui(&ctx);
         self.reference_window(&ctx);
         self.recolor_dialog_ui(&ctx);
+        self.hook_windows(&ctx);
         self.update_title(&ctx);
         self.publish_view();
         if self.autoshot.as_mut().is_some_and(|s| s.tick(&ctx, now)) {
@@ -1498,6 +1512,7 @@ pub fn run(path: Option<PathBuf>, workdir: Option<PathBuf>) -> Result<(), String
         Box::new(move |cc| {
             let mut app = EditorApp::new(path);
             app.workdir = workdir;
+            app.hook_check_workdir();
             if let Some(s) = &ipc {
                 let ctx = cc.egui_ctx.clone();
                 s.set_waker(move || ctx.request_repaint());

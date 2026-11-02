@@ -77,10 +77,17 @@ impl Server {
     ) -> Result<(), String> {
         let journal = Journal::for_document(path);
         journal.ensure_current(before, "state before the next edit (first edit or changed outside the editor)")?;
-        tilemap::save(map, path)?;
+        self.save_map(map, path)?;
         let focus =
             bbox.map(|b| Focus { frame: 0, layer: 0, bbox: Some([b.x, b.y, b.w as i32, b.h as i32]), region: None });
         journal.record_edit(map, &self.author(), note, focus)?;
+        Ok(())
+    }
+
+    /// Save a map file and remember it for the on-save hook.
+    fn save_map(&self, map: &TileMap, path: &Path) -> Result<(), String> {
+        tilemap::save(map, path)?;
+        self.saved.borrow_mut().push(path.to_path_buf());
         Ok(())
     }
 
@@ -99,7 +106,7 @@ impl Server {
             let k = map.find_key(fill, Some(&ts))?;
             map.fill_rect(Rect::new(0, 0, w, h), k);
         }
-        tilemap::save(&map, &path)?;
+        self.save_map(&map, &path)?;
         Journal::for_document(&path).record(
             &map,
             &self.author(),
@@ -320,7 +327,7 @@ impl Server {
         let text = std::fs::read_to_string(&src).map_err(|e| format!("{}: {e}", self.rel(&src)))?;
         let (map, notes) =
             tilemap::import_world(&text, &tilemap::relative_to_map(&path, &ts_path), (ts.tile_w, ts.tile_h))?;
-        tilemap::save(&map, &path)?;
+        self.save_map(&map, &path)?;
         Journal::for_document(&path).record(
             &map,
             &self.author(),
@@ -460,7 +467,7 @@ impl Server {
             return Ok(Out::Text(format!("DRY RUN: would undo {steps} step(s); see history")));
         }
         let (restored, target): (TileMap, _) = j.undo(&map, steps, &self.author())?;
-        tilemap::save(&restored, &path)?;
+        self.save_map(&restored, &path)?;
         Ok(Out::Text(format!(
             "restored the state after #{} ({:?})\n{}",
             target.id,

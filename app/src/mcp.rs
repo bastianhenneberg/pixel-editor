@@ -64,6 +64,8 @@ pub fn run(workdir: &Path) -> std::io::Result<()> {
             stdout.flush()?;
         }
     }
+    // let a running or pending export finish before the process ends
+    server.hooks.wait_idle(std::time::Duration::from_secs(60));
     Ok(())
 }
 
@@ -93,6 +95,13 @@ struct Server {
     author: std::cell::RefCell<String>,
     /// INSTRUCTIONS plus the workdir's `.pxe-instructions.md`, read once at start.
     instructions: String,
+    /// The workdir's on-save hook (`.pxe-project.json`) and the user's consent.
+    hooks: crate::hook::Runner,
+    trust: crate::hook::TrustStore,
+    /// Documents saved by the running tool call; the hook gets them afterwards.
+    saved: std::cell::RefCell<Vec<PathBuf>>,
+    /// Hash of the command already reported as untrusted (reported once).
+    untrusted_told: std::cell::RefCell<Option<String>>,
 }
 
 /// Display name of an MCP client: "claude-code"/"claude…" -> "Claude",
@@ -114,8 +123,20 @@ fn author_from_client(name: Option<&str>) -> String {
 
 impl Server {
     fn new(workdir: PathBuf) -> Server {
+        Server::with_trust(workdir, crate::hook::TrustStore::from_env())
+    }
+
+    fn with_trust(workdir: PathBuf, trust: crate::hook::TrustStore) -> Server {
         let instructions = instructions_for(&workdir);
-        Server { workdir, author: std::cell::RefCell::new(author_from_client(None)), instructions }
+        Server {
+            hooks: crate::hook::Runner::new(&workdir),
+            workdir,
+            author: std::cell::RefCell::new(author_from_client(None)),
+            instructions,
+            trust,
+            saved: Default::default(),
+            untrusted_told: Default::default(),
+        }
     }
 
     fn author(&self) -> String {
@@ -148,7 +169,14 @@ impl Server {
             "tools/call" => {
                 let name = params.get("name").and_then(Value::as_str).unwrap_or("");
                 let args = params.get("arguments").cloned().unwrap_or(json!({}));
-                match check_args(name, &args).and_then(|_| self.call(name, &args)) {
+                let out = check_args(name, &args).and_then(|_| self.call(name, &args));
+                let hook_note = self.run_save_hook();
+                let out = out.map(|o| match (o, hook_note) {
+                    (Out::Text(t), Some(n)) => Out::Text(format!("{t}\n{n}")),
+                    (Out::TextAndImage(t, png), Some(n)) => Out::TextAndImage(format!("{t}\n{n}"), png),
+                    (o, None) => o,
+                });
+                match out {
                     Ok(Out::Text(t)) => json!({"content": [{"type": "text", "text": t}], "isError": false}),
                     Ok(Out::TextAndImage(t, png)) => json!({"content": [
                         {"type": "text", "text": t},
@@ -223,10 +251,119 @@ impl Server {
     ) -> Result<(), String> {
         let journal = Journal::for_document(path);
         journal.ensure_current(before, "state before the next edit (first edit or changed outside the editor)")?;
-        io::save(doc, path)?;
+        self.save_doc(doc, path)?;
         journal.record_edit(doc, &self.author(), note, focus)?;
         crate::view::follow_marks(path, doc)?;
         Ok(())
+    }
+
+    /// Save a document file (the real one, not history or snapshots) and
+    /// remember it for the on-save hook.
+    fn save_doc(&self, doc: &Document, path: &Path) -> Result<(), String> {
+        io::save(doc, path)?;
+        self.saved.borrow_mut().push(path.to_path_buf());
+        Ok(())
+    }
+
+    /// After a tool call: hand the saved documents to the on-save hook.
+    /// Returns a line for the tool result, if there is something to say.
+    fn run_save_hook(&self) -> Option<String> {
+        use crate::hook::Trust;
+        let saved = std::mem::take(&mut *self.saved.borrow_mut());
+        if saved.is_empty() {
+            return None;
+        }
+        match self.trust.check(&self.workdir) {
+            Trust::None => None,
+            Trust::Trusted(cfg) => {
+                let queued = saved.iter().filter(|p| self.hooks.notify(&cfg, p)).count();
+                (queued > 0).then(|| format!("on_save started ({}; hook_status shows the result)", cfg.label))
+            }
+            Trust::Untrusted(cfg) => {
+                let hash = cfg.hash();
+                if self.untrusted_told.borrow().as_deref() == Some(hash.as_str()) {
+                    return None;
+                }
+                *self.untrusted_told.borrow_mut() = Some(hash);
+                Some(format!(
+                    "on_save not run: the hook in {} ({}) is not trusted for this folder. The user confirms it once \
+                     in the editor window (it asks when the folder is opened or a document saved).",
+                    crate::hook::PROJECT_FILE,
+                    cfg.display()
+                ))
+            }
+            Trust::Invalid(e) => Some(format!("on_save not run: {e}")),
+        }
+    }
+
+    /// The on-save hook: configuration, trust and the last run (for `path`).
+    fn hook_status(&self, a: &Value) -> Result<Out, String> {
+        use crate::hook::Trust;
+        let mut lines = Vec::new();
+        match self.trust.check(&self.workdir) {
+            Trust::None => {
+                return Ok(Out::Text(format!(
+                    "no on_save hook ({} in the workdir has no on_save)",
+                    crate::hook::PROJECT_FILE
+                )))
+            }
+            Trust::Invalid(e) => return Ok(Out::Text(format!("hook not usable: {e}"))),
+            Trust::Untrusted(cfg) => lines.push(format!(
+                "hook {} ({}) is NOT trusted for this folder; it does not run until the user confirms it in the editor window",
+                cfg.label,
+                cfg.display()
+            )),
+            Trust::Trusted(cfg) => lines.push(format!("hook {} ({}), trusted", cfg.label, cfg.display())),
+        }
+        let st = self.hooks.status();
+        let file = match a.get("path").and_then(Value::as_str) {
+            Some(p) => Some(self.rel(&self.resolve(p)?)),
+            None => None,
+        };
+        if let Some((since, files)) = &st.running {
+            lines.push(format!("running for {:.1} s: {}", since.elapsed().as_secs_f64(), files.join(", ")));
+        }
+        if !st.pending.is_empty() {
+            lines.push(format!("waiting to run: {}", st.pending.join(", ")));
+        }
+        let last = match &file {
+            Some(f) => st.by_file.get(f),
+            None => st.last.as_ref(),
+        };
+        match last {
+            None => lines.push(match &file {
+                Some(f) => format!("no run for {f} in this session"),
+                None => "no run in this session".into(),
+            }),
+            Some(r) => {
+                let ago = r.finished.elapsed().map(|d| d.as_secs()).unwrap_or(0);
+                let how = match (r.ok, r.code) {
+                    (true, _) => "ok".to_string(),
+                    (false, Some(c)) => format!("FAILED (exit {c})"),
+                    (false, None) => "FAILED".to_string(),
+                };
+                lines.push(format!(
+                    "last run for {}: {how} in {:.1} s, {ago} s ago\ncommand: {}",
+                    r.files.join(", "),
+                    r.duration.as_secs_f64(),
+                    r.command
+                ));
+                let out = r.output.trim_end();
+                let tail: Vec<&str> = out.lines().rev().take(40).collect();
+                if tail.is_empty() {
+                    lines.push("output: (none)".into());
+                } else {
+                    let n = out.lines().count();
+                    let head = if n > tail.len() {
+                        format!("output (last {} of {n} lines):", tail.len())
+                    } else {
+                        "output:".into()
+                    };
+                    lines.push(format!("{head}\n{}", tail.into_iter().rev().collect::<Vec<_>>().join("\n")));
+                }
+            }
+        }
+        Ok(Out::Text(lines.join("\n")))
     }
 
     /// Paced write: show the change being drawn stroke by stroke (row by
@@ -525,6 +662,7 @@ impl Server {
         match name {
             "list_documents" => self.list_documents(),
             "get_user_view" => self.get_user_view(),
+            "hook_status" => self.hook_status(a),
             "create_document" => self.create_document(a),
             "get_document" => {
                 let (path, doc, warnings) = self.load(a)?;
@@ -1044,7 +1182,7 @@ impl Server {
             "save_as" => {
                 let (src, doc, warnings) = self.load(a)?;
                 let dest = self.new_doc_path(str_arg(a, "to")?, bool_arg(a, "overwrite", false))?;
-                io::save(&doc, &dest)?;
+                self.save_doc(&doc, &dest)?;
                 let mut msg = format!("wrote {} as {}", self.rel(&src), self.rel(&dest));
                 if !doc.ramps.is_empty() && pixel_core::aseprite::is_aseprite_path(&dest) {
                     msg += &format!("\nnote: the {} color ramp(s) are not stored in .aseprite", doc.ramps.len());
@@ -1067,7 +1205,7 @@ impl Server {
                 };
                 let doc = import::import_png(&src, tile, opt_int(a, "duration_ms")?.unwrap_or(100).max(1) as u32)?;
                 let dest = self.new_doc_path(str_arg(a, "name")?, bool_arg(a, "overwrite", false))?;
-                io::save(&doc, &dest)?;
+                self.save_doc(&doc, &dest)?;
                 Ok(Out::Text(format!(
                     "imported {} as {} ({}x{}, {} frames, {} colors)",
                     self.rel(&src),
@@ -1116,7 +1254,7 @@ impl Server {
                     return Ok(Out::Text(format!("DRY RUN: would undo {steps} step(s); see history")));
                 }
                 let (restored, target) = j.undo(&doc, steps, &self.author())?;
-                io::save(&restored, &path)?;
+                self.save_doc(&restored, &path)?;
                 crate::view::follow_marks(&path, &restored)?;
                 let changes = diff::summary(&doc, &restored);
                 Ok(Out::Text(format!(
@@ -1808,7 +1946,7 @@ impl Server {
         if dest == src {
             return Err("dst is the source document; use transform scope all to mirror it in place".into());
         }
-        io::save(&mirrored, &dest)?;
+        self.save_doc(&mirrored, &dest)?;
         let note = note_arg(a, || format!("{}: mirror_document {} from {}", self.author(), op.id(), self.rel(&src)));
         Journal::for_document(&dest).record_edit(&mirrored, &self.author(), &note, None)?;
         Ok(Out::Text(format!("wrote {}: {msg}\nrecorded as {note:?}", self.rel(&dest))))
@@ -1910,7 +2048,7 @@ impl Server {
             doc.rename_layer(0, n);
         }
         let path = self.new_doc_path(str_arg(a, "name")?, bool_arg(a, "overwrite", false))?;
-        io::save(&doc, &path)?;
+        self.save_doc(&doc, &path)?;
         let author = self.author();
         Journal::for_document(&path).record(&doc, &author, &note_arg(a, || format!("{author}: create_document")))?;
         Ok(Out::Text(format!("created {} ({w}x{h}, palette: {})", self.rel(&path), palette_line(&doc))))
@@ -2833,7 +2971,9 @@ name of the tileset document, e.g. tiles32.pxe.json) and optionally an object do
 Read with get_tilemap, change cells with set_tiles (diff, dry_run, note, history/undo like pixel writes), keys with \
 set_legend, size with resize_tilemap, look with render_preview. Editing a tile in the tileset changes it everywhere on \
 the map. The sandbox game's world.txt: import_world / export_world (byte-exact round trip; the game adds edges, cliff \
-faces and decor itself). Godot: export target godot on a map (TileSet + TileMapLayer scene) or godot_tileset on a tileset.";
+faces and decor itself). Godot: export target godot on a map (TileSet + TileMapLayer scene) or godot_tileset on a tileset. \
+A workdir may define an on_save hook (.pxe-project.json, e.g. the project's own export); after a write that saves a \
+document the result says \"on_save started\", and hook_status shows whether it succeeded and its output.";
 
 fn tools() -> &'static Value {
     static TOOLS: OnceLock<Value> = OnceLock::new();
@@ -3121,6 +3261,7 @@ fn tool_list() -> Value {
                 "name": {"type": "string", "description": "new document name"},
                 "tile_w": int("tile width"), "tile_h": int("tile height (default = tile_w)"),
                 "duration_ms": int("frame duration, default 100"), "overwrite": boolean("replace an existing file")}), &["png_path", "name"]),
+        tool("hook_status", "The workdir's on_save hook (.pxe-project.json: a command run after each save, e.g. the project's export): whether it is trusted, whether it is running, and the last run (for path, or the last one) with exit code, duration and output (stdout/stderr). Writes that save a document say \"on_save started\"; check here whether it succeeded.", json!({"path": {"type": "string", "description": "document; default: the last run of any document"}}), &[]),
         tool("history", "Edit history of a document (MCP and GUI edits with their notes), newest first.", json!({"path": path, "limit": int("entries, default 20")}), &["path"]),
         tool("undo", "Undo the last edit(s) recorded in the history (also GUI saves). Repeated calls step further back.", json!({"path": path, "steps": int("default 1"), "dry_run": dry}), &["path"]),
         tool("snapshot", "Save the current state under a name, to compare or roll back later.", json!({"path": path, "name": {"type": "string"}, "note": {"type": "string"}}), &["path", "name"]),

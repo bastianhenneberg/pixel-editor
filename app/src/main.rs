@@ -1,4 +1,5 @@
 mod gui;
+mod hook;
 mod ipc;
 mod launch;
 mod mcp;

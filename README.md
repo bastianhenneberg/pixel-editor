@@ -362,6 +362,7 @@ oder `claude mcp add pixel-editor -- /pfad/zu/pixel-editor/target/release/pixel-
 | `history`, `undo(steps?)`, `snapshot(name, note?)`, `list_snapshots`, `diff_snapshot(name, layer?, frame?)`, `restore_snapshot(name)` | Verlauf und Schnappschüsse |
 | `focus(path, frame, layer?, region? \| rect?, note?)`, `open_editor(path)`; `pace_ms` an Schreibwerkzeugen | live zusehen (siehe „KI folgen“) |
 | `get_user_view` | was im Editor gerade offen und ausgewählt ist, samt Pixeln der Auswahl und allen „KI zeigen“-Markierungen mit Notizen (siehe „Was du gerade ansiehst“) |
+| `hook_status(path?)` | der `on_save`-Befehl aus `.pxe-project.json`: vertraut oder nicht, läuft gerade, letztes Ergebnis (Exit-Code, Dauer, Ausgabe) |
 | `clear_marks(path, frame?, numbers?)` | „KI zeigen“-Markierungen entfernen: alle des Dokuments, nur die eines Frames oder bestimmte Nummern |
 | `export(path, target, …)` | `png_sheet`, `godot`, `unity`, `gif`, `aseprite`, `godot_tileset` (Tileset als Atlas + TileSet); auf einer Karte `godot` (Atlas, TileSet, Szene) oder `world_txt` |
 | `create_tilemap(name, tileset, width, height, fill?)` | neue Karte; nennt alle Tiles des Tilesets |
@@ -442,6 +443,16 @@ Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen n
 4. Animation: `add_frame(copy_from)` + kleine Änderungen. Bezieht sich der Nutzer auf „das hier“, erst `get_user_view` aufrufen. Wiederkehrende Frames mit `linked: true` anlegen, dann `set_frame_duration` und `set_tag` (Bereich + Richtung).
 5. `export` (für das Testspiel `godot`), für Aseprite-Nutzer `aseprite`.
 6. Umgebungen: Karte mit `create_tilemap` oder `import_world`, ansehen mit `get_tilemap` und `render_preview`, ändern mit `set_tiles` (immer den Diff prüfen). Tiles selbst bearbeitet man im Tileset-Dokument; jede Karte zeigt die Änderung sofort.
+
+## Nach dem Speichern automatisch exportieren
+
+Liegt im Arbeitsordner eine `.pxe-project.json` mit `on_save`, führt der Editor diesen Befehl nach jedem Speichern im Hintergrund aus, z. B. den Export des Projekts in eine Engine:
+
+```json
+{"on_save": ["python3", "../tools/export.py", "--only", "{file}"], "label": "Export"}
+```
+
+`{file}` ist das gespeicherte Dokument relativ zum Arbeitsordner, dazu gibt es `{abs}` und `{workdir}`. Gilt für Strg+S in der GUI und für jedes MCP-Werkzeug, das ein Dokument schreibt; eine Serie von Schreibvorgängen gibt nach 300 ms Ruhe einen Lauf. Beim ersten Mal fragt das Fenster „Diesem Ordner vertrauen?“, denn ein fremdes Repo soll nicht schon beim Öffnen Befehle ausführen. Die Zustimmung gilt für genau diesen Befehl und liegt außerhalb des Ordners (`~/.config/pixel-editor/trusted.json`); der MCP-Server läuft nur in vertrauten Ordnern. Die Statusleiste zeigt „Export läuft … / ok (0,4 s) / Fehler“, ein Klick die letzte Ausgabe; per MCP liefert `hook_status` dasselbe. Einzelheiten in [FORMAT.md](FORMAT.md#projekt-datei-pxe-projectjson).
 
 ## Bekannte Grenzen
 

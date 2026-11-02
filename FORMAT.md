@@ -193,6 +193,26 @@ Gespeichert wird atomar wie Dokumente; der Verlauf liegt ebenfalls in `.pxe-hist
 
 Optional im Arbeitsordner des MCP-Servers (`pixel-editor mcp <workdir>`): freies Markdown mit den Vorgaben des Projekts, z. B. Leinwandgrößen, Ordner je Figur, Marker. Der Server hängt den Inhalt beim Start an seine Anweisungen an (höchstens 16 KB, der Rest wird mit Hinweis abgeschnitten). Der Editor selbst wertet die Datei nicht aus.
 
+## Projekt-Datei (`.pxe-project.json`)
+
+Optional im Arbeitsordner (des Editorfensters und des MCP-Servers). Bisher kennt sie einen Eintrag: einen Befehl, der nach jedem Speichern läuft, etwa der Export eines Projekts:
+
+```json
+{
+  "on_save": ["python3", "../tools/export.py", "--only", "{file}"],
+  "label": "Export"
+}
+```
+
+- `on_save`: Programm und Argumente als Liste (keine Shell; wer eine braucht, schreibt `["sh", "-c", "…"]`). Platzhalter in jedem Argument: `{file}` (das gespeicherte Dokument relativ zum Arbeitsordner, mit `/`), `{abs}` (absoluter Pfad), `{workdir}`. Der Befehl läuft im Arbeitsordner.
+- `label`: Name in der Statusleiste, Vorgabe `on_save`.
+
+Ausgelöst wird er, wenn ein Dokument oder eine Karte im Arbeitsordner gespeichert wurde: in der GUI mit Strg+S, „Speichern unter“ und „Alle speichern“, im MCP-Server von jedem Werkzeug, das die Datei schreibt (Pixel, Struktur, `undo`, `restore_snapshot`, `save_as`, …). Nicht ausgelöst wird er von Lesewerkzeugen, `dry_run`, Exporten und Schreibvorgängen in `.pxe-history/` (Verlauf, Schnappschüsse). Er läuft im Hintergrund und entprellt: erst 300 ms nach dem letzten Speichern, eine Serie von Schreibvorgängen gibt einen Lauf. Kommt während eines Laufs ein Speichern dazu, folgt danach genau ein weiterer. Mit `{file}`/`{abs}` läuft er einmal je gespeichertem Dokument. Nach 5 Minuten wird er abgebrochen.
+
+**Vertrauen:** Ein Ordner führt beim Öffnen nichts aus. Die GUI fragt einmal je Arbeitsordner und Befehl („Diesem Ordner vertrauen?“) und merkt sich die Zustimmung außerhalb des Ordners in `$XDG_CONFIG_HOME/pixel-editor/trusted.json` (sonst `~/.config/…`; mit `PIXEL_EDITOR_TRUST_FILE` eine andere Datei): je Arbeitsordner der SHA-256 der Befehlsliste. Ändert sich der Befehl, fragt sie erneut; `label` allein zählt nicht. „Nicht ausführen“ gilt bis zum Schließen des Fensters. Der MCP-Server fragt nicht: Er führt den Befehl nur aus, wenn der Ordner schon vertraut ist, und meldet sonst einmal in der Antwort, dass der Hook nicht vertraut ist.
+
+**Rückmeldung:** Die GUI-Statusleiste zeigt „Export läuft …“, „Export ok (0,4 s)“ oder „Export Fehler“; ein Klick öffnet die letzte Ausgabe (stdout, dann stderr). Im MCP-Ergebnis eines Schreibvorgangs steht `on_save started`, das Werkzeug `hook_status(path?)` nennt das letzte Ergebnis mit Exit-Code, Dauer und Ausgabe. GUI und MCP-Server führen den Befehl jeweils für ihre eigenen Speichervorgänge aus.
+
 ## Verlauf (`.pxe-history/`)
 
 Neben jedem Dokument legen MCP-Server und Editor `.pxe-history/<dateiname>/` an: `journal.json` (Einträge mit Zeit, Autor: Name des MCP-Clients wie `Claude`/`Codex` (ältere Journale `claude`), `user` für GUI-Speicherungen, Beschreibung, Art `edit`/`progress`/`focus` und Ort der Änderung `focus: {frame, layer, bbox, region}`, damit der Editor folgen kann; `gui.pid` vom laufenden Editor, `gui.log` mit seiner Fehlerausgabe, wenn er über `open`/`open_editor` gestartet wurde), `views/<pid>.json` (was jeder laufende Editor gerade zeigt, für `get_user_view`), `marks.json` (die „KI zeigen“-Markierungen des Dokuments: `{"next": 3, "marks": [{"n": 1, "frame": {index, name, address}, "layer": {index, name}, "rect": {x, y, w, h} oder null für den ganzen Frame, "note": "…", "time_ms", "pid", "dirty"}]}`; ohne Markierungen fehlt die Datei; eine ältere `pointer.json` mit einem einzelnen Zeiger wird beim Lesen als #1 übernommen und dann ersetzt) und `states/` (Zustand nach jedem Eintrag, höchstens 300) sowie `snapshots/` mit benannten Schnappschüssen. Der Ordner kann gelöscht werden; dann beginnt der Verlauf neu. Für Git: in `.gitignore` aufnehmen.
