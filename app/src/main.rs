@@ -79,7 +79,7 @@ fn cli_preview(args: &[String]) -> Result<(), String> {
         None => (0..doc.frames.len()).collect(),
     };
     let zoom = flag(args, "--zoom").and_then(|z| z.parse().ok()).unwrap_or(render::PreviewOptions::auto_zoom(&doc));
-    let opts = render::PreviewOptions { zoom, grid: true, layer: None, regions: true };
+    let opts = render::PreviewOptions { zoom, grid: true, layer: None, regions: true, tiled: false };
     render::preview(&doc, &frames, &opts).save_png(Path::new(out))?;
     println!("{out}");
     Ok(())

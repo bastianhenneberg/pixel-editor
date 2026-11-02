@@ -11,6 +11,7 @@ use eframe::egui::{self, Color32, Pos2, Rect, TextureHandle, TextureOptions, Vec
 use pixel_core::render;
 
 use super::settings::{PreviewBg, PreviewSettings};
+use super::tiled::TileMode;
 use super::EditorApp;
 
 #[derive(Default)]
@@ -90,8 +91,8 @@ impl EditorApp {
             let img = render::composite(&self.doc, frame);
             let img = egui::ColorImage::from_rgba_unmultiplied([img.width as usize, img.height as usize], &img.pixels);
             match &mut self.preview.tex {
-                Some(t) => t.set(img, TextureOptions::NEAREST),
-                None => self.preview.tex = Some(ctx.load_texture("preview", img, TextureOptions::NEAREST)),
+                Some(t) => t.set(img, TextureOptions::NEAREST_REPEAT),
+                None => self.preview.tex = Some(ctx.load_texture("preview", img, TextureOptions::NEAREST_REPEAT)),
             }
             self.preview.built = Some((self.rev, frame));
         }
@@ -116,7 +117,14 @@ impl EditorApp {
             window = window.constrain_to(area);
         }
         let ppp = ctx.pixels_per_point();
-        let (w, h) = (self.doc.width as f32, self.doc.height as f32);
+        // gekachelt: the copies of the Kachel-Modus, 3x3 while it is off
+        let (nx, ny) = match self.tile_mode {
+            _ if !s.tiled => (1, 1),
+            TileMode::Off => (3, 3),
+            m => m.repeats(),
+        };
+        let (nx, ny) = (nx as f32, ny as f32);
+        let (w, h) = (self.doc.width as f32 * nx, self.doc.height as f32 * ny);
         let label = {
             let d = &self.doc;
             let mut l = d.frame_label(frame);
@@ -134,6 +142,7 @@ impl EditorApp {
                 for z in 1..=3 {
                     ui.selectable_value(&mut st.scale, z, format!("{z}×"));
                 }
+                ui.toggle_value(&mut st.tiled, "Kacheln").on_hover_text("das Bild wiederholt zeigen, wie gekachelt");
                 let play = if self.preview.playing { "Anhalten" } else { "Tag abspielen" };
                 if ui.button(play).on_hover_text("aktuellen Tag in Echtzeit abspielen (Schleife)").clicked() {
                     toggle_play = true;
@@ -165,7 +174,7 @@ impl EditorApp {
                     painter.rect_filled(r, 0.0, Color32::from_rgb(cr, cg, cb));
                 }
             }
-            painter.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0)), Color32::WHITE);
+            painter.image(tex.id(), r, Rect::from_min_max(Pos2::ZERO, Pos2::new(nx, ny)), Color32::WHITE);
             image_rect = r;
             ui.label(egui::RichText::new(label).small().weak());
         });

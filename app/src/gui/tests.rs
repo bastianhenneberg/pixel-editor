@@ -2448,3 +2448,151 @@ fn mirrored_duplicate_opens_in_a_new_tab() {
     assert!(h.state().status.contains("gibt es schon"), "{}", h.state().status);
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+#[test]
+fn tiled_mode_draws_in_all_copies() {
+    use super::tiled::TileMode;
+    let _gpu = gpu_lock();
+    let dir = scratch_dir("tiled").join("tiles");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("ground.pxe.json");
+    let doc = Document::new(32, 32, Document::builtin_palette("sweetie16").unwrap()).unwrap();
+    io::save(&doc, &path).unwrap();
+    let mut h = harness(EditorApp::new(Some(path.clone())));
+    h.run_steps(3);
+    assert_eq!(h.state().tile_mode, TileMode::Both, "a document in a tiles folder starts tiled");
+    let (screen, area) = (h.state().canvas.screen, h.state().canvas.area);
+    assert!(screen.width() * 3.0 <= area.width() && screen.height() * 3.0 <= area.height(), "all copies fit");
+    let get = |h: &Harness<'_, EditorApp>, x: i32, y: i32| h.state().doc.get(0, 0, x, y);
+    h.state_mut().color = b'2';
+    // a pencil stroke over the right edge comes back in on the left
+    drag_px(&mut h, (29, 5), (35, 5));
+    for x in (29..32).chain(0..=3) {
+        assert_eq!(get(&h, x, 5), b'2', "x {x}");
+    }
+    assert_eq!(get(&h, 4, 5), TRANSPARENT);
+    // a click on the top-left copy paints the real pixel
+    click_px(&mut h, -2, -2);
+    assert_eq!(get(&h, 30, 30), b'2');
+    // hovering a copy shows the real pixel
+    h.hover_at(px_center(&h, -1, 33));
+    h.step();
+    assert_eq!(h.state().canvas.hover, Some((31, 1)));
+    // rectangle across the bottom edge
+    h.key_press(egui::Key::U);
+    h.step();
+    drag_px(&mut h, (10, 30), (12, 33));
+    assert_eq!((get(&h, 10, 30), get(&h, 12, 31), get(&h, 10, 1), get(&h, 11, 1)), (b'2', b'2', b'2', b'2'));
+    assert_eq!(get(&h, 11, 0), TRANSPARENT, "outline only");
+    // a wall at x = 16; the fill from the left half runs around the edge into the right half
+    h.state_mut().doc.set_points(0, 0, &pixel_core::draw::line(16, 0, 16, 31), b'9');
+    h.key_press(egui::Key::G);
+    h.step();
+    h.state_mut().color = b'5';
+    click_px(&mut h, 2, 20);
+    assert_eq!((get(&h, 2, 20), get(&h, 20, 20), get(&h, 16, 20)), (b'5', b'5', b'9'));
+    // symmetry works together with the wrap
+    h.key_press(egui::Key::B);
+    h.step();
+    h.state_mut().symmetry =
+        super::transform::Symmetry { mode: super::transform::SymMode::Vertical, x2: None, y2: None };
+    h.state_mut().color = b'c';
+    click_px(&mut h, -1, 12);
+    assert_eq!((get(&h, 31, 12), get(&h, 0, 12)), (b'c', b'c'));
+    h.state_mut().symmetry.mode = super::transform::SymMode::Off;
+    // a rectangle selection over the right edge selects both sides
+    h.key_press(egui::Key::M);
+    h.step();
+    drag_px(&mut h, (30, 2), (33, 3));
+    let sel = h.state().selection.clone().expect("selection");
+    assert!(sel.contains(31, 2) && sel.contains(0, 3) && sel.contains(1, 2) && !sel.contains(2, 2));
+    assert_eq!(sel.count(), 8);
+    // Alt+T cycles the mode, remembered for this document
+    h.key_press_modifiers(Modifiers::ALT, egui::Key::T);
+    h.step();
+    assert_eq!(h.state().tile_mode, TileMode::Horizontal);
+    let key = super::tiled::memory_key(&path);
+    assert_eq!(h.state().tile_memory.get(&key), Some(&TileMode::Horizontal));
+    assert_eq!(h.state().settings().tile_modes.get(&key), Some(&TileMode::Horizontal));
+    // only side by side now: the copy above is not drawn in
+    h.state_mut().selection = None;
+    h.key_press(egui::Key::B);
+    h.step();
+    click_px(&mut h, 8, -3);
+    assert_eq!(get(&h, 8, 29), b'5', "unchanged (filled before)");
+    // the preview shows the copies too
+    h.state_mut().preview.settings.tiled = true;
+    h.state_mut().preview.settings.scale = 2;
+    h.run_steps(3);
+    let r = h.state().preview.image_rect.expect("preview shown");
+    assert_eq!((r.width(), r.height()), (3.0 * 64.0, 64.0));
+    // reopening restores the remembered mode
+    h.state_mut().tile_mode = TileMode::Off;
+    let p = path.clone();
+    h.state_mut().open(&p);
+    assert_eq!(h.state().tile_mode, TileMode::Horizontal);
+    std::fs::remove_dir_all(dir.parent().unwrap()).unwrap();
+}
+
+#[test]
+fn new_tile_document_starts_tiled() {
+    use super::tiled::TileMode;
+    let _gpu = gpu_lock();
+    let mut h = harness(EditorApp::new(None));
+    h.run_steps(3);
+    h.state_mut().new_document();
+    h.run_steps(2);
+    assert!(!h.state().new_dialog.as_ref().unwrap().tiled, "not in a tile folder");
+    h.get_by_label("Tile 32×32").click();
+    h.run_steps(2);
+    h.get_by_label("Erstellen").click();
+    h.run_steps(3);
+    assert_eq!((h.state().doc.width, h.state().tile_mode), (32, TileMode::Both));
+    menu(&mut h, "Ansicht");
+    h.get_by_label("Kachel-Modus: Beide").hover();
+    h.run_steps(3);
+    h.get_by_label("Aus – nur das Bild").click();
+    h.run_steps(2);
+    assert_eq!(h.state().tile_mode, TileMode::Off);
+}
+
+#[test]
+fn tiled_screenshot_of_the_tileset() {
+    let _gpu = gpu_lock();
+    let src = std::path::Path::new(env!("HOME")).join("Development/pixelart-studio/art/tiles32.pxe.json");
+    let dir = scratch_dir("tileset");
+    let path = dir.join("tiles32.pxe.json");
+    let doc = match io::load(&src) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("tiles32 not found ({e}), screenshot with a plain tile");
+            let mut d = Document::new(32, 32, Document::builtin_palette("sweetie16").unwrap()).unwrap();
+            d.set_points(0, 0, &pixel_core::draw::rect(0, 0, 31, 31, true), b'5');
+            d.frames[0].name = "path".into();
+            d
+        }
+    };
+    io::save(&doc, &path).unwrap(); // a copy: the original stays untouched
+    let mut h = harness(EditorApp::new(Some(path.clone())));
+    h.run_steps(3);
+    let f = h.state().doc.find_frame("path").unwrap();
+    h.state_mut().goto_frame(f);
+    h.state_mut().layer = 0;
+    let red = h.state().doc.palette.iter().find(|p| p.name == "berry").map_or(b'2', |p| p.key);
+    h.state_mut().color = red;
+    // the tiled preview small in the corner, out of the canvas copies' way
+    let st = &mut h.state_mut().preview.settings;
+    (st.tiled, st.scale, st.pos) = (true, 1, Some([850.0, 330.0]));
+    h.run_steps(2);
+    // one stroke from the middle out over the right edge, back in on the left
+    drag_px(&mut h, (20, 10), (42, 20));
+    for (x, y) in pixel_core::draw::line(20, 10, 42, 20) {
+        assert_eq!(h.state().doc.get(0, f, x % 32, y), red, "({x}, {y})");
+    }
+    h.hover_at(px_center(&h, 40, 19));
+    h.run_steps(3);
+    let shot = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/tiled-screenshot.png");
+    h.render().unwrap().save(&shot).unwrap();
+    eprintln!("saved {}", shot.display());
+    std::fs::remove_dir_all(&dir).unwrap();
+}

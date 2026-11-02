@@ -81,6 +81,20 @@ pub fn ellipse(cx: i32, cy: i32, rx: i32, ry: i32, filled: bool) -> Vec<(i32, i3
 
 /// Pixels of the 4-connected region of equal keys around (x, y) in one cel.
 pub fn flood_region(doc: &Document, layer: usize, frame: usize, x: i32, y: i32) -> Vec<(i32, i32)> {
+    flood_region_wrapped(doc, layer, frame, x, y, false, false)
+}
+
+/// Like `flood_region`, but the region continues across the left/right
+/// (`wrap_x`) and top/bottom (`wrap_y`) edges, as in a seamless tile.
+pub fn flood_region_wrapped(
+    doc: &Document,
+    layer: usize,
+    frame: usize,
+    x: i32,
+    y: i32,
+    wrap_x: bool,
+    wrap_y: bool,
+) -> Vec<(i32, i32)> {
     if !doc.in_bounds(x, y) {
         return Vec::new();
     }
@@ -94,6 +108,8 @@ pub fn flood_region(doc: &Document, layer: usize, frame: usize, x: i32, y: i32) 
     while let Some((px, py)) = stack.pop() {
         out.push((px, py));
         for (nx, ny) in [(px - 1, py), (px + 1, py), (px, py - 1), (px, py + 1)] {
+            let nx = if wrap_x { nx.rem_euclid(w) } else { nx };
+            let ny = if wrap_y { ny.rem_euclid(h) } else { ny };
             if nx >= 0 && ny >= 0 && nx < w && ny < h {
                 let i = (ny * w + nx) as usize;
                 if !seen[i] && cel[i] == target {
@@ -154,5 +170,17 @@ mod tests {
         assert_eq!(fill(&mut d, 0, 0, 2, 2, b'1'), 1);
         assert_eq!(fill(&mut d, 0, 0, 0, 0, b'1'), 16);
         assert_eq!(d.get(0, 0, 1, 1), b'0');
+    }
+
+    #[test]
+    fn wrapped_fill_crosses_the_edges() {
+        let mut d = Document::new(6, 4, Document::builtin_palette("mono").unwrap()).unwrap();
+        // a wall in column 2..3 splits the cel; wrapped, column 0 and 5 touch
+        d.set_points(0, 0, &rect(2, 0, 3, 3, true), b'0');
+        assert_eq!(flood_region(&d, 0, 0, 0, 0).len(), 8);
+        assert_eq!(flood_region_wrapped(&d, 0, 0, 0, 0, true, false).len(), 16);
+        assert_eq!(flood_region_wrapped(&d, 0, 0, 0, 0, false, true).len(), 8);
+        let pts = flood_region_wrapped(&d, 0, 0, 5, 3, true, true);
+        assert!(pts.contains(&(0, 0)) && pts.contains(&(4, 1)) && !pts.contains(&(2, 1)));
     }
 }

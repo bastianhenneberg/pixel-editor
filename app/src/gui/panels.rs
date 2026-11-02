@@ -34,6 +34,7 @@ impl EditorApp {
             ui.checkbox(&mut self.filled, "gefüllt");
         }
         self.symmetry_panel(ui);
+        self.tile_panel(ui);
         if self.tool == Tool::Point {
             ui.label(
                 RichText::new(

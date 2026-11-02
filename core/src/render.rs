@@ -163,6 +163,8 @@ const GRID8: [u8; 4] = [255, 255, 255, 90];
 const TEXT: [u8; 4] = [230, 230, 240, 255];
 const DIM: [u8; 4] = [140, 140, 160, 255];
 const TEXT_SCALE: u32 = 2;
+/// Seam ticks of a tiled preview.
+const SEAM: [u8; 4] = [255, 120, 200, 255];
 
 #[derive(Clone, Debug)]
 pub struct PreviewOptions {
@@ -173,6 +175,10 @@ pub struct PreviewOptions {
     pub layer: Option<usize>,
     /// Draw named regions as labelled outlines.
     pub regions: bool,
+    /// Show each frame repeated 3x3, as a seamless tile would appear; the
+    /// rulers count inside the tile, ticks mark the seams, regions are
+    /// drawn on the middle copy.
+    pub tiled: bool,
 }
 
 /// A marker on the art pixel whose top-left screen position is (x0, y0) at
@@ -217,6 +223,22 @@ impl PreviewOptions {
     pub fn auto_zoom(doc: &Document) -> u32 {
         (512 / doc.width.max(doc.height)).clamp(1, 32)
     }
+
+    /// Zoom for a tiled (3x3) preview: about 768 px on the longer side.
+    pub fn auto_zoom_tiled(doc: &Document) -> u32 {
+        (768 / (3 * doc.width.max(doc.height))).clamp(1, 32)
+    }
+}
+
+/// `img` repeated `nx` times side by side and `ny` times on top of each other.
+pub fn tiled(img: &Image, nx: u32, ny: u32) -> Image {
+    let mut out = Image::new(img.width * nx, img.height * ny);
+    for ty in 0..ny {
+        for tx in 0..nx {
+            out.paste(img, tx * img.width, ty * img.height);
+        }
+    }
+    out
 }
 
 /// Inspection preview, modelled on pixelart-studio's preview: per frame a
@@ -229,7 +251,10 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
     use crate::font::{draw_text, fit_text, text_height, text_width};
     let zoom = opts.zoom.clamp(1, 64);
     let ts = TEXT_SCALE;
-    let (tw, th) = (doc.width * zoom, doc.height * zoom);
+    // displayed size in art pixels: the frame, or 3x3 copies of it
+    let rep = if opts.tiled { 3 } else { 1 };
+    let (dw, dh) = (doc.width * rep, doc.height * rep);
+    let (tw, th) = (dw * zoom, dh * zoom);
     let pad = 12;
     // label lines: name, info, and a region legend if there are regions
     let label_lines = if opts.regions && !doc.regions.is_empty() { 3 } else { 2 };
@@ -240,7 +265,7 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
     // label every `step` pixels, so numbers never overlap
     let num_w = text_width(&"0".repeat(digits as usize), ts) + 4;
     let step = [1u32, 2, 4, 8, 16, 32, 64].into_iter().find(|s| s * zoom >= num_w).unwrap_or(64);
-    let thumbs_w = doc.width * 2 + 8;
+    let thumbs_w = dw * 2 + 8;
     // two label lines per frame: "index name" and "ms [tags] LINK"
     let labels: Vec<(String, String)> = frames
         .iter()
@@ -260,7 +285,7 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
     let min_cell = ruler_left + tw + 8 + thumbs_w + pad;
     let widest = labels.iter().map(|(a, b)| text_width(a, ts).max(text_width(b, ts))).max().unwrap_or(0) + pad;
     let cell_w = min_cell.max(widest.min(min_cell * 2));
-    let cell_h = label_h + ruler_top + th.max(doc.height * 3 + 6) + pad;
+    let cell_h = label_h + ruler_top + th.max(dh * 3 + 6) + pad;
     let n = frames.len().max(1) as u32;
     let cols = (1800 / cell_w).clamp(1, n);
     let rows = n.div_ceil(cols);
@@ -271,9 +296,16 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
     let height = pad + rows * cell_h + pal_h;
     let mut out = Image::filled(width, height, BG);
 
-    let render_frame = |f: usize| match opts.layer {
-        Some(l) => layer_image(doc, l, f),
-        None => composite(doc, f),
+    let render_frame = |f: usize| {
+        let img = match opts.layer {
+            Some(l) => layer_image(doc, l, f),
+            None => composite(doc, f),
+        };
+        if opts.tiled {
+            tiled(&img, rep, rep)
+        } else {
+            img
+        }
     };
     for (i, &f) in frames.iter().enumerate() {
         let ox = pad + (i as u32 % cols) * cell_w;
@@ -285,13 +317,13 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
         let gx = ox + ruler_left;
         let gy = oy + label_h + ruler_top;
         // rulers: numbers centred on their pixel column/row
-        for x in (0..doc.width).step_by(step as usize) {
-            let t = x.to_string();
+        for x in (0..dw).filter(|x| (x % doc.width).is_multiple_of(step)) {
+            let t = (x % doc.width).to_string();
             let cx = gx as i32 + (x * zoom + zoom / 2) as i32 - text_width(&t, ts) as i32 / 2;
             draw_text(&mut out, cx, (gy - ruler_top) as i32, &t, ts, if x % 8 == 0 { TEXT } else { DIM });
         }
-        for y in (0..doc.height).step_by(step as usize) {
-            let t = y.to_string();
+        for y in (0..dh).filter(|y| (y % doc.height).is_multiple_of(step)) {
+            let t = (y % doc.height).to_string();
             let cy = gy as i32 + (y * zoom + zoom / 2) as i32 - text_height(ts) as i32 / 2;
             let cx = (gx - 4 - text_width(&t, ts)) as i32;
             draw_text(&mut out, cx, cy, &t, ts, if y % 8 == 0 { TEXT } else { DIM });
@@ -304,14 +336,23 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
         }
         let img = render_frame(f);
         out.overlay(&img.scaled(zoom), gx, gy);
+        if opts.tiled {
+            // seam ticks between the rulers and the image, the art stays untouched
+            for i in 1..rep {
+                let sx = gx + i * doc.width * zoom;
+                let sy = gy + i * doc.height * zoom;
+                out.fill_rect(sx - 1, gy - 4, 3, 4, SEAM);
+                out.fill_rect(gx - 4, sy - 1, 4, 3, SEAM);
+            }
+        }
         if opts.grid && zoom >= 4 {
-            for x in 0..=doc.width {
+            for x in 0..=dw {
                 let c = if x % 8 == 0 { GRID8 } else { GRID };
                 for y in 0..th {
                     out.blend((gx + x * zoom).min(gx + tw - 1), gy + y, c);
                 }
             }
-            for y in 0..=doc.height {
+            for y in 0..=dh {
                 let c = if y % 8 == 0 { GRID8 } else { GRID };
                 for x in 0..tw {
                     out.blend(gx + x, (gy + y * zoom).min(gy + th - 1), c);
@@ -326,7 +367,9 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
                 }
                 let c = r.color.map_or(auto_color(ri), |c| [c.0[0], c.0[1], c.0[2], 255]);
                 let t = if zoom >= 6 { 2 } else { 1 };
-                let (x0, y0) = (gx as i32 + rc.x * zoom as i32, gy as i32 + rc.y * zoom as i32);
+                // tiled: on the middle copy
+                let (mx, my) = if opts.tiled { (doc.width * zoom, doc.height * zoom) } else { (0, 0) };
+                let (x0, y0) = ((gx + mx) as i32 + rc.x * zoom as i32, (gy + my) as i32 + rc.y * zoom as i32);
                 let clip = (gx as i32, gy as i32, (gx + tw) as i32, (gy + th) as i32);
                 if r.is_marker() {
                     crosshair(&mut out, x0, y0, zoom, c, clip);
@@ -367,7 +410,7 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
         // actual-size thumbnails: does it read at 1x and 2x?
         let tx = gx + tw + 8;
         out.overlay(&img, tx, gy);
-        out.overlay(&img.scaled(2), tx, gy + doc.height + 6);
+        out.overlay(&img.scaled(2), tx, gy + dh + 6);
     }
 
     if !doc.palette.is_empty() {
@@ -438,7 +481,7 @@ mod tests {
         let mut d = Document::new(4, 4, Document::builtin_palette("pico8").unwrap()).unwrap();
         d.set_rows(0, 0, 0, 0, &["8c".into(), "c8".into()]).unwrap();
         let zoom = 6;
-        let img = preview(&d, &[0], &PreviewOptions { zoom, grid: false, layer: None, regions: false });
+        let img = preview(&d, &[0], &PreviewOptions { zoom, grid: false, layer: None, regions: false, tiled: false });
         // find the zoomed frame: the first run of zoom x zoom pixels of color '8'
         let red = d.color_of(b'8').unwrap().0;
         let (mut found, w) = (None, img.width);
@@ -468,7 +511,7 @@ mod tests {
         m.color = Some(crate::Rgba([0, 255, 0, 255]));
         d.regions.push(m);
         let zoom = 8;
-        let img = preview(&d, &[0], &PreviewOptions { zoom, grid: false, layer: None, regions: true });
+        let img = preview(&d, &[0], &PreviewOptions { zoom, grid: false, layer: None, regions: true, tiled: false });
         // the marked art pixel keeps its color; green arms around it
         let red = d.color_of(b'8').unwrap().0;
         // leftmost red pixel = the zoomed frame (thumbnails are to its right)
@@ -486,6 +529,36 @@ mod tests {
         assert_eq!(img.get(x0 - 2, y0 + 4), [0, 255, 0, 255], "left arm");
         assert_eq!(img.get(x0 + 4, y0 + zoom + 1), [0, 255, 0, 255], "lower arm");
         assert_ne!(img.get(x0 - 2, y0 - 2), [0, 255, 0, 255], "no box corner");
+    }
+
+    #[test]
+    fn tiled_preview_repeats_the_frame_3x3() {
+        let mut d = Document::new(4, 3, Document::builtin_palette("pico8").unwrap()).unwrap();
+        d.set(0, 0, 3, 2, b'8');
+        let t = tiled(&composite(&d, 0), 3, 3);
+        assert_eq!((t.width, t.height), (12, 9));
+        let red = d.color_of(b'8').unwrap().0;
+        for (x, y) in [(3, 2), (7, 2), (11, 8), (3, 5)] {
+            assert_eq!(t.get(x, y), red, "({x}, {y})");
+        }
+        assert_eq!(t.get(4, 2), [0, 0, 0, 0]);
+        let zoom = 5;
+        let opts = PreviewOptions { zoom, grid: false, layer: None, regions: false, tiled: true };
+        let plain = preview(&d, &[0], &PreviewOptions { tiled: false, ..opts.clone() });
+        let img = preview(&d, &[0], &opts);
+        assert!(img.height > plain.height);
+        // the red pixel appears 9 times zoomed: count red blocks exactly zoom wide
+        let corners = (1..img.height - zoom)
+            .flat_map(|y| (1..img.width - zoom).map(move |x| (x, y)))
+            .filter(|&(x, y)| {
+                img.get(x, y) == red
+                    && img.get(x - 1, y) != red
+                    && img.get(x, y - 1) != red
+                    && img.get(x + zoom - 1, y + zoom - 1) == red
+                    && img.get(x + zoom, y) != red
+            })
+            .count();
+        assert_eq!(corners, 9);
     }
 
     #[test]

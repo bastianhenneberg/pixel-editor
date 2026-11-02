@@ -4,9 +4,12 @@ use eframe::egui::{self, Color32, PointerButton, Pos2, Rect, Sense, TextureHandl
 use pixel_core::{draw, render, TRANSPARENT};
 
 use super::select::{lasso_points, SelOp, Selection};
+use super::tiled::TileMode;
 use super::{EditorApp, Tool};
 
 const WHEEL_STEP: f32 = 40.0;
+/// Kachel-Modus: the copies around the image are drawn slightly darker.
+const COPY_TINT: Color32 = Color32::from_gray(165);
 /// Color of the "KI zeigen" mark (and its drag preview).
 pub const PIN_COLOR: Color32 = Color32::from_rgb(90, 200, 255);
 const ZOOM_LEVELS: [f32; 14] = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 8.0, 10.0, 12.0, 16.0, 20.0, 24.0, 32.0, 48.0];
@@ -38,7 +41,13 @@ enum SelectDrag {
 }
 
 pub struct CanvasState {
+    /// The image pixel under the pointer (in the Kachel-Modus also over a copy).
     pub hover: Option<(i32, i32)>,
+    /// The canvas pixel under the pointer before wrapping (where the hover box goes).
+    hover_raw: Option<(i32, i32)>,
+    /// Selection tools in the Kachel-Modus: the copy the gesture started in
+    /// (pointer position minus wrapped position), so moving stays smooth.
+    sel_shift: (i32, i32),
     /// Screen rect of the document this frame.
     pub screen: Rect,
     /// Screen rect of the whole canvas area (the preview sits in its corner).
@@ -69,6 +78,8 @@ impl Default for CanvasState {
     fn default() -> Self {
         CanvasState {
             hover: None,
+            hover_raw: None,
+            sel_shift: (0, 0),
             screen: Rect::NOTHING,
             area: Rect::NOTHING,
             focus_request: None,
@@ -122,8 +133,7 @@ impl EditorApp {
             Tool::Ellipse => draw::ellipse_in_box(s.0, s.1, e.0, e.1, self.filled),
             _ => return None,
         };
-        let pts = self.sym_points(pts).into_iter().filter(|(x, y)| self.may_paint(*x, *y)).collect();
-        Some((pts, g.key))
+        Some((self.paint_points(pts), g.key))
     }
 
     /// Rebuild textures when the document, frame or onion setting changed.
@@ -200,8 +210,11 @@ impl EditorApp {
         // exactly zoom x zoom screen pixels, also with fractional UI scaling.
         let ppp = ui.ctx().pixels_per_point();
         let size = Vec2::new(self.doc.width as f32, self.doc.height as f32);
+        let (rep_x, rep_y) = self.tile_mode.repeats();
         if self.fit_pending && area.width() > 50.0 {
-            let fit = ((area.width() * ppp - 40.0) / size.x).min((area.height() * ppp - 40.0) / size.y).max(1.0);
+            // the Kachel-Modus fits all copies
+            let shown = size * Vec2::new(rep_x as f32, rep_y as f32);
+            let fit = ((area.width() * ppp - 40.0) / shown.x).min((area.height() * ppp - 40.0) / shown.y).max(1.0);
             self.zoom = ZOOM_LEVELS.iter().rev().find(|z| **z <= fit).copied().unwrap_or(1.0);
             self.pan = Vec2::ZERO;
             self.fit_pending = false;
@@ -277,8 +290,11 @@ impl EditorApp {
             let v = (p - canvas.min) / cell;
             (v.x.floor() as i32, v.y.floor() as i32)
         };
-        self.canvas.hover =
-            pointer.hover_pos().filter(|p| area.contains(*p)).map(to_px).filter(|(x, y)| self.doc.in_bounds(*x, *y));
+        self.canvas.hover_raw =
+            pointer.hover_pos().filter(|p| area.contains(*p)).map(to_px).filter(|p| {
+                self.doc.in_bounds(p.0, p.1) || (self.tile_mode != TileMode::Off && self.in_tiled_view(*p))
+            });
+        self.canvas.hover = self.canvas.hover_raw.map(|p| self.wrap(p));
 
         // ---- input: symmetry axis grips, then tools
         let grips = self.axis_grips(canvas, cell);
@@ -293,6 +309,20 @@ impl EditorApp {
 
         // ---- paint
         let full_uv = Rect::from_min_max(Pos2::ZERO, Pos2::new(1.0, 1.0));
+        // Kachel-Modus: the copies around the image, slightly darker
+        let copies: Vec<Rect> = (-(rep_x / 2)..=rep_x / 2)
+            .flat_map(|ix| (-(rep_y / 2)..=rep_y / 2).map(move |iy| (ix, iy)))
+            .filter(|&c| c != (0, 0))
+            .map(|(ix, iy)| canvas.translate(Vec2::new(ix as f32 * canvas.width(), iy as f32 * canvas.height())))
+            .collect();
+        let shown = copies.iter().fold(canvas, |a, r| a.union(*r));
+        if let (Some(ch), Some(t)) = (&self.canvas.checker, &self.canvas.tex) {
+            let uv = Rect::from_min_max(Pos2::ZERO, (canvas.size() / 16.0).to_pos2());
+            for r in &copies {
+                painter.image(ch.id(), *r, uv, COPY_TINT);
+                painter.image(t.id(), *r, full_uv, COPY_TINT);
+            }
+        }
         if let Some(ch) = &self.canvas.checker {
             let uv = Rect::from_min_max(Pos2::ZERO, (canvas.size() / 16.0).to_pos2());
             painter.image(ch.id(), canvas, uv, Color32::WHITE);
@@ -319,17 +349,19 @@ impl EditorApp {
         let mut mesh = egui::Mesh::default();
         let mut line = |r: Rect, c: Color32| mesh.add_colored_rect(r, c);
         if self.grid && !clean && self.zoom >= 4.0 {
+            // over the copies too: they are drawn in as well
             let thin = Color32::from_white_alpha(22);
             let thick = Color32::from_white_alpha(60);
-            for x in 0..=self.doc.width {
-                let sx = snap(canvas.min.x + x as f32 * cell).min(canvas.max.x - px);
-                let c = if x % 8 == 0 { thick } else { thin };
-                line(Rect::from_min_max(Pos2::new(sx, canvas.min.y), Pos2::new(sx + px, canvas.max.y)), c);
+            let (w, h) = (self.doc.width as i32, self.doc.height as i32);
+            for x in -(rep_x / 2) * w..=(rep_x / 2 + 1) * w {
+                let sx = snap(canvas.min.x + x as f32 * cell).min(shown.max.x - px);
+                let c = if x.rem_euclid(w) % 8 == 0 { thick } else { thin };
+                line(Rect::from_min_max(Pos2::new(sx, shown.min.y), Pos2::new(sx + px, shown.max.y)), c);
             }
-            for y in 0..=self.doc.height {
-                let sy = snap(canvas.min.y + y as f32 * cell).min(canvas.max.y - px);
-                let c = if y % 8 == 0 { thick } else { thin };
-                line(Rect::from_min_max(Pos2::new(canvas.min.x, sy), Pos2::new(canvas.max.x, sy + px)), c);
+            for y in -(rep_y / 2) * h..=(rep_y / 2 + 1) * h {
+                let sy = snap(canvas.min.y + y as f32 * cell).min(shown.max.y - px);
+                let c = if y.rem_euclid(h) % 8 == 0 { thick } else { thin };
+                line(Rect::from_min_max(Pos2::new(shown.min.x, sy), Pos2::new(shown.max.x, sy + px)), c);
             }
         }
         let mut frame_rect = |r: Rect, w: f32, c: Color32| {
@@ -338,12 +370,16 @@ impl EditorApp {
             line(Rect::from_min_max(r.min, Pos2::new(r.min.x + w, r.max.y)), c);
             line(Rect::from_min_max(Pos2::new(r.max.x - w, r.min.y), r.max), c);
         };
-        if let Some((x, y)) = self.canvas.hover.filter(|_| !clean) {
+        if let Some((x, y)) = self.canvas.hover_raw.filter(|_| !clean) {
             let r = Rect::from_min_size(canvas.min + Vec2::new(x as f32, y as f32) * cell, Vec2::splat(cell));
             frame_rect(r, px, Color32::from_white_alpha(200));
         }
-        if !clean {
+        if !clean && copies.is_empty() {
             frame_rect(canvas.expand(px), px, Color32::from_gray(90));
+        } else if !clean {
+            // Kachel-Modus: a clear frame around the real image
+            frame_rect(canvas.expand(px), px, Color32::from_black_alpha(200));
+            frame_rect(canvas.expand(2.0 * px), px, Color32::from_rgb(255, 210, 90));
         }
         let to_screen = |r: pixel_core::Rect| {
             Rect::from_min_size(
@@ -489,6 +525,8 @@ impl EditorApp {
         }
         if pressed && self.tool.selects() {
             let Some(p) = pos else { return };
+            let w = self.wrap(p);
+            self.canvas.sel_shift = (p.0 - w.0, p.1 - w.1);
             self.playing = false;
             if pointer.secondary_pressed() {
                 // the right button opens the selection menu (on release, see
@@ -507,6 +545,7 @@ impl EditorApp {
             // right button paints transparent; Alt+click picks a color
             let key = if pointer.secondary_pressed() { TRANSPARENT } else { self.color };
             if alt || self.tool == Tool::Eyedropper {
+                let p = self.wrap(p);
                 if self.doc.in_bounds(p.0, p.1) {
                     let k = match self.doc.get(layer, frame, p.0, p.1) {
                         TRANSPARENT => self.doc.top_key(frame, p.0, p.1),
@@ -526,16 +565,14 @@ impl EditorApp {
             match self.tool {
                 Tool::Fill => {
                     // with symmetry, each mirrored seed fills its own area too
-                    let seeds: Vec<(i32, i32)> = self
-                        .sym_points(vec![p])
-                        .into_iter()
-                        .filter(|&(x, y)| self.doc.in_bounds(x, y) && self.may_paint(x, y))
-                        .collect();
+                    // in the Kachel-Modus the fill runs across the edges
+                    let seeds: Vec<(i32, i32)> =
+                        self.paint_points(vec![p]).into_iter().filter(|&(x, y)| self.doc.in_bounds(x, y)).collect();
                     if !seeds.is_empty() {
                         let mut seen = std::collections::HashSet::new();
                         let pts: Vec<(i32, i32)> = seeds
                             .iter()
-                            .flat_map(|s| draw::flood_region(&self.doc, layer, frame, s.0, s.1))
+                            .flat_map(|s| self.flood(s.0, s.1))
                             .filter(|&(x, y)| self.may_paint(x, y) && seen.insert((x, y)))
                             .collect();
                         let desc =
@@ -546,8 +583,7 @@ impl EditorApp {
                 Tool::Pencil | Tool::Eraser => {
                     let key = if self.tool == Tool::Eraser { TRANSPARENT } else { key };
                     self.history.push(self.doc.clone(), "Stift");
-                    let pts: Vec<(i32, i32)> =
-                        self.sym_points(vec![p]).into_iter().filter(|(x, y)| self.may_paint(*x, *y)).collect();
+                    let pts = self.paint_points(vec![p]);
                     if self.doc.set_points(layer, frame, &pts, key) > 0 {
                         self.touch();
                     }
@@ -572,11 +608,7 @@ impl EditorApp {
                 if matches!(self.tool, Tool::Pencil | Tool::Eraser) {
                     let (from, key) = (g.last, g.key);
                     g.last = p;
-                    let pts: Vec<(i32, i32)> = self
-                        .sym_points(draw::line(from.0, from.1, p.0, p.1))
-                        .into_iter()
-                        .filter(|(x, y)| self.may_paint(*x, *y))
-                        .collect();
+                    let pts = self.paint_points(draw::line(from.0, from.1, p.0, p.1));
                     let n = self.doc.set_points(layer, frame, &pts, key);
                     if let Some(g) = &mut self.canvas.gesture {
                         g.painted += n;
@@ -613,8 +645,7 @@ impl EditorApp {
                     return;
                 }
             };
-            let pts: Vec<(i32, i32)> =
-                self.sym_points(pts).into_iter().filter(|(x, y)| self.may_paint(*x, *y)).collect();
+            let pts = self.paint_points(pts);
             let desc = format!("{} {} · {}", self.tool.label(), self.doc.key_label(g.key), self.here());
             self.edit(desc, |d| d.set_points(layer, frame, &pts, g.key));
         }
@@ -622,18 +653,20 @@ impl EditorApp {
 
     /// Selection tools, press: grab the selected pixels to move them (a
     /// plain press inside the selection) or start a selection gesture.
+    /// `p` is the canvas pixel; in the Kachel-Modus it may lie on a copy.
     fn select_press(&mut self, p: (i32, i32), op: SelOp) {
-        let inside_float = self.floating.as_ref().is_some_and(|f| f.rect.contains(p.0, p.1))
-            && self.selection.as_ref().is_some_and(|s| s.contains(p.0, p.1));
-        let inside_sel = self.selection.as_ref().is_some_and(|s| s.contains(p.0, p.1));
+        let q = self.wrap(p);
+        let inside_float = self.floating.as_ref().is_some_and(|f| f.rect.contains(q.0, q.1))
+            && self.selection.as_ref().is_some_and(|s| s.contains(q.0, q.1));
+        let inside_sel = self.selection.as_ref().is_some_and(|s| s.contains(q.0, q.1));
         let brush = self.tool == Tool::SelectBrush;
         if op == SelOp::Replace && !brush && (inside_float || inside_sel) {
             if self.tool == Tool::Wand {
-                self.canvas.select_drag = Some(SelectDrag::Wand { start: p });
+                self.canvas.select_drag = Some(SelectDrag::Wand { start: q });
                 return;
             }
             if inside_float || self.lift_selection() {
-                self.start_move(p);
+                self.start_move(q);
                 return;
             }
         }
@@ -646,7 +679,7 @@ impl EditorApp {
                 self.brush_select(&[p], op);
                 self.canvas.select_drag = Some(SelectDrag::Brush { last: p, op });
             }
-            Tool::Wand => self.wand_select(p, op),
+            Tool::Wand => self.wand_select(q, op),
             Tool::Lasso => {
                 self.canvas.select_drag = Some(SelectDrag::Lasso { path: vec![p], op, base });
             }
@@ -666,7 +699,7 @@ impl EditorApp {
     }
 
     fn brush_select(&mut self, pts: &[(i32, i32)], op: SelOp) {
-        if let Some(new) = Selection::from_points(pts.iter().copied()) {
+        if let Some(new) = Selection::from_points(self.wrap_points(pts.iter().copied())) {
             let base = self.selection.clone();
             self.combine_selection(base.as_ref(), &new, op);
         }
@@ -681,23 +714,37 @@ impl EditorApp {
         }
     }
 
+    /// The rectangle selection between two canvas pixels; in the Kachel-Modus
+    /// the part over a copy wraps into the image.
+    fn rect_selection(&self, a: (i32, i32), b: (i32, i32)) -> Option<Selection> {
+        if self.tile_mode == TileMode::Off {
+            return Some(Selection::rect(drag_rect(a, b)));
+        }
+        Selection::from_points(self.wrap_points(draw::rect(a.0, a.1, b.0, b.1, true)))
+    }
+
     fn select_drag(&mut self, pos: Option<(i32, i32)>, down: bool) {
         let Some(mut drag) = self.canvas.select_drag.take() else { return };
         let (w, h) = (self.doc.width, self.doc.height);
         let mut moving = None;
+        // moving: relative to the copy the gesture started in
+        let shift = self.canvas.sel_shift;
         if let Some(p) = pos {
+            let local = (p.0 - shift.0, p.1 - shift.1);
             match &mut drag {
-                SelectDrag::Move { grab } => self.move_floating_to(p.0 - grab.0, p.1 - grab.1),
+                SelectDrag::Move { grab } => self.move_floating_to(local.0 - grab.0, local.1 - grab.1),
                 SelectDrag::New { start, last, op, base } => {
                     *last = p;
-                    self.selection =
-                        Selection::combine(base.as_ref(), &Selection::rect(drag_rect(*start, p)), *op, w, h);
+                    self.selection = match self.rect_selection(*start, p) {
+                        Some(shape) => Selection::combine(base.as_ref(), &shape, *op, w, h),
+                        None => base.clone(),
+                    };
                 }
                 SelectDrag::Lasso { path, op, base } => {
                     if path.last() != Some(&p) {
                         path.push(p);
                     }
-                    let shape = Selection::from_points(lasso_points(path));
+                    let shape = Selection::from_points(self.wrap_points(lasso_points(path)));
                     self.selection = match shape {
                         Some(shape) => Selection::combine(base.as_ref(), &shape, *op, w, h),
                         None => base.clone(),
@@ -723,10 +770,10 @@ impl EditorApp {
                 }
                 SelectDrag::Wand { start } => {
                     // dragged away from the press: move the selection instead
-                    if p != *start && self.lift_selection() {
+                    if local != *start && self.lift_selection() {
                         let r = self.floating.as_ref().unwrap().rect;
                         let grab = (start.0 - r.x, start.1 - r.y);
-                        self.move_floating_to(p.0 - grab.0, p.1 - grab.1);
+                        self.move_floating_to(local.0 - grab.0, local.1 - grab.1);
                         moving = Some(SelectDrag::Move { grab });
                     }
                 }

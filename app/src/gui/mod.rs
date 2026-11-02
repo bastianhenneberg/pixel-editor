@@ -11,6 +11,7 @@ mod share;
 mod tabs;
 #[cfg(test)]
 mod tests;
+mod tiled;
 mod timeline;
 mod toolbar;
 mod transform;
@@ -123,6 +124,8 @@ struct NewDialog {
     width: u32,
     height: u32,
     palette: String,
+    /// Start in the Kachel-Modus (the tile templates switch it on).
+    tiled: bool,
 }
 
 /// Debug/verification hook: `PIXEL_EDITOR_SCREENSHOT=out.png` makes the app
@@ -211,6 +214,10 @@ pub struct EditorApp {
     wand_all: bool,
     /// Symmetric drawing (per document).
     symmetry: transform::Symmetry,
+    /// Kachel-Modus (per document, remembered in `tile_memory`).
+    tile_mode: tiled::TileMode,
+    /// Kachel-Modus per document path, kept in the settings.
+    tile_memory: std::collections::BTreeMap<String, tiled::TileMode>,
     /// "Animation gespiegelt duplizieren": the destination path being typed.
     mirror_dialog: Option<String>,
     /// The last used tool of each toolbar group.
@@ -274,6 +281,7 @@ impl EditorApp {
                 app.open(&p);
             } else {
                 // start a new document that will be saved under this name
+                app.tile_mode = app.initial_tile_mode(&p);
                 app.path = Some(p.clone());
                 app.status = format!("Neue Datei {}", p.display());
             }
@@ -316,6 +324,8 @@ impl EditorApp {
             drop_behind: false,
             wand_all: false,
             symmetry: Default::default(),
+            tile_mode: Default::default(),
+            tile_memory: Default::default(),
             mirror_dialog: None,
             group_tool: toolbar::GROUPS.map(|(_, tools)| tools[0]),
             flyout: None,
@@ -366,7 +376,7 @@ impl EditorApp {
                 open_tabs.insert(key, paths);
             }
         }
-        settings::Settings { preview: self.preview.settings.clone(), open_tabs }
+        settings::Settings { preview: self.preview.settings.clone(), open_tabs, tile_modes: self.tile_memory.clone() }
     }
 
     /// Load settings from `path` and save changes there from now on.
@@ -379,6 +389,7 @@ impl EditorApp {
     fn apply_settings(&mut self, s: &settings::Settings) {
         self.preview.settings = s.preview.clone();
         self.preview.settings.scale = s.preview.scale.clamp(1, 3);
+        self.tile_memory = s.tile_modes.clone();
         self.saved_settings = s.clone();
     }
 
@@ -389,8 +400,15 @@ impl EditorApp {
             return;
         }
         if let Some(p) = &self.settings_path {
-            // keep the tab lists other windows saved meanwhile
-            let mut on_disk = settings::Settings::load(p).open_tabs;
+            // keep the tab lists and tile modes other windows saved meanwhile
+            let disk = settings::Settings::load(p);
+            for (k, m) in disk.tile_modes {
+                if !self.saved_settings.tile_modes.contains_key(&k) {
+                    self.tile_memory.entry(k.clone()).or_insert(m);
+                    current.tile_modes.entry(k).or_insert(m);
+                }
+            }
+            let mut on_disk = disk.open_tabs;
             for k in self.saved_settings.open_tabs.keys().chain(current.open_tabs.keys()) {
                 on_disk.remove(k);
             }
@@ -511,6 +529,7 @@ impl EditorApp {
                 self.external_conflict = false;
                 self.disk_mtime = mtime(path);
                 self.marks = crate::view::read_marks(path);
+                self.tile_mode = self.initial_tile_mode(path);
                 self.marks_mtime = mtime(&crate::view::marks_file(path));
                 self.mark_sel = None;
                 self.follow_reset(path);
@@ -575,6 +594,10 @@ impl EditorApp {
                 self.follow.journal_mtime = mtime(&journal.file());
                 self.saved_doc = Some(self.doc.clone());
                 self.unsaved_steps.clear();
+                // remember the mode unless the name brings it anyway
+                if self.tile_mode != self.initial_tile_mode(&path) {
+                    self.tile_memory.insert(tiled::memory_key(&path), self.tile_mode);
+                }
                 self.path = Some(path.clone());
                 self.dirty = false;
                 self.external_conflict = false;
@@ -639,7 +662,10 @@ impl EditorApp {
     }
 
     fn new_document(&mut self) {
-        self.new_dialog = Some(NewDialog { width: 64, height: 64, palette: "sweetie16".into() });
+        // in a tile folder (or next to a tile document) the tile template comes first
+        let tiles = self.path.as_deref().or(self.workdir.as_deref()).is_some_and(tiled::suggests_tiles);
+        let (size, tiled) = if tiles { (32, true) } else { (64, false) };
+        self.new_dialog = Some(NewDialog { width: size, height: size, palette: "sweetie16".into(), tiled });
     }
 
     fn perform(&mut self, action: Pending) {
@@ -856,6 +882,7 @@ impl EditorApp {
             }
         }
         self.transform_shortcuts(ctx);
+        self.tile_shortcuts(ctx);
         if alt(Key::N) {
             self.new_frame(true, false);
         }
@@ -941,13 +968,13 @@ impl EditorApp {
                 ui.heading("Neues Dokument");
                 ui.horizontal(|ui| {
                     if ui.button("Figur 48×48").clicked() {
-                        (dlg.width, dlg.height) = (48, 48);
+                        (dlg.width, dlg.height, dlg.tiled) = (48, 48, false);
                     }
                     if ui.button("Tile 32×32").clicked() {
-                        (dlg.width, dlg.height) = (32, 32);
+                        (dlg.width, dlg.height, dlg.tiled) = (32, 32, true);
                     }
                     if ui.button("Tile 16×16").clicked() {
-                        (dlg.width, dlg.height) = (16, 16);
+                        (dlg.width, dlg.height, dlg.tiled) = (16, 16, true);
                     }
                 });
                 ui.horizontal(|ui| {
@@ -963,14 +990,14 @@ impl EditorApp {
                 });
                 ui.horizontal(|ui| {
                     if ui.button("Erstellen").clicked() {
-                        create = Some((dlg.width, dlg.height, dlg.palette.clone()));
+                        create = Some((dlg.width, dlg.height, dlg.palette.clone(), dlg.tiled));
                     }
                     if ui.button("Abbrechen").clicked() {
                         cancel = true;
                     }
                 });
             });
-            if let Some((w, h, pal)) = create {
+            if let Some((w, h, pal, tiled)) = create {
                 let doc = Document::new(w, h, Document::builtin_palette(&pal).unwrap()).unwrap();
                 if self.path.is_some() || self.dirty || self.rev > 0 {
                     self.new_tab(); // keep the current document in its tab
@@ -985,6 +1012,7 @@ impl EditorApp {
                 self.play_tag = None;
                 self.playing = false;
                 self.fit_pending = true;
+                self.tile_mode = if tiled { tiled::TileMode::Both } else { tiled::TileMode::Off };
                 self.status = format!("Neues Dokument {w}×{h}");
                 self.new_dialog = None;
             } else if cancel {
@@ -1126,6 +1154,7 @@ impl EditorApp {
                 ui.checkbox(&mut self.show_regions, "Regionen anzeigen");
                 ui.checkbox(&mut self.clean_view, "Saubere Ansicht: alle Einblendungen aus  (H)");
                 ui.checkbox(&mut self.preview.settings.open, "Vorschau  (P)");
+                self.tile_menu(ui);
                 ui.checkbox(&mut self.follow.enabled, "KI folgen (bei externen Änderungen mitspringen)");
                 self.mark_menu_entries(ui);
                 if ui.button("Einpassen  (0)").clicked() {

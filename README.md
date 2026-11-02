@@ -137,6 +137,16 @@ Ein nicht quadratischer Bereich, um 90° gedreht, belegt das gedrehte Rechteck a
 
 **Symmetrisch zeichnen** (Werkzeugfeld bei Stift, Radierer, Füllen, Linie, Rechteck, Ellipse; Menü Bild; **Alt+S** schaltet Aus → Vertikal → Horizontal → Beide): jeder Strich, jede Form und jede Füllung wird an der vertikalen Achse (links/rechts), der horizontalen (oben/unten) oder an beiden gespiegelt, auch in der Vorschau beim Ziehen. Die Achsen liegen zuerst in der Leinwandmitte und erscheinen als gestrichelte Linien. Verschieben: am dreieckigen Griff über (vertikale Achse) bzw. links neben der Leinwand (horizontale Achse) ziehen, oder die Zahl im Werkzeugfeld eingeben (in halben Pixeln: `12` liegt auf einer Pixelkante, `12.5` geht durch die Pixelmitte). „Mitte“ setzt sie zurück. Die Einstellung gilt je Tab.
 
+## Kachel-Modus (Tiles nahtlos zeichnen)
+
+Wie der „Tiled Mode“ von Aseprite: Die Leinwand zeigt das Bild wiederholt, damit man beim Zeichnen sieht, ob ein Tile nahtlos kachelt.
+
+- **Einschalten**: Menü **Ansicht → Kachel-Modus** (Aus / Horizontal / Vertikal / Beide), Zeile „Kacheln“ im Werkzeugfeld oder **Alt+T** (Aus → Beide → Horizontal → Vertikal → Aus). Horizontal legt Kopien links und rechts daneben, Vertikal darüber und darunter, Beide zeigt 3×3. Die Kopien sind leicht abgedunkelt, das echte Bild in der Mitte hat einen gelben Rahmen; „Einpassen“ (0) passt alle Kopien ein. Das Pixelraster läuft über die Kopien weiter.
+- **In allen Kopien zeichnen**: Stift, Radierer, Linie, Rechteck, Ellipse, Füllen und die Auswahl-Werkzeuge (Rechteck, Pinsel, Zauberstab, Lasso) wirken überall in den Kopien und schreiben ins echte Bild (Wrap per Modulo). Ein Strich, der rechts hinausläuft, kommt links wieder herein, auch schon in der Vorschau beim Ziehen. Füllen und Zauberstab laufen über den Rand hinweg weiter. Die Symmetrie spielt mit: gespiegelte Punkte, die über den Rand fallen, wrappen ebenfalls. Pipette und Statuszeile nennen über einer Kopie das echte Pixel.
+- **Vorschau** (P): Knopf „Kacheln“ (auch im Untermenü Ansicht → Kachel-Modus: „Vorschau auch gekachelt“) zeigt das Bild so oft wie der Kachel-Modus, bei ausgeschaltetem Modus 3×3.
+- **Je Dokument gemerkt** (in `~/.config/pixel-editor/settings.json`, `tile_modes`). Dokumente, in deren Namen oder Ordner „tile“ vorkommt (`tiles32.pxe.json`, `tiles/gras.pxe.json`), starten im Modus „Beide“, solange nichts anderes gemerkt ist. **Neu** schaltet ihn mit den Vorlagen „Tile 32×32“/„Tile 16×16“ ein (Schalter „Kachel-Modus“ im Dialog); in einem Tile-Ordner ist die Vorlage Tile 32×32 vorausgewählt.
+- **Für Claude**: `render_preview` mit `tiled: true` zeigt jeden Frame 3×3 (Lineale zählen innerhalb des Tiles, rosa Striche markieren die Nahtstellen, ohne Raster), `check_seams` vergleicht die rechte Spalte mit der linken und die unterste Zeile mit der obersten und meldet harte Kanten (siehe Werkzeuge).
+
 ## Bedienung
 
 Aufbau wie in Aseprite: links Werkzeuge und Palette, in der Mitte die Leinwand, rechts die Eigenschaften (Ebene, Frame/Cel, Tag), unten die **Zeitleiste**:
@@ -158,6 +168,7 @@ Tastenkürzel (soweit sinnvoll wie in Aseprite):
 | Umschalt / Alt oder Strg beim Auswählen | bei Rechteck, Zauberstab und Lasso: zur Auswahl hinzufügen / von ihr abziehen; ohne Taste ersetzt die Geste die Auswahl |
 | Alt+H / Alt+V / Alt+R / Alt+L / Alt+Umschalt+R | Auswahl (sonst Cel) horizontal / vertikal spiegeln, 90° rechts / 90° links / 180° drehen (Menü Bild, siehe oben) |
 | Alt+S | Symmetrisch zeichnen: Aus → Vertikal → Horizontal → Beide |
+| Alt+T | Kachel-Modus: Aus → Beide → Horizontal → Vertikal (siehe oben) |
 | Umschalt+H | Ablegen „Vorne“/„Hinten“ umschalten (auch im Werkzeugfeld und im Menü Werkzeuge), siehe unten |
 | Strg+C / Strg+X / Strg+V | Auswahl kopieren / ausschneiden / einfügen (schwebend, verschiebbar, Enter legt ab) |
 | Strg+A / Strg+D / Strg+Umschalt+I / Entf | alles auswählen / Auswahl aufheben / Auswahl umkehren / Auswahl löschen (auch im Menü Auswahl und per Rechtsklick auf die Leinwand) |
@@ -181,7 +192,7 @@ Tastenkürzel (soweit sinnvoll wie in Aseprite):
 | Strg+Tab / Strg+Umschalt+Tab / Strg+W | nächster / vorheriger Tab / Tab schließen |
 | Strg+Umschalt+K | KI zeigen: Auswahl oder Frame als weitere Markierung für die KI hinzufügen (`get_user_view`) |
 
-- **Neu** bietet die Vorlagen Figur 48×48, Tile 32×32 und 16×16 sowie eine eingebaute Palette.
+- **Neu** bietet die Vorlagen Figur 48×48, Tile 32×32 und 16×16 (diese mit Kachel-Modus) sowie eine eingebaute Palette.
 - **Zeitleisten-Leiste**: Abspielen, Animation (Tag) wählen, Onion Skin, Vorschaubilder; Frame: `+ Neu` (Kopie), `+ Leer`, `+ Verknüpft` (neuer Frame mit verknüpften Cels), Löschen, `<`/`>` verschieben; Ebene: Neu, Löschen, Hoch, Runter.
 - **Eigenschaften**: Ebene (Name, sichtbar, gesperrt, Deckkraft), Frame (Name, Dauer, „für alle“, gesperrt, Status der Cel: leer, eigenständig oder verknüpft mit Frames …, „Verknüpfung lösen“, „Mit vorherigem Frame verknüpfen“), Tag (Name, Bereich, Richtung, Loop, Farbe; „Übernehmen“, „Löschen“, „Neu“; **Folge** für eine beliebige Reihenfolge wie `0 1 0 2`, angelegt als verknüpfte Frames, damit der Tag ein Bereich bleibt wie in Aseprite), Regionen (Liste mit Rechteck im aktuellen Frame, Sperre, Löschen; Klick übernimmt sie als Auswahl; neue Region aus der Auswahl, auf Wunsch nur für diesen Frame), Verlauf (Schritte mit Beschreibung, Rückgängig/Wiederholen, Schnappschüsse).
 - **Palette**: Klick wählt, Name der Farbe, Farbe ändern (Farbwähler oder Hex-Feld), „+ Farbe“, „Entfernen“ (betroffene Pixel werden transparent). Tooltips zeigen Taste, Name und Farbwert.
@@ -233,7 +244,8 @@ oder `claude mcp add pixel-editor -- /home/bastian/Development/pixel-editor/targ
 | `add_frame(copy_from?, linked?, …)`, `delete_frame`, `set_frame_duration`, `set_frame(name?, duration_ms?, locked?, move_to?)`, `link_cel` | Frames und verknüpfte Cels |
 | `set_tag(name, from/to \| frames, direction?, loop?, color?, delete?)` | Tags (Bereich + Richtung; `frames` in beliebiger Reihenfolge über verknüpfte Frames) |
 | `set_palette_color(key, color?, name?, remove?)` | Palette mit Namen |
-| `render_preview(path, frame? \| frames?, layer?, zoom?, grid?, regions?, inline?)` | Vorschau ansehen |
+| `render_preview(path, frame? \| frames?, layer?, zoom?, grid?, regions?, tiled?, inline?)` | Vorschau ansehen; `tiled: true` zeigt jeden Frame 3×3 wie gekachelt (Datei `…_tiled.png`, Raster und Regionen dann nur auf Wunsch) |
+| `check_seams(path, frame?, layer?, threshold?)` | Nahtstellen eines Tiles prüfen: rechte Spalte gegen linke, unterste Zeile gegen oberste, wie sie beim Kacheln aneinanderstoßen. Je Naht: wie viele Paare sich unterscheiden, welche harte Kanten sind (Farbabstand ≥ `threshold`, Standard 0,25; als Läufe mit beiden Tasten, z. B. `y 9..14: E cliff earth dark \| r stone`) und ob die Naht mehr Kontrast hat als das Innere des Tiles („VISIBLE SEAM“). Nur lesend |
 | `render_animation(path, tag, region?, track?, zoom?, jump_threshold?, inline?)` | Animation als Standbild prüfen (siehe unten) |
 | `history`, `undo(steps?)`, `snapshot(name, note?)`, `list_snapshots`, `diff_snapshot(name, layer?, frame?)`, `restore_snapshot(name)` | Verlauf und Schnappschüsse |
 | `focus(path, frame, layer?, region? \| rect?, note?)`, `open_editor(path)`; `pace_ms` an Schreibwerkzeugen | live zusehen (siehe „KI folgen“) |
@@ -289,6 +301,7 @@ Sheets enthalten die Frames in Reihenfolge (höchstens 16 pro Reihe, über `colu
   - Pixel-Auswahl: Zauberstab (auch „alle gleichfarbigen“), Auswahl-Pinsel (Ziehen mit rechts, Alt, Strg nehmen heraus; Rechtsklick öffnet das Menü), Rechteck und Lasso mit Umschalt/Alt/Strg, Umriss entlang der Maske, Verschieben einer geformten Auswahl (Pixel außerhalb bleiben), Ablegen vorne und hinten samt Vorschau, Pfeile und Esc, Kopieren/Einfügen/Ausschneiden/Entf mit Maske; `get_user_view` mit `·` für nicht gewählte Pixel
   - Tabs: öffnen, wechseln (Strg+Tab, Klick), schließen mit Rückfrage, eigener Zustand je Tab, Markierung bei Änderung im Hintergrund ohne Tab-Wechsel, `focus` wechselt den Tab, Öffnen aus einem anderen Prozess über den Socket (`open`/`open_editor`), Wiederherstellen; Bild der Tab-Leiste in `target/tabs-screenshot.png`
   - Zeitleiste scrubben (Ziehen über die Nummern und Cels, Pause, Klemmen am Rand, Klick wählt weiter), Mausrad über den Nummern
+  - Kachel-Modus: Stift über den Rand, Klick in eine Kopie, Rechteck über den unteren Rand, Füllen um den Rand herum, Symmetrie mit Wrap, Rechteck-Auswahl über den Rand, Alt+T, Merken je Dokument und Wiederherstellen beim Öffnen, Start im Modus bei Tile-Namen, Vorlage Tile 32×32, Menü Ansicht, gekachelte Vorschau; Bild mit einer Kopie von `tiles32` (Frame `path`, ein Strich über den rechten Rand) in `target/tiled-screenshot.png`
   - KI-Markierungen: mehrere per Ziehen und Klick, Notiz tippen und mit Enter speichern, Klick daneben schließt nur das Notizfeld, Klick hinein wählt aus und ändert die Notiz, verschieben, Größe an Kante und Ecke, Rechtsklick entfernt eine, Menü „dieses Frames“, Statuszeile „alle“, andere Frames nicht auf der Leinwand aber in der Zeitleiste, eigene Markierungen je Tab, Strg+Umschalt+K auch mit Fokus in einem Textfeld, Übernahme einer alten `pointer.json`, Neuladen nach `clear_marks`; Bild in `target/marks-screenshot.png`. Am echten Bildschirm wurde die Oberfläche bisher nicht bedient.
 
 Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen nach `target/gui-screenshot.png`. Mit sichtbarem Fenster: `PIXEL_EDITOR_SCREENSHOT=/pfad/bild.png pixel-editor datei.pxe.json` speichert nach 2 s (`PIXEL_EDITOR_SCREENSHOT_DELAY`) ein Bild des eigenen Fensters und beendet das Programm.
@@ -297,13 +310,14 @@ Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen n
 
 1. `create_document` (Figuren 48×48, Begleithund 48×36, Schleim 32×32, Tiles 32×32, Angriffe größer wie 104×56 oder 80×96 mit gesperrtem Marker `origin` an den Füßen; ein Dokument je Animation, ein Ordner je Figur; Spiel-Viewport 640×360), Farben und Ebenen benennen, Teile als Regionen anlegen (`set_region`).
 2. Flächen mit `set_rows`, Formen mit `draw_*`/`fill`, Details mit `set_pixels`, immer mit Ziel (Ebene, Frame, Region).
-3. Den zurückgegebenen Diff prüfen, `render_preview` ansehen, mit `get_rows` Details prüfen. Bei Korrekturwünschen nur die genannte Region ändern; vor größeren Umbauten `snapshot`.
+3. Den zurückgegebenen Diff prüfen, `render_preview` ansehen, mit `get_rows` Details prüfen. Bei Korrekturwünschen nur die genannte Region ändern; vor größeren Umbauten `snapshot`. Bei Tiles zusätzlich `render_preview` mit `tiled: true` und `check_seams`: das Tile muss an seinen eigenen Rändern weiterlaufen.
 4. Animation: `add_frame(copy_from)` + kleine Änderungen. Bezieht sich der Nutzer auf „das hier“, erst `get_user_view` aufrufen. Wiederkehrende Frames mit `linked: true` anlegen, dann `set_frame_duration` und `set_tag` (Bereich + Richtung).
 5. `export` (für das Testspiel `godot`), für Aseprite-Nutzer `aseprite`.
 
 ## Bekannte Grenzen
 
 - Drehen nur in 90°-Schritten (keine freien Winkel, kein Skalieren). Symmetrie wirkt nicht auf Auswahl-Werkzeuge und Pipette.
+- Kachel-Modus: Schwebende (verschobene oder eingefügte) Pixel wrappen nicht, sie werden am Bildrand abgeschnitten wie ohne Kachel-Modus. „KI zeigen“-Markierungen, Regionen und der Auswahlumriss erscheinen nur auf dem echten Bild in der Mitte. Keine Tilemap (eigener Auftrag).
 - Zeitleiste: Frames werden per Knopf verschoben, nicht per Ziehen. Die Ebenennamen-Spalte scrollt horizontal mit.
 - Keine Ebenengruppen, Blend-Modi, Cel-Deckkraft oder Tilemaps (beim Aseprite-Import gemeldet). Frame-Namen und -Sperren gehen beim Umweg über `.aseprite` verloren (Aseprite kennt sie nicht).
 - Tags sind Bereiche wie in Aseprite. Eine beliebige Reihenfolge entsteht über angehängte verknüpfte Frames (GUI „Folge“, MCP `set_tag frames`).

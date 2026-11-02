@@ -29,6 +29,7 @@ use pixel_core::document::{Direction, Rect, Region, RegionKind, Tag, KEY_ORDER};
 use pixel_core::export::{self, ExportOptions, Target};
 use pixel_core::journal::{Focus, Journal};
 use pixel_core::render::PreviewOptions;
+use pixel_core::seams;
 use pixel_core::transform::{self, Op};
 use pixel_core::{draw, import, io, palettes, render, Document, PaletteEntry, Rgba, TRANSPARENT};
 use serde_json::{json, Map, Value};
@@ -801,6 +802,7 @@ impl Server {
                 Ok(format!("{} {} = {}", if added { "added" } else { "changed" }, p.label(), p.color))
             }),
             "render_preview" => self.render_preview(a),
+            "check_seams" => self.check_seams(a),
             "focus" => {
                 let (path, doc, _) = self.load(a)?;
                 let frame = doc.find_frame(&index_or_name(a.get("frame")).ok_or("missing \"frame\"")?)?;
@@ -1710,9 +1712,16 @@ impl Server {
             Some(l) => Some(doc.find_layer(&l)?),
             None => None,
         };
-        let zoom = opt_int(a, "zoom")?.map(|z| z.clamp(1, 64) as u32).unwrap_or(PreviewOptions::auto_zoom(&doc));
-        let opts =
-            PreviewOptions { zoom, grid: bool_arg(a, "grid", true), layer, regions: bool_arg(a, "regions", true) };
+        let tiled = bool_arg(a, "tiled", false);
+        let auto = if tiled { PreviewOptions::auto_zoom_tiled(&doc) } else { PreviewOptions::auto_zoom(&doc) };
+        let zoom = opt_int(a, "zoom")?.map(|z| z.clamp(1, 64) as u32).unwrap_or(auto);
+        let opts = PreviewOptions {
+            zoom,
+            grid: bool_arg(a, "grid", !tiled),
+            layer,
+            regions: bool_arg(a, "regions", !tiled),
+            tiled,
+        };
         let img = render::preview(&doc, &frames, &opts);
         let stem = io::stem(&path);
         let dir = self.workdir.join("preview");
@@ -1724,13 +1733,22 @@ impl Server {
         if let Some(l) = layer {
             file += &format!("_layer{l}");
         }
+        if tiled {
+            file += "_tiled";
+        }
         let out = dir.join(format!("{file}.png"));
         let png = img.encode_png()?;
         io::write_atomic(&out, &png)?;
+        let tiling = if tiled {
+            " Tiled: each frame repeated 3x3 (rulers count inside the tile, pink ticks mark the seams); \
+             look for edges that break where the copies meet, or run check_seams."
+        } else {
+            ""
+        };
         let text = format!(
             "wrote {} ({}x{} px, zoom {zoom}, frames {frames:?}{}). Each frame: label (index name / ms [tags]), \
              rulers with pixel coordinates, grid (brighter every 8 px), region outlines with names, 1x and 2x \
-             thumbnails; palette swatches with keys at the bottom.",
+             thumbnails; palette swatches with keys at the bottom.{tiling}",
             self.rel(&out),
             img.width,
             img.height,
@@ -1741,6 +1759,52 @@ impl Server {
         } else {
             Ok(Out::Text(text))
         }
+    }
+}
+
+impl Server {
+    /// Compare the edges of tiles: right column against left, bottom row
+    /// against top (see `pixel_core::seams`).
+    fn check_seams(&self, a: &Value) -> Result<Out, String> {
+        let (path, doc, _) = self.load(a)?;
+        let frames: Vec<usize> = match index_or_name(a.get("frame")) {
+            Some(f) if f != "all" => vec![doc.find_frame(&f)?],
+            _ => (0..doc.frames.len()).collect(),
+        };
+        let layer = match index_or_name(a.get("layer")) {
+            Some(l) => Some(doc.find_layer(&l)?),
+            None => None,
+        };
+        let threshold = match a.get("threshold") {
+            None | Some(Value::Null) => seams::DEFAULT_THRESHOLD,
+            Some(v) => v
+                .as_f64()
+                .filter(|t| (0.0..=1.0).contains(t))
+                .ok_or_else(|| format!("argument \"threshold\" must be a number 0..1, got {v}"))?
+                as f32,
+        };
+        let mut text = format!(
+            "{}: edges compared as they meet when the frame is repeated ({}, threshold {threshold}: color \
+             distance 0..1 from which a pair is a hard edge; the seam is judged against the hard edges inside \
+             the tile).\n",
+            self.rel(&path),
+            layer.map_or("visible composite".to_string(), |l| format!("layer {l} {} only", doc.layers[l].name))
+        );
+        let mut visible = 0;
+        for f in frames {
+            let r = seams::check(&doc, f, layer, threshold);
+            visible += [&r.left_right, &r.top_bottom].iter().filter(|s| s.stands_out()).count();
+            text += &format!("\nframe {}:\n{}", doc.frame_label_long(f), r.describe(&doc));
+        }
+        text += &format!(
+            "\n{}",
+            if visible == 0 {
+                "No seam stands out.".to_string()
+            } else {
+                format!("{visible} visible seam(s); render_preview with tiled: true shows them.")
+            }
+        );
+        Ok(Out::Text(text))
     }
 }
 
@@ -2318,7 +2382,9 @@ of every document grouped by frame: numbered areas or pixels with an optional no
 weg') and their pixels. Marks are the user's instructions; after handling them remove them with clear_marks. \
 Mirroring/rotating: transform (op flip_h|flip_v|rot90|rot180|rot270; scope rect/region/cel of one layer+frame, or \
 frame/frames/tag/all around the canvas centre; regions follow). A facing-left animation from a facing-right one: \
-mirror_document(src, dst) writes a mirrored copy with tags, durations, linked cels and regions kept; never redraw it.";
+mirror_document(src, dst) writes a mirrored copy with tags, durations, linked cels and regions kept; never redraw it. \
+Tiles must repeat seamlessly: render_preview with tiled: true shows a frame 3x3, check_seams reports hard edges where \
+the right/bottom edge meets the left/top one.";
 
 fn tools() -> &'static Value {
     static TOOLS: OnceLock<Value> = OnceLock::new();
@@ -2501,8 +2567,13 @@ fn tool_list() -> Value {
                 "frames": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "several frames"},
                 "layer": {"type": ["integer", "string"], "description": "show only this layer"},
                 "zoom": int("screen pixels per art pixel; default fits ~512 px"), "grid": boolean("default true"),
-                "regions": boolean("draw region outlines, default true"),
+                "regions": boolean("draw region outlines, default true (false when tiled)"),
+                "tiled": boolean("show each frame repeated 3x3 like a seamless tile (default false); grid off unless asked"),
                 "inline": boolean("also return the PNG as image content; default true")}), &["path"]),
+        tool("check_seams", "Check whether tiles repeat seamlessly: the rightmost column is compared with the leftmost, the bottom row with the top row, as they meet when the frame is repeated. Reports per seam how many pairs differ and which are hard edges (color distance >= threshold, as runs with both keys), judged against the hard edges inside the tile: VISIBLE SEAM, or no more contrast than inside. Read-only.", json!({
+                "path": path, "frame": {"type": ["integer", "string"], "description": "one frame; default all"},
+                "layer": {"type": ["integer", "string"], "description": "only this layer; default the visible composite"},
+                "threshold": {"type": "number", "description": "color distance 0..1 from which a pair is a hard edge; default 0.25"}}), &["path"]),
         tool("render_animation", "Review an animation as still images: one tag in real play order (direction/pingpong expanded, loop transition shown) as a filmstrip, an onion-skin row and a difference row (changed pixels highlighted with counts), plus a text analysis: per-step changed pixels and silhouette shift, total duration, and warnings (ground line changes, silhouette jumps, isolated/new orphan pixels, identical frames). region zooms into an area; track marks an area's opaque bbox per step and plots its centre path (feet, head, sword tip).", json!({
                 "path": path, "tag": {"type": "string", "description": "tag name"},
                 "region": {"description": "only this area, enlarged: region name, \"x,y,w,h\" or {x,y,w,h}"},

@@ -500,7 +500,7 @@ impl EditorApp {
             return Vec::new();
         }
         if !self.wand_all {
-            return draw::flood_region(&self.doc, self.layer, self.frame, x, y);
+            return self.flood(x, y);
         }
         let k = self.doc.get(self.layer, self.frame, x, y);
         let w = self.doc.width as i32;

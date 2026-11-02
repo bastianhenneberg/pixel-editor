@@ -46,11 +46,20 @@ pub struct PreviewSettings {
     pub collapsed: bool,
     /// Top-left corner in points; None = top-right corner of the canvas.
     pub pos: Option<[f32; 2]>,
+    /// Show the frame tiled (as the Kachel-Modus does, 3x3 when it is off).
+    pub tiled: bool,
 }
 
 impl Default for PreviewSettings {
     fn default() -> Self {
-        PreviewSettings { open: true, scale: 2, background: PreviewBg::Checker, collapsed: false, pos: None }
+        PreviewSettings {
+            open: true,
+            scale: 2,
+            background: PreviewBg::Checker,
+            collapsed: false,
+            pos: None,
+            tiled: false,
+        }
     }
 }
 
@@ -60,6 +69,8 @@ pub struct Settings {
     pub preview: PreviewSettings,
     /// Open documents per window workdir, reopened on the next start.
     pub open_tabs: std::collections::BTreeMap<String, Vec<PathBuf>>,
+    /// Kachel-Modus per document (absolute path).
+    pub tile_modes: std::collections::BTreeMap<String, super::tiled::TileMode>,
 }
 
 pub fn default_path() -> Option<PathBuf> {

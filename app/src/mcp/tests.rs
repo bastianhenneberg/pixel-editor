@@ -64,6 +64,8 @@ fn protocol_and_tools() {
         "CONSISTENCY RULES: every pixel write needs an explicit target",
         "mirror_document(src, dst)",
         "transform (op flip_h",
+        "tiled: true",
+        "check_seams",
     ] {
         assert!(instructions.contains(part), "instructions lack {part:?}: {instructions}");
     }
@@ -109,6 +111,7 @@ fn protocol_and_tools() {
         "get_user_view",
         "transform",
         "mirror_document",
+        "check_seams",
     ] {
         assert!(names.contains(&required), "missing tool {required}");
     }
@@ -857,5 +860,42 @@ fn transform_respects_locked_regions_and_mirror_document_copies() {
     assert!(err(&s, "mirror_document", json!({"src": "walk_right", "dst": "x", "op": "rot90"})).contains("flip_h"));
     ok(&s, "mirror_document", json!({"src": "walk_right", "dst": "walk_left.aseprite"}));
     assert_eq!(io::load(&dir.join("walk_left.aseprite")).unwrap().rows(0, 0), ["..21", "...3"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn tiled_preview_and_seam_check() {
+    let (s, dir) = server("tiles");
+    ok(&s, "create_document", json!({"name": "tile", "width": 8, "height": 4, "palette": "pico8"}));
+    ok(
+        &s,
+        "draw_rect",
+        json!({"path": "tile", "layer": 0, "frame": 0, "x": 0, "y": 0, "w": 8, "h": 4, "key": "b", "filled": true}),
+    );
+    ok(&s, "add_frame", json!({"path": "tile", "copy_from": 0}));
+    ok(&s, "set_frame_duration", json!({"path": "tile", "frame": 1, "duration_ms": 100}));
+    // frame 1: a white stripe along the right edge, frame 0 stays plain grass
+    ok(
+        &s,
+        "draw_line",
+        json!({"path": "tile", "layer": 0, "frame": 1, "x0": 7, "y0": 0, "x1": 7, "y1": 3, "key": "7"}),
+    );
+    let t = ok(&s, "render_preview", json!({"path": "tile", "frame": 1, "tiled": true, "inline": false}));
+    assert!(t.contains("repeated 3x3"), "{t}");
+    let png = dir.join("preview/tile_f1_tiled.png");
+    let img = pixel_core::render::Image::load_png(&png).unwrap_or_else(|e| panic!("{e}: {t}"));
+    let plain = ok(&s, "render_preview", json!({"path": "tile", "frame": 1, "inline": false, "zoom": 8}));
+    assert!(plain.contains("tile_f1.png") && !plain.contains("3x3"), "{plain}");
+    assert!(img.height > 3 * 4 * 8, "3x3 at zoom 8 or more: {}x{}", img.width, img.height);
+
+    let r = ok(&s, "check_seams", json!({"path": "tile"}));
+    assert!(r.contains("frame 0") && r.contains("seamless"), "{r}");
+    assert!(r.contains("left/right seam (x=last | x=0): VISIBLE SEAM"), "{r}");
+    assert!(r.contains("y 0..3: 7"), "{r}");
+    assert!(r.contains("1 visible seam(s)"), "{r}");
+    let one = ok(&s, "check_seams", json!({"path": "tile", "frame": 0, "layer": 0}));
+    assert!(one.contains("No seam stands out") && !one.contains("frame 1"), "{one}");
+    let e = err(&s, "check_seams", json!({"path": "tile", "threshold": 2}));
+    assert!(e.contains("0..1"), "{e}");
     std::fs::remove_dir_all(&dir).unwrap();
 }

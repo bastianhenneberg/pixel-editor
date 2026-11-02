@@ -64,6 +64,7 @@ per_tab! {
     rev: u64,
     color: u8,
     symmetry: transform::Symmetry,
+    tile_mode: super::tiled::TileMode,
     layer: usize,
     frame: usize,
     panel_frame: usize,
