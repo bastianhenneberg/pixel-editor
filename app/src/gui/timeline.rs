@@ -5,6 +5,15 @@
 //! left/right; the current frame follows the column under the pointer. The
 //! mouse wheel over the frame numbers steps one frame per notch (over the
 //! cels it scrolls as before).
+//!
+//! Frame selection: click a frame number (or its thumbnail) to select it,
+//! Shift+click for a range, Ctrl+click to add/remove single frames. Delete,
+//! duplicate, "Dauer für Auswahl" and moving act on the selection.
+//! Reordering: drag a thumbnail, or Alt+drag on a frame number or a cel;
+//! a line shows where the frames will land. A plain drag on the numbers or
+//! cels stays scrubbing.
+
+use std::collections::BTreeSet;
 
 use eframe::egui::{
     self, Align2, Color32, FontId, Pos2, Rect, RichText, Sense, Stroke, StrokeKind, TextureHandle, Vec2,
@@ -53,6 +62,8 @@ fn direction_glyph(d: Direction) -> &'static str {
 enum Hit {
     Tag(usize),
     Frame(usize),
+    /// The thumbnail of a frame (drag = reorder).
+    Thumb(usize),
     Eye(usize),
     Lock(usize),
     LayerName(usize),
@@ -70,6 +81,18 @@ pub struct TimelineState {
     wheel: f32,
     /// Screen rects of the frame number cells in the last paint.
     pub frame_cells: Vec<Rect>,
+    /// Screen rects of the thumbnails in the last paint (empty without).
+    pub thumb_cells: Vec<Rect>,
+    /// Selected frames (several with Shift/Ctrl+click); see `selected_frames`.
+    pub sel: BTreeSet<usize>,
+    /// Where a Shift+click range starts.
+    anchor: usize,
+    /// Frames being dragged to a new place (reorder drag).
+    pub reorder: Option<Vec<usize>>,
+    /// Gap (0..=frames) the dragged frames would land in.
+    pub drop_gap: Option<usize>,
+    /// Duration typed in the frame context menu ("Dauer für Auswahl").
+    menu_ms: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -88,6 +111,12 @@ impl Default for TimelineState {
             scrubbing: false,
             wheel: 0.0,
             frame_cells: Vec::new(),
+            thumb_cells: Vec::new(),
+            sel: BTreeSet::new(),
+            anchor: 0,
+            reorder: None,
+            drop_gap: None,
+            menu_ms: 100,
         }
     }
 }
@@ -176,6 +205,9 @@ impl EditorApp {
                         .map(Hit::Tag);
                 }
                 if y < head_h {
+                    if self.timeline.show_thumbs && y >= tags_h + HEADER_H + NAME_ROW_H {
+                        return frame.map(Hit::Thumb);
+                    }
                     return frame.map(Hit::Frame);
                 }
                 let row = ((y - head_h) / ROW_H) as usize;
@@ -203,6 +235,18 @@ impl EditorApp {
             p.rect_filled(cur_col, 0.0, Color32::from_rgba_unmultiplied(80, 140, 220, 30));
             let cur_row = Rect::from_min_size(Pos2::new(o.x, row_y(self.layer)), Vec2::new(size.x, ROW_H));
             p.rect_filled(cur_row, 0.0, Color32::from_rgba_unmultiplied(80, 140, 220, 30));
+            // selected frames (more than one): stronger header
+            let selected = self.selected_frames();
+            if selected.len() > 1 {
+                for &f in &selected {
+                    let r = Rect::from_min_size(Pos2::new(col_x(f), o.y + tags_h), Vec2::new(cell_w, head_h - tags_h));
+                    p.rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(80, 160, 255, 70));
+                    p.line_segment(
+                        [Pos2::new(r.min.x + 1.0, r.max.y - 1.0), Pos2::new(r.max.x - 1.0, r.max.y - 1.0)],
+                        Stroke::new(2.0, Color32::from_rgb(120, 190, 255)),
+                    );
+                }
+            }
 
             // tags
             for (i, t) in self.doc.tags.iter().enumerate() {
@@ -338,6 +382,14 @@ impl EditorApp {
             self.timeline.frame_cells = (0..n_frames)
                 .map(|f| Rect::from_min_size(Pos2::new(col_x(f), o.y + tags_h), Vec2::new(cell_w, HEADER_H)))
                 .collect();
+            let thumb_top = o.y + tags_h + HEADER_H + NAME_ROW_H;
+            self.timeline.thumb_cells = if self.timeline.show_thumbs {
+                (0..n_frames)
+                    .map(|f| Rect::from_min_size(Pos2::new(col_x(f), thumb_top), Vec2::new(cell_w, thumb_h)))
+                    .collect()
+            } else {
+                Vec::new()
+            };
             // frames with "KI zeigen" marks: a light blue badge with the count
             for (f, cell) in self.timeline.frame_cells.iter().enumerate() {
                 let n = self.marks.on_frame(f).count();
@@ -348,8 +400,23 @@ impl EditorApp {
                 }
             }
             let frame_at_x = |x: f32| (((x - o.x - NAME_W) / cell_w).floor().max(0.0) as usize).min(n_frames - 1);
+            let alt = ui.input(|i| i.modifiers.alt);
             if resp.drag_started_by(egui::PointerButton::Primary) {
-                if let Some(Hit::Frame(_) | Hit::Cel(..)) = origin {
+                // reorder: drag a thumbnail, or Alt+drag a frame number / cel
+                let grab = match origin {
+                    Some(Hit::Thumb(f)) => Some(f),
+                    Some(Hit::Frame(f) | Hit::Cel(_, f)) if alt => Some(f),
+                    _ => None,
+                };
+                if let Some(f) = grab {
+                    let mut frames = self.selected_frames();
+                    if !frames.contains(&f) {
+                        self.select_frame(f, egui::Modifiers::NONE);
+                        frames = vec![f];
+                    }
+                    self.timeline.reorder = Some(frames);
+                    self.playing = false;
+                } else if let Some(Hit::Frame(_) | Hit::Cel(..)) = origin {
                     if let Some(Hit::Cel(l, _)) = origin {
                         self.layer = l;
                     }
@@ -366,6 +433,29 @@ impl EditorApp {
                 }
                 if !resp.dragged() || resp.drag_stopped() {
                     self.timeline.scrubbing = false;
+                }
+            }
+            if let Some(frames) = self.timeline.reorder.clone() {
+                let gap_at = |x: f32| (((x - o.x - NAME_W) / cell_w).round().max(0.0) as usize).min(n_frames);
+                if let Some(pos) = resp.interact_pointer_pos().or_else(|| ui.input(|i| i.pointer.latest_pos())) {
+                    self.timeline.drop_gap = Some(gap_at(pos.x));
+                }
+                if let Some(gap) = self.timeline.drop_gap {
+                    let x = col_x(gap);
+                    let c = Color32::from_rgb(255, 210, 80);
+                    p.line_segment([Pos2::new(x, o.y + tags_h), Pos2::new(x, o.y + size.y)], Stroke::new(3.0, c));
+                    for &f in &frames {
+                        let r =
+                            Rect::from_min_size(Pos2::new(col_x(f), o.y + tags_h), Vec2::new(cell_w, size.y - tags_h));
+                        p.rect_stroke(r, 2.0, Stroke::new(1.5, c), StrokeKind::Inside);
+                    }
+                }
+                if !resp.dragged() || resp.drag_stopped() {
+                    if let Some(gap) = self.timeline.drop_gap.take() {
+                        let to = gap - frames.iter().filter(|f| **f < gap).count();
+                        self.move_frames_to(&frames, to);
+                    }
+                    self.timeline.reorder = None;
                 }
             }
             // wheel over the frame numbers: one frame per notch
@@ -411,8 +501,9 @@ impl EditorApp {
                             if t.looping { "Loop" } else { "einmal" }
                         )
                     }
-                    Hit::Frame(f) => format!(
-                        "Frame {} · {} ms{}{} (Rechtsklick: sperren)",
+                    Hit::Frame(f) | Hit::Thumb(f) => format!(
+                        "Frame {} · {} ms{}{} (Umschalt/Strg+Klick: Auswahl; Vorschaubild oder Alt+Nummer ziehen: \
+                         verschieben; Rechtsklick: Menü)",
                         self.doc.frame_label_long(f),
                         self.doc.frames[f].duration_ms,
                         if self.doc.frames[f].locked { " · gesperrt" } else { "" },
@@ -440,9 +531,10 @@ impl EditorApp {
                 resp.clone().on_hover_text(tip);
             }
             if resp.clicked() {
+                let mods = ui.input(|i| i.modifiers);
                 match hover {
                     Some(Hit::Tag(i)) => self.select_tag(Some(i)),
-                    Some(Hit::Frame(f)) => self.goto_frame(f),
+                    Some(Hit::Frame(f) | Hit::Thumb(f)) => self.select_frame(f, mods),
                     Some(Hit::Eye(l)) => {
                         let ly = &self.doc.layers[l];
                         let desc =
@@ -457,7 +549,7 @@ impl EditorApp {
                     Some(Hit::LayerName(l)) => self.layer = l,
                     Some(Hit::Cel(l, f)) => {
                         self.layer = l;
-                        self.goto_frame(f);
+                        self.select_frame(f, egui::Modifiers::NONE);
                     }
                     None => {}
                 }
@@ -469,7 +561,13 @@ impl EditorApp {
                         self.goto_frame(f);
                         self.timeline.context = Some(Context::Cel(l, f));
                     }
-                    Some(Hit::Frame(f)) => self.timeline.context = Some(Context::Frame(f)),
+                    Some(Hit::Frame(f) | Hit::Thumb(f)) => {
+                        if !self.selected_frames().contains(&f) {
+                            self.select_frame(f, egui::Modifiers::NONE);
+                        }
+                        self.timeline.menu_ms = self.doc.frames[f].duration_ms;
+                        self.timeline.context = Some(Context::Frame(f));
+                    }
                     _ => self.timeline.context = None,
                 }
             }
@@ -486,6 +584,26 @@ impl EditorApp {
                         self.edit(desc, |d| d.frames[f].locked = !locked);
                         ui.close();
                     }
+                    let sel = self.selected_frames();
+                    let what = frames_label(&sel);
+                    ui.separator();
+                    if ui.button(format!("{what} duplizieren")).clicked() {
+                        self.duplicate_frames(&sel);
+                        ui.close();
+                    }
+                    if ui.add_enabled(sel.len() < n_frames, egui::Button::new(format!("{what} löschen"))).clicked() {
+                        self.delete_frames(&sel);
+                        ui.close();
+                    }
+                    ui.horizontal(|ui| {
+                        let lbl = ui.label("Dauer");
+                        ui.add(egui::DragValue::new(&mut self.timeline.menu_ms).range(1..=10000).suffix(" ms"))
+                            .labelled_by(lbl.id);
+                        if ui.button("für Auswahl").on_hover_text(format!("Dauer für {what}")).clicked() {
+                            self.set_duration(&sel, self.timeline.menu_ms);
+                            ui.close();
+                        }
+                    });
                 }
                 Some(Context::Cel(l, f)) => {
                     ui.label(format!("Ebene {}, Frame {}", self.doc.layers[l].name, self.doc.frame_label(f)));
@@ -541,7 +659,6 @@ impl EditorApp {
             ui.checkbox(&mut self.timeline.show_thumbs, "Vorschaubilder");
             ui.separator();
             ui.label("Frame:");
-            let f = self.frame;
             if ui.button("+ Neu").on_hover_text("Kopie des aktuellen Frames (Alt+N)").clicked() {
                 self.new_frame(true, false);
             }
@@ -556,23 +673,38 @@ impl EditorApp {
                 self.new_frame(true, true);
             }
             let n = self.doc.frames.len();
-            if ui.add_enabled(n > 1, egui::Button::new("Löschen")).on_hover_text("Alt+C").clicked() {
-                let desc = format!("Frame {} gelöscht", self.doc.frame_label(f));
-                if let Err(e) = self.edit(desc, |d| d.delete_frame(f)) {
-                    self.status = e;
-                }
-            }
-            if ui.add_enabled(f > 0, egui::Button::new("<")).on_hover_text("Frame nach links verschieben").clicked() {
-                self.edit(format!("Frame {f} nach links"), |d| d.move_frame(f, f - 1)).ok();
-                self.frame -= 1;
+            let sel = self.selected_frames();
+            let what = frames_label(&sel);
+            if sel.len() > 1
+                && ui
+                    .button(format!("{what} duplizieren"))
+                    .on_hover_text("Kopien hinter dem letzten einfügen")
+                    .clicked()
+            {
+                self.duplicate_frames(&sel);
             }
             if ui
-                .add_enabled(f + 1 < n, egui::Button::new(">"))
-                .on_hover_text("Frame nach rechts verschieben")
+                .add_enabled(sel.len() < n, egui::Button::new("Löschen"))
+                .on_hover_text(format!("{what} löschen (Alt+C)"))
                 .clicked()
             {
-                self.edit(format!("Frame {f} nach rechts"), |d| d.move_frame(f, f + 1)).ok();
-                self.frame += 1;
+                self.delete_frames(&sel);
+            }
+            let first = sel[0];
+            let last_free = n - sel.len();
+            if ui
+                .add_enabled(first > 0, egui::Button::new("<"))
+                .on_hover_text(format!("{what} nach links verschieben"))
+                .clicked()
+            {
+                self.move_frames_to(&sel, first - 1);
+            }
+            if ui
+                .add_enabled(first < last_free, egui::Button::new(">"))
+                .on_hover_text(format!("{what} nach rechts verschieben"))
+                .clicked()
+            {
+                self.move_frames_to(&sel, first + 1);
             }
             ui.separator();
             ui.label("Ebene:");
@@ -617,6 +749,96 @@ impl EditorApp {
         self.layer = self.edit("Neue Ebene", |d| d.add_layer("Ebene", at));
     }
 
+    /// The frames the frame actions work on: the selection when the
+    /// current frame is part of a selection of several, else the current one.
+    pub(super) fn selected_frames(&self) -> Vec<usize> {
+        let n = self.doc.frames.len();
+        let sel: Vec<usize> = self.timeline.sel.iter().copied().filter(|f| *f < n).collect();
+        if sel.len() > 1 && sel.contains(&self.frame) {
+            sel
+        } else {
+            vec![self.frame]
+        }
+    }
+
+    /// Click on a frame: select it alone, Shift = range from the last
+    /// clicked frame, Ctrl = add or remove it.
+    pub(super) fn select_frame(&mut self, f: usize, mods: egui::Modifiers) {
+        let t = &mut self.timeline;
+        if mods.shift {
+            let a = t.anchor.min(self.doc.frames.len() - 1);
+            t.sel = (a.min(f)..=a.max(f)).collect();
+        } else if mods.command || mods.ctrl {
+            if t.sel.is_empty() {
+                t.sel.insert(self.frame);
+            }
+            if !t.sel.insert(f) && t.sel.len() > 1 {
+                t.sel.remove(&f);
+                if f == self.frame {
+                    let next = *t.sel.iter().next().unwrap();
+                    self.goto_frame(next);
+                }
+                return;
+            }
+            t.anchor = f;
+        } else {
+            t.sel = [f].into();
+            t.anchor = f;
+        }
+        self.goto_frame(f);
+    }
+
+    /// Move `frames` as a block so the first one lands at `to`; the
+    /// selection, the current frame and the "KI zeigen" marks follow.
+    pub(super) fn move_frames_to(&mut self, frames: &[usize], to: usize) {
+        let desc = format!("{} verschoben nach {to}", frames_label_doc(&self.doc, frames));
+        let list = frames.to_vec();
+        match self.edit(desc, |d| d.move_frames(&list, to)) {
+            Ok(pos) => {
+                self.frame = pos[self.frame.min(pos.len() - 1)];
+                self.panel_frame = self.frame;
+                self.timeline.sel = frames.iter().map(|f| pos[*f]).collect();
+                self.timeline.anchor = pos[self.timeline.anchor.min(pos.len() - 1)];
+                self.sync_marks();
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    pub(super) fn duplicate_frames(&mut self, frames: &[usize]) {
+        let desc = format!("{} dupliziert", frames_label_doc(&self.doc, frames));
+        let list = frames.to_vec();
+        match self.edit(desc, |d| d.duplicate_frames(&list, false)) {
+            Ok(copies) => {
+                self.timeline.sel = copies.iter().copied().collect();
+                self.timeline.anchor = copies[0];
+                self.goto_frame(copies[0]);
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    pub(super) fn delete_frames(&mut self, frames: &[usize]) {
+        let desc = format!("{} gelöscht", frames_label_doc(&self.doc, frames));
+        let list = frames.to_vec();
+        match self.edit(desc, |d| d.delete_frames(&list)) {
+            Ok(()) => {
+                self.goto_frame(frames[0].min(self.doc.frames.len() - 1));
+                self.timeline.sel.clear();
+            }
+            Err(e) => self.status = e,
+        }
+    }
+
+    pub(super) fn set_duration(&mut self, frames: &[usize], ms: u32) {
+        let desc = format!("Dauer {} = {ms} ms", frames_label_doc(&self.doc, frames));
+        self.edit(desc, |d| {
+            for f in frames {
+                d.frames[*f].duration_ms = ms;
+            }
+        });
+    }
+
     pub(super) fn goto_frame(&mut self, f: usize) {
         self.playing = false;
         self.frame = f.min(self.doc.frames.len() - 1);
@@ -629,5 +851,21 @@ impl EditorApp {
             self.frame = *f;
             self.panel_frame = *f; // a manual choice: the panel follows even while playing
         }
+    }
+}
+
+/// "Frame 3" or "4 Frames".
+fn frames_label(frames: &[usize]) -> String {
+    match frames {
+        [f] => format!("Frame {f}"),
+        _ => format!("{} Frames", frames.len()),
+    }
+}
+
+/// "Frame walk/2" or "Frames 2, 3, 5".
+fn frames_label_doc(doc: &pixel_core::Document, frames: &[usize]) -> String {
+    match frames {
+        [f] => format!("Frame {}", doc.frame_label(*f)),
+        _ => format!("Frames {}", frames.iter().map(|f| f.to_string()).collect::<Vec<_>>().join(", ")),
     }
 }

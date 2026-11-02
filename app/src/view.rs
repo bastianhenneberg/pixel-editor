@@ -172,12 +172,42 @@ impl Marks {
         self.marks.iter().filter(move |m| m.frame.index == f)
     }
 
+    /// Marks belong to their frame, not to an index: after frames were
+    /// moved (or an undo moved them back) each mark goes to the frame with
+    /// its name again. A mark whose frame name is gone stays at its index
+    /// and takes that frame's name. Returns whether anything changed.
+    pub fn follow_frames(&mut self, doc: &Document) -> bool {
+        let mut changed = false;
+        for m in &mut self.marks {
+            let index = match doc.frames.iter().position(|f| f.name == m.frame.name) {
+                Some(i) => i,
+                None if m.frame.index < doc.frames.len() => m.frame.index,
+                None => continue,
+            };
+            let r = frame_ref(doc, index);
+            if r != m.frame {
+                m.frame = r;
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Remove the marks `remove` picks; returns them.
     pub fn remove_where(&mut self, mut remove: impl FnMut(&Mark) -> bool) -> Vec<Mark> {
         let (gone, kept): (Vec<Mark>, Vec<Mark>) = std::mem::take(&mut self.marks).into_iter().partition(|m| remove(m));
         self.marks = kept;
         gone
     }
+}
+
+/// Keep the marks file of `path` in step with `doc` (see `follow_frames`).
+pub fn follow_marks(path: &Path, doc: &Document) -> Result<(), String> {
+    let mut marks = read_marks(path);
+    if marks.follow_frames(doc) {
+        write_marks(path, &marks)?;
+    }
+    Ok(())
 }
 
 pub fn marks_file(doc: &Path) -> PathBuf {

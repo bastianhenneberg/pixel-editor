@@ -7,6 +7,7 @@ mod marks;
 mod panels;
 mod preview;
 mod recolor;
+mod reference;
 mod select;
 mod settings;
 mod share;
@@ -522,11 +523,26 @@ impl EditorApp {
         self.clamp_selection();
     }
 
+    /// Let the "KI zeigen" marks follow their frames (after frames moved).
+    fn sync_marks(&mut self) {
+        let doc = self.doc.clone();
+        let mut m = self.marks.clone();
+        if m.follow_frames(&doc) {
+            if self.path.is_some() {
+                self.update_marks(|m| m.follow_frames(&doc));
+            } else {
+                self.marks = m;
+            }
+        }
+    }
+
     fn undo(&mut self) {
         self.drop_floating();
         if let Some((d, desc)) = self.history.undo(&self.doc) {
             self.replace_doc(d);
-            // back at the saved state = nothing unsaved
+            self.sync_marks();
+            self.timeline.sel.clear(); // the indices may mean other frames now
+                                       // back at the saved state = nothing unsaved
             self.dirty = self.saved_doc.as_ref() != Some(&self.doc);
             self.unsaved_steps.push(format!("Rückgängig: {desc}"));
             self.status = format!("Rückgängig: {desc}");
@@ -537,6 +553,8 @@ impl EditorApp {
         self.drop_floating();
         if let Some((d, desc)) = self.history.redo(&self.doc) {
             self.replace_doc(d);
+            self.sync_marks();
+            self.timeline.sel.clear(); // the indices may mean other frames now
             self.dirty = self.saved_doc.as_ref() != Some(&self.doc);
             self.unsaved_steps.push(format!("Wiederholt: {desc}"));
             self.status = format!("Wiederholt: {desc}");
@@ -650,6 +668,9 @@ impl EditorApp {
                 self.status = format!("Gespeichert: {}", path.display());
                 if !self.doc.ramps.is_empty() && pixel_core::aseprite::is_aseprite_path(&path) {
                     self.status += " · Farbrampen stehen nur in .pxe.json, nicht in .aseprite";
+                }
+                if self.doc.reference.is_some() && pixel_core::aseprite::is_aseprite_path(&path) {
+                    self.status += " · die Referenz steht nur in .pxe.json, nicht in .aseprite";
                 }
             }
             Err(e) => self.status = format!("Fehler beim Speichern: {e}"),
@@ -942,11 +963,8 @@ impl EditorApp {
             self.new_frame(false, false);
         }
         if alt(Key::C) && n > 1 {
-            let f = self.frame;
-            let desc = format!("Frame {} gelöscht", self.doc.frame_label(f));
-            if let Err(e) = self.edit(desc, |d| d.delete_frame(f)) {
-                self.status = e;
-            }
+            let sel = self.selected_frames();
+            self.delete_frames(&sel);
         }
         if shift(Key::N) {
             self.new_layer();
@@ -1210,6 +1228,7 @@ impl EditorApp {
                 ui.checkbox(&mut self.show_regions, "Regionen anzeigen");
                 ui.checkbox(&mut self.clean_view, "Saubere Ansicht: alle Einblendungen aus  (H)");
                 ui.checkbox(&mut self.preview.settings.open, "Vorschau  (P)");
+                ui.checkbox(&mut self.canvas.reference.open, "Referenz…");
                 self.tile_menu(ui);
                 ui.checkbox(&mut self.follow.enabled, "KI folgen (bei externen Änderungen mitspringen)");
                 self.mark_menu_entries(ui);
@@ -1413,6 +1432,7 @@ impl eframe::App for EditorApp {
         self.dialogs(&ctx);
         self.map_dialog_ui(&ctx);
         self.mirror_dialog_ui(&ctx);
+        self.reference_window(&ctx);
         self.recolor_dialog_ui(&ctx);
         self.update_title(&ctx);
         self.publish_view();

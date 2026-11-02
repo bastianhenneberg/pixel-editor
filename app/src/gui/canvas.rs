@@ -97,6 +97,8 @@ pub struct CanvasState {
     checker: Option<TextureHandle>,
     /// (rev, frame, onion) the textures were built for.
     built: Option<(u64, usize, bool)>,
+    /// The reference picture (see `reference`).
+    pub(super) reference: super::reference::RefView,
 }
 
 impl Default for CanvasState {
@@ -121,6 +123,7 @@ impl Default for CanvasState {
             next_tex: None,
             checker: None,
             built: None,
+            reference: Default::default(),
         }
     }
 }
@@ -178,21 +181,21 @@ impl EditorApp {
         };
         // floating pixels: composite as if dropped (in front or behind), so
         // the preview matches the result exactly
-        let mut img = match floating {
-            Some(fl) => {
+        // a shape being dragged goes into a copy of the layer, so it shows
+        // with the layer's opacity and under the layers above, as drawn
+        let img = match (floating, &preview) {
+            (None, None) => render::composite(&self.doc, self.frame),
+            _ => {
                 let mut d = self.doc.clone();
-                super::select::apply_floating(&mut d, fl, self.drop_behind);
+                if let Some(fl) = floating {
+                    super::select::apply_floating(&mut d, fl, self.drop_behind);
+                }
+                for &(x, y, k) in preview.iter().flatten() {
+                    d.set(self.layer, self.frame, x, y, k);
+                }
                 render::composite(&d, self.frame)
             }
-            None => render::composite(&self.doc, self.frame),
         };
-        if let Some(pts) = &preview {
-            for &(x, y, k) in pts {
-                if self.doc.in_bounds(x, y) {
-                    img.put(x as u32, y as u32, self.doc.color_of(k).map_or([0, 0, 0, 0], |c| c.0));
-                }
-            }
-        }
         let rebuild_next = preview.is_some() || floating.is_some();
         set(&mut self.canvas.tex, "canvas", image_to_color(&img));
         if self.onion {
@@ -323,7 +326,10 @@ impl EditorApp {
 
         // ---- input: symmetry axis grips, then tools
         let grips = self.axis_grips(canvas, cell);
-        if !self.canvas.panning && !self.axis_input(&resp, &pointer, canvas, cell, &grips) {
+        if !self.canvas.panning
+            && !self.reference_input(&resp, &pointer, cell)
+            && !self.axis_input(&resp, &pointer, canvas, cell, &grips)
+        {
             self.tool_input(&resp, &pointer, mods, to_px);
         }
         // selection tools: a right click (not a drag) opens the selection menu
@@ -365,9 +371,12 @@ impl EditorApp {
                 }
             }
         }
+        let ctx = ui.ctx().clone();
+        self.paint_reference(&ctx, &painter, canvas, cell, false);
         if let Some(t) = &self.canvas.tex {
             painter.image(t.id(), canvas, full_uv, Color32::WHITE);
         }
+        self.paint_reference(&ctx, &painter, canvas, cell, true);
         // Grid, hover box and border as untextured meshes: egui does not
         // anti-alias meshes, so these lines stay exactly 1 physical px wide.
         let px = 1.0 / ppp;

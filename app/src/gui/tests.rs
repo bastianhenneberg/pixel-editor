@@ -3407,3 +3407,335 @@ fn replace_dialog_screenshot() {
     h.render().unwrap().save(&shot).unwrap();
     eprintln!("saved {}", shot.display());
 }
+
+// ---- frame selection, reordering, reference -----------------------------------
+
+/// A click on a frame cell with modifiers held (Shift / Ctrl).
+fn click_mods(h: &mut Harness<'_, EditorApp>, p: Pos2, mods: Modifiers) {
+    h.event(egui::Event::ModifiersChanged(mods));
+    h.event(egui::Event::PointerMoved(p));
+    h.step();
+    h.event(egui::Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: true, modifiers: mods });
+    h.step();
+    h.event(egui::Event::PointerButton { pos: p, button: PointerButton::Primary, pressed: false, modifiers: mods });
+    h.step();
+    h.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+    h.step();
+}
+
+/// Press at `from`, move in small steps to `to` (optionally with Alt held);
+/// `before_release` runs while the button is still down.
+fn drag_mods(
+    h: &mut Harness<'_, EditorApp>,
+    from: Pos2,
+    to: Pos2,
+    mods: Modifiers,
+    before_release: impl FnOnce(&mut Harness<'_, EditorApp>),
+) {
+    h.event(egui::Event::ModifiersChanged(mods));
+    h.event(egui::Event::PointerMoved(from));
+    h.step();
+    h.event(egui::Event::PointerButton { pos: from, button: PointerButton::Primary, pressed: true, modifiers: mods });
+    h.step();
+    for i in 1..=8 {
+        h.event(egui::Event::PointerMoved(from + (to - from) * (i as f32 / 8.0)));
+        h.step();
+    }
+    before_release(h);
+    h.event(egui::Event::PointerButton { pos: to, button: PointerButton::Primary, pressed: false, modifiers: mods });
+    h.step();
+    h.event(egui::Event::ModifiersChanged(Modifiers::NONE));
+    h.run_steps(2);
+}
+
+/// Six frames f0..f5 (pixel x = frame), tags a 0..2 and b 3..5, f4 linked
+/// to f3, a region moving per frame, saved to `dir`.
+fn six_frames(dir: &std::path::Path) -> std::path::PathBuf {
+    let mut doc = Document::new(16, 16, Document::builtin_palette("pico8").unwrap()).unwrap();
+    for f in 1..6 {
+        doc.add_frame(f, None, false).unwrap();
+    }
+    for f in 0..6 {
+        doc.set(0, f, f as i32, f as i32, b'8');
+    }
+    doc.layers[0].link(4, 3);
+    doc.set_tag(pixel_core::Tag::new("a", 0, 2)).unwrap();
+    doc.set_tag(pixel_core::Tag::new("b", 3, 5)).unwrap();
+    let mut r = pixel_core::Region::new("hand", pixel_core::Rect::new(0, 0, 2, 2));
+    for f in 0..6 {
+        r.set_rect_for(f, f, Some(pixel_core::Rect::new(f as i32, 8, 2, 2)), 6);
+    }
+    doc.regions.push(r);
+    let path = dir.join("six.pxe.json");
+    io::save(&doc, &path).unwrap();
+    path
+}
+
+fn order(app: &EditorApp) -> Vec<&str> {
+    app.doc.frames.iter().map(|f| f.name.as_str()).collect()
+}
+
+/// Shift/Ctrl+click select frames; dragging a thumbnail moves the selection
+/// as a block (tags, link, region and marks go along, one undo step); the
+/// actions work on the selection; Alt+drag on a number reorders too, a plain
+/// drag on the numbers still scrubs. Screenshot of the drag in
+/// `target/frames-drag-screenshot.png`.
+#[test]
+fn timeline_multi_select_and_drag_reorder() {
+    let _gpu = gpu_lock();
+    let dir = scratch_dir("frames-drag");
+    let path = six_frames(&dir);
+    // a "KI zeigen" mark on f4
+    let mut marks = crate::view::Marks::default();
+    let doc = io::load(&path).unwrap();
+    marks.add(crate::view::Mark {
+        n: 0,
+        frame: crate::view::frame_ref(&doc, 4),
+        layer: crate::view::layer_ref(&doc, 0),
+        rect: None,
+        note: "hier".into(),
+        time_ms: crate::view::now_ms(),
+        pid: std::process::id(),
+        dirty: false,
+    });
+    crate::view::write_marks(&path, &marks).unwrap();
+    let mut app = EditorApp::new(Some(path.clone()));
+    app.preview.settings.open = false;
+    let mut h = harness(app);
+    h.run_steps(3);
+    // the cells are read fresh each time: the toolbar may wrap and move the grid
+    let num = |h: &Harness<'_, EditorApp>, f: usize| h.state().timeline.frame_cells[f];
+    let thumb = |h: &Harness<'_, EditorApp>, f: usize| h.state().timeline.thumb_cells[f];
+    assert_eq!(h.state().timeline.thumb_cells.len(), 6, "thumbnails shown");
+
+    // selection: click, Shift+click range, Ctrl+click adds and removes
+    let p = num(&h, 1).center();
+    click_mods(&mut h, p, Modifiers::NONE);
+    assert_eq!(h.state().selected_frames(), vec![1]);
+    let p = num(&h, 3).center();
+    click_mods(&mut h, p, Modifiers::SHIFT);
+    assert_eq!((h.state().selected_frames(), h.state().frame), (vec![1, 2, 3], 3));
+    let p = num(&h, 5).center();
+    click_mods(&mut h, p, Modifiers::COMMAND);
+    assert_eq!(h.state().selected_frames(), vec![1, 2, 3, 5]);
+    let p = thumb(&h, 2).center();
+    click_mods(&mut h, p, Modifiers::COMMAND);
+    assert_eq!(h.state().selected_frames(), vec![1, 3, 5], "Ctrl+click on a thumbnail removes it");
+    assert!(h.query_by_label("3 Frames duplizieren").is_some());
+
+    // drag f3's thumbnail (part of the selection) before f0: 1 3 5 move as a block
+    let shot = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/frames-drag-screenshot.png");
+    let to = Pos2::new(num(&h, 0).min.x + 2.0, thumb(&h, 0).center().y);
+    let p = thumb(&h, 3).center();
+    drag_mods(&mut h, p, to, Modifiers::NONE, |h| {
+        assert_eq!(h.state().timeline.drop_gap, Some(0), "the line sits before f0");
+        assert!(!h.state().timeline.scrubbing, "a thumbnail drag does not scrub");
+        h.render().unwrap().save(&shot).unwrap();
+    });
+    eprintln!("saved {}", shot.display());
+    let app = h.state();
+    assert_eq!(order(app), ["f1", "f3", "f5", "f0", "f2", "f4"]);
+    assert_eq!(app.selected_frames(), vec![0, 1, 2], "the selection moved along");
+    assert_eq!(app.doc.frames[app.frame].name, "f5", "the current frame (f5, Ctrl+clicked last) too");
+    let d = &app.doc;
+    for (new, old) in [(0, 1), (1, 3), (2, 5), (3, 0), (4, 2), (5, 4)] {
+        let px = if old == 4 { 3 } else { old }; // f4 shows f3's (linked) cel
+        assert_eq!(d.get(0, new, px, px), b'8', "pixels of f{old}");
+        assert_eq!(d.regions[0].rect_at(new), Some(pixel_core::Rect::new(old, 8, 2, 2)), "region of f{old}");
+    }
+    assert_eq!(d.layers[0].linked_frames(1), vec![1, 5], "f3 and f4 stay linked");
+    let tag = |n: &str| d.tags.iter().find(|t| t.name == n).map(|t| (t.from, t.to)).unwrap();
+    // a: f0 f2 stay (3..4), f1 moved away; b: f4 stays, f3 f5 moved off
+    assert_eq!((tag("a"), tag("b")), ((3, 4), (5, 5)));
+    assert_eq!(app.marks.marks[0].frame.index, 5, "the mark followed f4");
+    assert_eq!(crate::view::read_marks(&path).marks[0].frame.index, 5, "also in marks.json");
+    assert_eq!(app.history.undo_steps().last().copied(), Some("Frames 1, 3, 5 verschoben nach 0"));
+    // one undo step back, the mark goes back too
+    h.key_press_modifiers(Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    assert_eq!(order(h.state()), ["f0", "f1", "f2", "f3", "f4", "f5"]);
+    assert_eq!(h.state().marks.marks[0].frame.index, 4);
+
+    // Alt+drag on the number of f0 behind f5
+    let to = Pos2::new(num(&h, 5).max.x - 2.0, num(&h, 5).center().y);
+    let p = num(&h, 0).center();
+    drag_mods(&mut h, p, to, Modifiers::ALT, |h| {
+        assert!(h.state().timeline.reorder.is_some() && !h.state().timeline.scrubbing);
+    });
+    assert_eq!(order(h.state()), ["f1", "f2", "f3", "f4", "f5", "f0"]);
+    // a plain drag on the numbers still scrubs and moves nothing
+    let p = num(&h, 0).center();
+    let q = num(&h, 3).center();
+    drag_mods(&mut h, p, q, Modifiers::NONE, |h| {
+        assert!(h.state().timeline.scrubbing && h.state().timeline.reorder.is_none());
+    });
+    assert_eq!(h.state().frame, 3, "scrubbed to the column");
+    assert_eq!(order(h.state()), ["f1", "f2", "f3", "f4", "f5", "f0"]);
+
+    // actions on the selection: duration, duplicate, delete, < >
+    let p = num(&h, 0).center();
+    click_mods(&mut h, p, Modifiers::NONE);
+    let p = num(&h, 1).center();
+    click_mods(&mut h, p, Modifiers::SHIFT);
+    h.state_mut().set_duration(&[0, 1], 240);
+    assert!(h.state().doc.frames[..2].iter().all(|f| f.duration_ms == 240));
+    assert_eq!(h.state().doc.frames[2].duration_ms, 100);
+    h.get_by_label("2 Frames duplizieren").click();
+    h.run_steps(2);
+    assert_eq!(order(h.state()), ["f1", "f2", "f6", "f7", "f3", "f4", "f5", "f0"]);
+    assert_eq!(h.state().selected_frames(), vec![2, 3], "the copies are selected");
+    h.get_by_label(">").click();
+    h.run_steps(2);
+    assert_eq!(order(h.state()), ["f1", "f2", "f3", "f6", "f7", "f4", "f5", "f0"]);
+    h.key_press_modifiers(Modifiers::ALT, egui::Key::C);
+    h.run_steps(2);
+    assert_eq!(order(h.state()), ["f1", "f2", "f3", "f4", "f5", "f0"], "Alt+C deleted both");
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The reference: loaded in the panel, painted half transparent under or
+/// over the pixels, hidden, moved by dragging (one undo step), locked, never
+/// in the pixels; saved in the document. Screenshot of a copy of
+/// `toast_warrior/walk_side` with a reference over it in
+/// `target/reference-screenshot.png`.
+#[test]
+fn reference_layer_in_the_gui() {
+    let _gpu = gpu_lock();
+    let dir = scratch_dir("reference");
+    let art = std::path::Path::new(env!("HOME")).join("Development/pixelart-studio/art/toast_warrior");
+    let (doc, picture) = match (io::load(&art.join("walk_side.pxe.json")), io::load(&art.join("walk_up.pxe.json"))) {
+        // the reference: walk_up's first frame, twice as big (a sketch to compare against)
+        (Ok(d), Ok(up)) => (d, pixel_core::render::composite(&up, 0).scaled(2)),
+        _ => {
+            let mut d = Document::new(48, 48, Document::builtin_palette("pico8").unwrap()).unwrap();
+            d.set(0, 0, 20, 20, b'8');
+            let mut p = pixel_core::render::Image::new(48, 48);
+            p.fill_rect(0, 0, 48, 48, [40, 200, 90, 255]);
+            (d, p)
+        }
+    };
+    let path = dir.join("walk_side.pxe.json");
+    io::save(&doc, &path).unwrap(); // a copy: the original stays untouched
+    picture.save_png(&dir.join("vorlage.png")).unwrap();
+    let mut app = EditorApp::new(Some(path.clone()));
+    app.preview.settings.open = false;
+    app.canvas.reference.draft = "vorlage.png".into();
+    let mut h = harness(app);
+    h.run_steps(3);
+    h.get_by_label("Referenz…").click();
+    h.run_steps(2);
+    h.get_by_label("Laden").click();
+    h.run_steps(3);
+    let r = h.state().doc.reference.clone().unwrap_or_else(|| panic!("reference set: {}", h.state().status));
+    assert_eq!((r.source.path(), r.opacity, r.above, r.visible), ("vorlage.png", 0.5, false, true));
+    assert_eq!(h.state().canvas.reference.size, Some([picture.width, picture.height]));
+    let pixels = h.state().doc.layers.iter().map(|l| l.cel(0).clone()).collect::<Vec<_>>();
+
+    // a canvas pixel that is transparent in the sprite and opaque in the reference
+    let (w, hh) = (h.state().doc.width as i32, h.state().doc.height as i32);
+    let spot = (0..hh)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .find(|&(x, y)| h.state().doc.top_key(0, x, y) == TRANSPARENT && picture.get(x as u32, y as u32)[3] == 255)
+        .expect("a free spot under the reference");
+    let screen = |h: &mut Harness<'_, EditorApp>| {
+        let p = px_center(h, spot.0, spot.1);
+        let img = h.render().unwrap();
+        img.get_pixel(p.x as u32, p.y as u32).0
+    };
+    let ref_c = picture.get(spot.0 as u32, spot.1 as u32);
+    let shown = screen(&mut h);
+    let near = |a: u8, b: u8| (a as i32 - b as i32).abs() <= 40;
+    assert!(
+        shown != [0, 0, 0, 0] && (0..3).all(|i| !near(shown[i], 0) || near(ref_c[i], 0) || ref_c[i] < 60),
+        "{shown:?}"
+    );
+    // hidden: the checkerboard again
+    h.get_by_label("zeigen").click();
+    h.run_steps(2);
+    let hidden = screen(&mut h);
+    assert_ne!(hidden, shown, "hiding the reference changes the canvas");
+    assert!(pixel_core::render::CHECKER.iter().any(|c| c[..3] == hidden[..3]), "{hidden:?}");
+    h.get_by_label("zeigen").click();
+    h.run_steps(2);
+    assert_eq!(screen(&mut h), shown);
+
+    // move it by dragging (Verschieben), whole pixels, one undo step
+    h.get_by_label("Verschieben (auf der Leinwand ziehen)").click();
+    h.run_steps(1);
+    let (a, b) = (px_center(&h, 10, 10), px_center(&h, 13, 8));
+    drag_mods(&mut h, a, b, Modifiers::NONE, |_| {});
+    let r = h.state().doc.reference.clone().unwrap();
+    assert_eq!((r.x, r.y), (3.0, -2.0));
+    assert_eq!(h.state().history.undo_steps().last().copied(), Some("Referenz verschoben"));
+    let now: Vec<_> = h.state().doc.layers.iter().map(|l| l.cel(0).clone()).collect();
+    assert!(now == pixels, "moving the reference painted nothing");
+    h.key_press_modifiers(Modifiers::COMMAND, egui::Key::Z);
+    h.run_steps(2);
+    let r = h.state().doc.reference.clone().unwrap();
+    assert_eq!((r.x, r.y), (0.0, 0.0));
+    // locked: "Verschieben" goes off and cannot be switched on
+    h.get_by_label("sperren").click();
+    h.run_steps(2);
+    assert!(h.state().doc.reference.as_ref().unwrap().locked);
+    assert!(!h.state().canvas.reference.moving);
+    h.get_by_label("Verschieben (auf der Leinwand ziehen)").click();
+    h.run_steps(2);
+    assert!(!h.state().canvas.reference.moving, "disabled while locked");
+    h.get_by_label("sperren").click();
+    h.run_steps(2);
+
+    // over the pixels, half transparent, a bit to the right: the screenshot
+    h.get_by_label("über den Pixeln").click();
+    h.run_steps(2);
+    // the picture is walk_up at 2x: shown at half size, 6 px to the right
+    h.state_mut().doc.reference.as_mut().unwrap().x = 6.0;
+    h.state_mut().doc.reference.as_mut().unwrap().scale = 0.5;
+    h.state_mut().touch();
+    h.state_mut().canvas.reference.open = false; // the window would cover the toast
+    h.run_steps(3);
+    let shot = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/reference-screenshot.png");
+    h.render().unwrap().save(&shot).unwrap();
+    eprintln!("saved {}", shot.display());
+    // saved in the document, never in its pixels
+    h.key_press_modifiers(Modifiers::COMMAND, egui::Key::S);
+    h.run_steps(2);
+    let back = io::load(&path).unwrap();
+    let r = back.reference.clone().unwrap();
+    assert_eq!((r.source.path(), r.above, r.x, r.scale), ("vorlage.png", true, 6.0, 0.5));
+    for (l, cel) in pixels.iter().enumerate() {
+        assert!(back.layers[l].cel(0) == cel, "layer {l}: pixels unchanged");
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A shape being dragged on a half-transparent layer shows as it will be
+/// drawn: with the layer's opacity, not at full strength.
+#[test]
+fn shape_preview_uses_the_layer_opacity() {
+    let _gpu = gpu_lock();
+    let mut app = doc_app(16, 16);
+    app.doc.layers[0].opacity = 0.5;
+    app.preview.settings.open = false;
+    app.tool = Tool::Rect;
+    app.color = b'2';
+    let mut h = harness(app);
+    h.run_steps(3);
+    let (a, b) = (px_center(&h, 2, 2), px_center(&h, 8, 8));
+    h.event(egui::Event::PointerMoved(a));
+    h.step();
+    press(&h, a, true);
+    h.step();
+    for i in 1..=4 {
+        h.event(egui::Event::PointerMoved(a + (b - a) * (i as f32 / 4.0)));
+        h.step();
+    }
+    let p = px_center(&h, 5, 2);
+    let during = h.render().unwrap().get_pixel(p.x as u32, p.y as u32).0;
+    press(&h, b, false);
+    h.run_steps(2);
+    assert_eq!(h.state().doc.get(0, 0, 5, 2), b'2');
+    let after = h.render().unwrap().get_pixel(p.x as u32, p.y as u32).0;
+    let full = h.state().doc.color_of(b'2').unwrap().0;
+    assert_ne!(&after[..3], &full[..3], "the drawn edge shows at half opacity");
+    assert_eq!(during, after, "the preview looks exactly like the result");
+}

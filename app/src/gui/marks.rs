@@ -69,7 +69,7 @@ impl EditorApp {
     }
 
     /// Change the marks: re-read the file, apply `f`, write it back.
-    fn update_marks<R>(&mut self, f: impl FnOnce(&mut Marks) -> R) -> Option<R> {
+    pub(super) fn update_marks<R>(&mut self, f: impl FnOnce(&mut Marks) -> R) -> Option<R> {
         let Some(path) = self.path.clone() else {
             self.status = "KI zeigen: erst speichern, die KI liest nur Dateien".into();
             return None;

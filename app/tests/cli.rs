@@ -239,3 +239,56 @@ fn mcp_server_replaces_outlines_and_dithers() {
     assert!(saved.contains("1212") && saved.contains("2121"), "{saved}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The real binary as MCP server: move_frames, set_layer opacity and
+/// set_reference end to end; the export keeps the opacity and never shows
+/// the reference.
+#[test]
+fn mcp_server_moves_frames_and_sets_a_reference() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("pxe-cli-frames-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let doc = r##"{"version":1,"width":2,"height":1,"palette":[{"key":"8","color":"#ff0000"}],
+        "layers":[{"name":"l"}],"frames":[{"name":"a"},{"name":"b"},{"name":"c"}],
+        "tags":[{"name":"walk","from":0,"to":1}],
+        "cels":[{"layer":0,"frame":0,"rows":["8."]},{"layer":0,"frame":2,"rows":[".8"]}]}"##;
+    std::fs::write(dir.join("t.pxe.json"), doc).unwrap();
+    // an opaque white 2x1 reference picture
+    let white = pixel_core::render::Image::filled(2, 1, [255, 255, 255, 255]);
+    white.save_png(&dir.join("ref.png")).unwrap();
+    let calls = [
+        r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{"name":"claude-code"}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"move_frames","arguments":{"path":"t","frames":["c"],"to":0}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"set_layer","arguments":{"path":"t","layer":0,"opacity":0.5}}}"#,
+        r#"{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"set_reference","arguments":{"path":"t","image":"ref.png","opacity":0.3,"above":true}}}"#,
+        r#"{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"export","arguments":{"path":"t","target":"png_sheet"}}}"#,
+    ];
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pixel-editor"))
+        .args(["mcp", dir.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all((calls.join("\n") + "\n").as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("new order: c a b") && text.contains("tags [walk 0..1 forward] -> [walk 1..2 forward]"),
+        "{text}"
+    );
+    assert!(text.contains("reference: none -> image ref.png at 0,0 ×1 30% over"), "{text}");
+    let saved = std::fs::read_to_string(dir.join("t.pxe.json")).unwrap();
+    assert!(
+        saved.contains(
+            r#""reference": {"image": "ref.png", "x": 0.0, "y": 0.0, "scale": 1.0, "opacity": 0.3, "above": true},"#
+        ),
+        "{saved}"
+    );
+    assert!(saved.contains(r#"{"name": "l", "visible": true, "opacity": 0.5}"#), "{saved}");
+    // the sheet: frame c first, red at half alpha, nothing of the white reference
+    let sheet = pixel_core::render::Image::load_png(&dir.join("export/t/t.png")).unwrap();
+    assert_eq!((sheet.get(0, 0), sheet.get(1, 0)), ([0, 0, 0, 0], [255, 0, 0, 128]), "frame c, half opacity");
+    assert_eq!(sheet.get(2, 0), [255, 0, 0, 128], "frame a");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

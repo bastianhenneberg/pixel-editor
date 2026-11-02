@@ -68,6 +68,9 @@ fn protocol_and_tools() {
         "check_seams",
         "set_ramps",
         "shade(pixels|rect|region",
+        "move_frames(frames, to)",
+        "set_reference",
+        "never exported",
     ] {
         assert!(instructions.contains(part), "instructions lack {part:?}: {instructions}");
     }
@@ -118,6 +121,9 @@ fn protocol_and_tools() {
         "shade",
         "replace_color",
         "outline",
+        "move_frames",
+        "set_reference",
+        "set_layer",
     ] {
         assert!(names.contains(&required), "missing tool {required}");
     }
@@ -1099,5 +1105,132 @@ fn outline_outside_inside_and_rect() {
     assert!(e.contains("outside"), "{e}");
     let h = ok(&s, "history", json!({"path": "o"}));
     assert!(h.contains("Claude: outline outside 0"), "{h}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+fn mark_on(dir: &Path, doc: &str, frame: usize, name: &str, note: &str) {
+    let path = dir.join(doc);
+    let mut marks = crate::view::read_marks(&path);
+    marks.add(crate::view::Mark {
+        n: 0,
+        frame: crate::view::FrameRef { index: frame, name: name.into(), address: name.into() },
+        layer: crate::view::LayerRef { index: 0, name: "Ebene 1".into() },
+        rect: Some(crate::view::Area { x: 0, y: 0, w: 1, h: 1 }),
+        note: note.into(),
+        time_ms: crate::view::now_ms(),
+        pid: std::process::id(),
+        dirty: false,
+    });
+    crate::view::write_marks(&path, &marks).unwrap();
+}
+
+#[test]
+fn move_frames_with_tags_links_regions_marks_and_history() {
+    let (s, dir) = server("move-frames");
+    ok(&s, "create_document", json!({"name": "walk", "width": 4, "height": 1}));
+    for i in 1..4 {
+        ok(&s, "add_frame", json!({"path": "walk"}));
+        ok(&s, "set_pixels", json!({"path": "walk", "layer": 0, "frame": i, "pixels": [{"x": i, "y": 0, "key": "8"}]}));
+    }
+    ok(&s, "link_cel", json!({"path": "walk", "frame": 3, "to": 1}));
+    ok(&s, "set_tag", json!({"path": "walk", "name": "step", "from": 0, "to": 1}));
+    ok(&s, "set_region", json!({"path": "walk", "name": "foot", "x": 0, "y": 0, "w": 1, "h": 1}));
+    ok(&s, "set_region", json!({"path": "walk", "name": "foot", "x": 3, "y": 0, "w": 1, "h": 1, "frame": 2}));
+    ok(&s, "set_layer", json!({"path": "walk", "layer": 0, "locked": true}));
+    mark_on(&dir, "walk.pxe.json", 2, "f2", "Fuß kleiner");
+    let before = load(&dir, "walk.pxe.json");
+    // dry run: nothing written
+    let t = ok(&s, "move_frames", json!({"path": "walk", "frames": [2, "f3"], "to": 0, "dry_run": true}));
+    assert!(t.starts_with("DRY RUN") && t.contains("new order: f2 f3 f0 f1"), "{t}");
+    assert_eq!(load(&dir, "walk.pxe.json"), before);
+    // moving is allowed on a locked layer: no frame's pixels change
+    let t = ok(&s, "move_frames", json!({"path": "walk", "frames": [2, "f3"], "to": 0}));
+    assert!(
+        t.contains("moved 2 frame(s): 2 \"f2\" -> 0, 3 \"f3\" -> 1") && t.contains("new order: f2 f3 f0 f1"),
+        "{t}"
+    );
+    assert!(t.contains("frames [f0:100ms f1:100ms f2:100ms f3:100ms] -> [f2:100ms f3:100ms f0:100ms f1:100ms]"), "{t}");
+    assert!(t.contains("tags [step 0..1 forward] -> [step 2..3 forward]"), "{t}");
+    assert!(!t.contains("pixels:"), "no frame's pixels changed: {t}");
+    let d = load(&dir, "walk.pxe.json");
+    assert_eq!(d.rows(0, 0), ["..8."]);
+    assert_eq!(d.rows(0, 1), d.rows(0, 3), "f3 still shows f1's cel");
+    assert_eq!(d.layers[0].linked_frames(1), vec![1, 3], "and stays linked to it");
+    assert_eq!((d.tags[0].from, d.tags[0].to), (2, 3));
+    let foot = &d.regions[0];
+    assert_eq!(foot.rect_at(0), Some(Rect::new(3, 0, 1, 1)), "f2's rect went along");
+    assert_eq!(foot.rect_at(2), Some(Rect::new(0, 0, 1, 1)));
+    let marks = crate::view::read_marks(&dir.join("walk.pxe.json"));
+    assert_eq!((marks.marks[0].frame.index, marks.marks[0].frame.name.as_str()), (0, "f2"), "the mark followed f2");
+    let h = ok(&s, "history", json!({"path": "walk"}));
+    assert!(h.contains("Claude: move_frames: moved 2 frame(s)"), "{h}");
+    // undo: the old order, and the mark goes back too
+    ok(&s, "undo", json!({"path": "walk"}));
+    assert_eq!(load(&dir, "walk.pxe.json"), before);
+    assert_eq!(crate::view::read_marks(&dir.join("walk.pxe.json")).marks[0].frame.index, 2);
+    // set_frame move_to uses the same rules
+    ok(&s, "set_frame", json!({"path": "walk", "frame": "f2", "move_to": 0}));
+    assert_eq!(crate::view::read_marks(&dir.join("walk.pxe.json")).marks[0].frame.index, 0);
+    let e = err(&s, "move_frames", json!({"path": "walk", "frames": [0, 1], "to": 3}));
+    assert!(e.contains("0..=2"), "{e}");
+    let e = err(&s, "move_frames", json!({"path": "walk", "frames": ["nope"], "to": 0}));
+    assert!(e.contains("no frame"), "{e}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn set_layer_opacity_and_reference() {
+    let (s, dir) = server("reference");
+    ok(&s, "create_document", json!({"name": "held", "width": 4, "height": 4}));
+    ok(&s, "set_pixels", json!({"path": "held", "layer": 0, "frame": 0, "pixels": [{"x": 1, "y": 1, "key": "8"}]}));
+    let t = ok(&s, "set_layer", json!({"path": "held", "layer": 0, "opacity": 0.5}));
+    assert!(t.contains("opacity 1.00 -> 0.50") && t.contains("recorded as"), "{t}");
+    assert!(ok(&s, "get_document", json!({"path": "held"})).contains("opacity 0.50"));
+    ok(&s, "export", json!({"path": "held", "target": "png_sheet"}));
+    let png = pixel_core::render::Image::load_png(&dir.join("export/held/held.png")).unwrap();
+    assert_eq!(png.get(1, 1)[3], 128, "the export uses the layer opacity");
+    let plain = std::fs::read(dir.join("export/held/held.png")).unwrap();
+    // a reference image next to the document
+    let mut pic = pixel_core::render::Image::new(8, 6);
+    pic.put(0, 0, [10, 200, 30, 255]);
+    pic.save_png(&dir.join("skizze.png")).unwrap();
+    let t = ok(&s, "set_reference", json!({"path": "held", "image": "skizze.png", "x": -2, "y": 1, "scale": 0.5}));
+    assert!(t.contains("reference: none -> image skizze.png at -2,1 ×0.5 50% under"), "{t}");
+    assert!(t.contains("8x6 px, shown 4x3 canvas px") && t.contains("never exported"), "{t}");
+    let d = load(&dir, "held.pxe.json");
+    let r = d.reference.clone().unwrap();
+    assert_eq!((r.x, r.y, r.scale, r.opacity, r.above), (-2.0, 1.0, 0.5, 0.5, false));
+    assert!(ok(&s, "get_document", json!({"path": "held"}))
+        .contains("reference (editor only, never exported): image skizze.png"));
+    // only the named fields change; the history has it
+    let t = ok(&s, "set_reference", json!({"path": "held", "opacity": 0.3, "above": true, "locked": true}));
+    assert!(t.contains("-> image skizze.png at -2,1 ×0.5 30% over, locked"), "{t}");
+    assert!(err(&s, "set_reference", json!({"path": "held", "x": 0})).contains("locked"));
+    ok(&s, "set_reference", json!({"path": "held", "locked": false, "x": 0}));
+    // never exported, never in the pixels
+    ok(&s, "export", json!({"path": "held", "target": "png_sheet"}));
+    assert_eq!(std::fs::read(dir.join("export/held/held.png")).unwrap(), plain);
+    assert_eq!(load(&dir, "held.pxe.json").rows(0, 0), d.rows(0, 0));
+    // another document as reference
+    ok(&s, "create_document", json!({"name": "vorlage", "width": 2, "height": 2}));
+    let t = ok(&s, "set_reference", json!({"path": "held", "document": "vorlage.pxe.json"}));
+    assert!(t.contains("document vorlage.pxe.json"), "{t}");
+    assert!(err(&s, "set_reference", json!({"path": "held", "image": "vorlage.pxe.json"})).contains("is a document"));
+    assert!(err(&s, "set_reference", json!({"path": "held", "image": "gone.png"})).contains("gone.png"));
+    assert!(err(&s, "set_reference", json!({"path": "held", "scale": 0})).contains("scale"));
+    let h = ok(&s, "history", json!({"path": "held"}));
+    assert!(h.contains("Claude: set_reference: reference: image skizze.png"), "{h}");
+    ok(&s, "undo", json!({"path": "held"}));
+    assert!(matches!(load(&dir, "held.pxe.json").reference.unwrap().source, RefSource::Image(_)));
+    let t = ok(&s, "set_reference", json!({"path": "held", "remove": true}));
+    assert!(t.contains("removed the reference") && t.contains("-> none"), "{t}");
+    assert!(load(&dir, "held.pxe.json").reference.is_none());
+    ok(&s, "set_reference", json!({"path": "held", "image": "skizze.png"}));
+    let t = ok(&s, "save_as", json!({"path": "held", "to": "held.aseprite"}));
+    assert!(t.contains("the reference is not stored in .aseprite"), "{t}");
+    assert!(load(&dir, "held.aseprite").reference.is_none());
+    assert!(
+        err(&s, "set_reference", json!({"path": "held.aseprite", "image": "skizze.png"})).contains(".pxe.json only")
+    );
     std::fs::remove_dir_all(&dir).unwrap();
 }

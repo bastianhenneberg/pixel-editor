@@ -14,6 +14,7 @@ serde_json.workspace = true
 png = "0.18"
 gif = "0.14"
 flate2 = "1"
+zune-jpeg = "0.5"
 
 [dev-dependencies]
 # independent .aseprite parser, used only to cross-check our writer

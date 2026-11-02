@@ -335,4 +335,45 @@ mod tests {
         }
         std::fs::remove_dir_all(&dir).unwrap();
     }
+
+    #[test]
+    fn layer_opacity_reaches_png_godot_and_gif_and_the_reference_never_does() {
+        let mut d = Document::new(2, 1, Document::builtin_palette("pico8").unwrap()).unwrap();
+        let top = d.add_layer("glanz", 1);
+        d.set(0, 0, 0, 0, b'7'); // white base under pixel 0
+        d.set(top, 0, 0, 0, b'8'); // red on top, at half opacity
+        d.set(top, 0, 1, 0, b'8'); // red over nothing
+        d.layers[top].opacity = 0.5;
+        let white = d.color_of(b'7').unwrap().0;
+        let red = d.color_of(b'8').unwrap().0;
+        let mixed = crate::color::blend_over(white, red, 0.5);
+        assert_ne!(mixed, white);
+        assert_ne!(mixed, red);
+        d.reference = Some(crate::document::Reference::new(crate::document::RefSource::Image("ref.png".into())));
+        let dir = std::env::temp_dir().join(format!("pxe-export-opacity-{}", std::process::id()));
+        let opts = ExportOptions { scale: Some(1), ..ExportOptions::default() };
+        for t in [Target::PngSheet, Target::Godot, Target::Unity] {
+            let files = export(&d, t, &dir, "glow", &opts).unwrap();
+            let png = Image::load_png(&files[0]).unwrap();
+            assert_eq!(png.get(0, 0), mixed, "{t:?}: half-transparent layer over white");
+            assert_eq!(png.get(1, 0), [red[0], red[1], red[2], 128], "{t:?}: half-transparent red over nothing");
+        }
+        // GIF: exact blended color; GIF has no partial alpha (>= 50 % shows opaque)
+        let files = export(&d, Target::Gif, &dir, "glow", &opts).unwrap();
+        let mut o = ::gif::DecodeOptions::new();
+        o.set_color_output(::gif::ColorOutput::RGBA);
+        let bytes = std::fs::read(&files[0]).unwrap();
+        let mut dec = o.read_info(&bytes[..]).unwrap();
+        let f = dec.read_next_frame().unwrap().unwrap();
+        assert_eq!(&f.buffer[0..4], &mixed);
+        assert_eq!(&f.buffer[4..8], &[red[0], red[1], red[2], 255]);
+        // the reference changes no exported pixel
+        let mut plain = d.clone();
+        plain.reference = None;
+        assert_eq!(build_sheet(&d, 1, None).image, build_sheet(&plain, 1, None).image);
+        d.layers[top].opacity = 0.0;
+        let png = build_sheet(&d, 1, None).image;
+        assert_eq!((png.get(0, 0), png.get(1, 0)), (white, [0, 0, 0, 0]), "opacity 0 hides the layer");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }

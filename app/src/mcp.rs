@@ -25,7 +25,7 @@ use std::sync::OnceLock;
 use base64::Engine;
 use pixel_core::aseprite::ColorMode;
 use pixel_core::diff::{self, rows_block};
-use pixel_core::document::{Direction, Ramp, Rect, Region, RegionKind, Tag, KEY_ORDER};
+use pixel_core::document::{Direction, Ramp, Rect, RefSource, Reference, Region, RegionKind, Tag, KEY_ORDER};
 use pixel_core::export::{self, ExportOptions, Target};
 use pixel_core::journal::{Focus, Journal};
 use pixel_core::recolor::{self, Area, Outline, OutlineMode, Pattern};
@@ -222,6 +222,7 @@ impl Server {
         journal.ensure_current(before, "state before the next edit (first edit or changed outside the editor)")?;
         io::save(doc, path)?;
         journal.record_edit(doc, &self.author(), note, focus)?;
+        crate::view::follow_marks(path, doc)?;
         Ok(())
     }
 
@@ -490,7 +491,9 @@ impl Server {
         let mut doc = before.clone();
         let msg = op(&mut doc)?;
         doc.validate()?;
-        if before.layers.len() == doc.layers.len() && before.frames.len() == doc.frames.len() {
+        // (moving frames moves cels without changing any frame's pixels)
+        let same_order = before.frames.iter().map(|f| &f.name).eq(doc.frames.iter().map(|f| &f.name));
+        if before.layers.len() == doc.layers.len() && same_order {
             for c in diff::changed_cels(&before, &doc) {
                 if let Some(why) = before.edit_blocked(c.layer, c.frame) {
                     return Err(format!("{why}: this edit would change its pixels; nothing was written"));
@@ -737,6 +740,38 @@ impl Server {
                 let shifted = if i + 1 < d.frames.len() { "; later frames shifted by one" } else { "" };
                 Ok(format!("added frame {i} {:?}{how}{shifted}", d.frames[i].name))
             }),
+            "move_frames" => self.meta_edit(a, "move_frames", |d| {
+                let list = a.get("frames").and_then(Value::as_array).ok_or("missing array \"frames\"")?;
+                let frames: Vec<usize> = list
+                    .iter()
+                    .map(|v| d.find_frame(&index_or_name(Some(v)).ok_or("frames: give indices or names")?))
+                    .collect::<Result<_, _>>()?;
+                let to = opt_int(a, "to")?.ok_or("missing integer \"to\" (new index of the first moved frame)")?;
+                let names: Vec<String> = d.frames.iter().map(|f| f.name.clone()).collect();
+                let new_pos = d.move_frames(&frames, to.max(0) as usize)?;
+                let mut sel: Vec<usize> = frames.clone();
+                sel.sort_unstable();
+                sel.dedup();
+                let moved: Vec<String> =
+                    sel.iter().map(|f| format!("{} {:?} -> {}", f, names[*f], new_pos[*f])).collect();
+                let order: Vec<&str> = d.frames.iter().map(|f| f.name.as_str()).collect();
+                Ok(format!(
+                    "moved {} frame(s): {}\nnew order: {}\n(cels, links, region rects and \"KI zeigen\" marks moved \
+                     with their frames; tags keep their frames)",
+                    sel.len(),
+                    moved.join(", "),
+                    order.join(" ")
+                ))
+            }),
+            "set_reference" => {
+                if pixel_core::aseprite::is_aseprite_path(Path::new(str_arg(a, "path")?)) {
+                    return Err("the reference is stored in .pxe.json only; .aseprite has no place for it \
+                                (save_as a .pxe.json copy first)"
+                        .into());
+                }
+                let (path, _, _) = self.load(a)?;
+                self.meta_edit(a, "set_reference", |d| set_reference(d, &path, a))
+            }
             "delete_frame" => self.meta_edit(a, "delete_frame", |d| {
                 let f = d.find_frame(&index_or_name(a.get("frame")).ok_or("missing \"frame\"")?)?;
                 let label = d.frame_label_long(f);
@@ -1011,6 +1046,9 @@ impl Server {
                 if !doc.ramps.is_empty() && pixel_core::aseprite::is_aseprite_path(&dest) {
                     msg += &format!("\nnote: the {} color ramp(s) are not stored in .aseprite", doc.ramps.len());
                 }
+                if doc.reference.is_some() && pixel_core::aseprite::is_aseprite_path(&dest) {
+                    msg += "\nnote: the reference is not stored in .aseprite";
+                }
                 if !warnings.is_empty() {
                     msg += &format!("\nwarnings while reading:\n  {}", warnings.join("\n  "));
                 }
@@ -1076,6 +1114,7 @@ impl Server {
                 }
                 let (restored, target) = j.undo(&doc, steps, &self.author())?;
                 io::save(&restored, &path)?;
+                crate::view::follow_marks(&path, &restored)?;
                 let changes = diff::summary(&doc, &restored);
                 Ok(Out::Text(format!(
                     "restored the state after #{} ({:?})\nchanges:\n{}",
@@ -2400,6 +2439,81 @@ fn clock(secs: u64) -> String {
 
 /// Summary plus, per cel, the rows of its content (cropped to the
 /// non-transparent area by default) with absolute coordinate rulers.
+/// `set_reference`: set, change or remove the document's reference.
+fn set_reference(d: &mut Document, path: &Path, a: &Value) -> Result<String, String> {
+    if bool_arg(a, "remove", false) {
+        return match d.reference.take() {
+            Some(r) => Ok(format!("removed the reference ({})", r.describe())),
+            None => Ok("there is no reference".into()),
+        };
+    }
+    let image = a.get("image").and_then(Value::as_str);
+    let document = a.get("document").and_then(Value::as_str);
+    let source = match (image, document) {
+        (Some(_), Some(_)) => return Err("give either image or document, not both".into()),
+        (Some(p), None) => match pixel_core::reference::source_for(p)? {
+            s @ RefSource::Image(_) => Some(s),
+            RefSource::Document(_) => return Err(format!("{p:?} is a document; pass it as \"document\"")),
+        },
+        (None, Some(p)) => match pixel_core::reference::source_for(p)? {
+            s @ RefSource::Document(_) => Some(s),
+            RefSource::Image(_) => return Err(format!("{p:?} is an image; pass it as \"image\"")),
+        },
+        (None, None) => None,
+    };
+    let only_lock = a.as_object().unwrap().keys().all(|k| matches!(k.as_str(), "path" | "locked" | "note" | "dry_run"));
+    let mut r = match (d.reference.take(), source) {
+        (Some(old), Some(src)) => {
+            if old.locked && a.get("locked") != Some(&json!(false)) {
+                d.reference = Some(old);
+                return Err("the reference is locked; unlock it first (locked: false)".into());
+            }
+            Reference { source: src, ..old }
+        }
+        (Some(old), None) => {
+            if old.locked && !only_lock && a.get("locked") != Some(&json!(false)) {
+                d.reference = Some(old);
+                return Err("the reference is locked; unlock it first (locked: false)".into());
+            }
+            old
+        }
+        (None, Some(src)) => Reference::new(src),
+        (None, None) => return Err("there is no reference yet: give image (PNG/JPG) or document".into()),
+    };
+    let num = |k: &str| a.get(k).and_then(Value::as_f64).map(|v| v as f32);
+    if let Some(v) = num("x") {
+        r.x = v;
+    }
+    if let Some(v) = num("y") {
+        r.y = v;
+    }
+    if let Some(v) = num("scale") {
+        r.scale = v;
+    }
+    if let Some(v) = num("opacity") {
+        r.opacity = v.clamp(0.0, 1.0);
+    }
+    for (k, field) in [("above", &mut r.above), ("visible", &mut r.visible), ("locked", &mut r.locked)] {
+        if let Some(v) = a.get(k).and_then(Value::as_bool) {
+            *field = v;
+        }
+    }
+    r.check()?;
+    // the picture has to load, else the user would see nothing
+    let img = pixel_core::reference::load(Some(path), &r, 0)?;
+    let msg = format!(
+        "reference: {} ({}x{} px, shown {:.0}x{:.0} canvas px). Only the editor shows it: it is never exported, \
+         never part of the pixels or of render_preview",
+        r.describe(),
+        img.width,
+        img.height,
+        img.width as f32 * r.scale,
+        img.height as f32 * r.scale
+    );
+    d.reference = Some(r);
+    Ok(msg)
+}
+
 fn describe(doc: &Document, rel: &str, a: &Value) -> Result<String, String> {
     let mut s = format!(
         "{rel}: {}x{} px, {} layers, {} frames\npalette ('.' = transparent):\n",
@@ -2416,6 +2530,9 @@ fn describe(doc: &Document, rel: &str, a: &Value) -> Result<String, String> {
         for r in &doc.ramps {
             s += &format!("  {}\n", doc.ramp_label(r));
         }
+    }
+    if let Some(r) = &doc.reference {
+        s += &format!("reference (editor only, never exported): {}\n", r.describe());
     }
     s += "layers (0 = bottom):\n";
     for (i, l) in doc.layers.iter().enumerate() {
@@ -2664,6 +2781,10 @@ mirror_document(src, dst) writes a mirrored copy with tags, durations, linked ce
 Shading: a document can have color ramps (palette keys dark to light, e.g. crust 3>8>9>a; set_ramps, shown by \
 get_document); shade(pixels|rect|region, steps +n lighter / -n darker) moves pixels along their ramp and leaves \
 colors outside any ramp alone. \
+Reordering: move_frames(frames, to) moves frames as a block; cels, links, region rects and marks go with their \
+frames and tags keep their frames. Layer opacity (set_layer opacity 0..1) applies to the canvas, render_preview and \
+every export. A reference (set_reference: PNG/JPG or another document, x/y/scale/opacity, under or over) is a guide \
+the user sees in the editor only; it is never exported or written into pixels. \
 Recoloring: replace_color(from, to) and outline(color, mode outside|inside, connectivity 4|8, only_transparent) \
 take the same scopes as transform (rect/region/cel of one layer+frame, or frame/frames/tag/all); fill and draw_rect \
 (filled) accept dither {pattern checker|25|75|bayer1..15|lines_h|lines_d, colors [a, b]}, aligned to the canvas so \
@@ -2876,9 +2997,21 @@ fn tool_list() -> Value {
                 "index": int("insert position; default end"), "duration_ms": int("duration"), "name": {"type": "string"}})), &["path"]),
         tool("delete_frame", "Delete a frame (not the last one, not a locked one). Later frame indices shift down; tags and region keys follow.",
             meta(json!({"frame": frame})), &["path", "frame"]),
+        tool("move_frames", "Move frames as one block (in their order) so the first one lands at index `to` of the new order (0 = start). Everything of a frame goes with it: cels on every layer (links stay links), name, duration, lock, region rects and \"KI zeigen\" marks. Tags keep their frames: a tag follows its frames that stay; a moved frame landing inside a tag joins it, one moved out leaves it; reordering inside a tag keeps the tag; a tag whose frames all move goes along. Returns the new order.", meta(json!({
+                "frames": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "frames to move (index, name or tag/n)"},
+                "to": int("new index of the first moved frame, 0..=frames-moved")})), &["path", "frames", "to"]),
+        tool("set_reference", "Lay a guide picture (\"Referenzebene\") under or over the canvas in the editor: a PNG/JPG image or another document (it shows the frame with the current frame's index), semi-transparent, to trace or compare against. It is stored in the document (.pxe.json only) but never exported, never written into pixels and not shown by render_preview. Change single fields later (only the given ones change); remove: true removes it. A locked reference refuses changes except locked: false.", meta(json!({
+                "image": {"type": "string", "description": "PNG/JPG path relative to the document's folder"},
+                "document": {"type": "string", "description": "a .pxe.json/.aseprite path relative to the document's folder"},
+                "x": {"type": "number", "description": "left edge in canvas pixels (may be negative)"},
+                "y": {"type": "number", "description": "top edge in canvas pixels"},
+                "scale": {"type": "number", "description": "size factor 0.01..64; 1 = one picture pixel per canvas pixel"},
+                "opacity": {"type": "number", "description": "0..1, default 0.5"},
+                "above": boolean("over the pixels instead of under them"), "visible": boolean("show/hide"),
+                "locked": boolean("lock/unlock (no moving by mouse)"), "remove": boolean("remove the reference")})), &["path"]),
         tool("set_frame_duration", "Set how long a frame is shown, in milliseconds. frame may be \"all\".", meta(json!({
                 "frame": frame, "duration_ms": int("milliseconds")})), &["path", "frame", "duration_ms"]),
-        tool("set_frame", "Rename a frame (unique name), set its duration, lock/unlock it, or move it (tags keep their index ranges).", meta(json!({
+        tool("set_frame", "Rename a frame (unique name), set its duration, lock/unlock it, or move it (like move_frames: tags, regions and marks follow).", meta(json!({
                 "frame": frame, "name": {"type": "string"}, "duration_ms": int("milliseconds"), "locked": boolean("lock/unlock"), "move_to": int("new index")})), &["path", "frame"]),
         tool("link_cel", "Link a frame's cel to another frame (they then share pixels), or unlink it (give it its own copy). All layers unless layer is given.", meta(json!({
                 "frame": frame, "to": {"type": ["integer", "string"], "description": "frame to link with"},

@@ -148,9 +148,10 @@ impl Layer {
         self.compact();
     }
 
-    fn move_frame(&mut self, from: usize, to: usize) {
-        let id = self.frames.remove(from);
-        self.frames.insert(to, id);
+    /// Reorder the frames: new frame `i` is old frame `order[i]`.
+    fn permute(&mut self, order: &[usize]) {
+        self.frames = order.iter().map(|o| self.frames[*o]).collect();
+        self.compact();
     }
 
     /// Drop pool entries no frame refers to (keeps first-use order).
@@ -373,13 +374,16 @@ impl Region {
         }
     }
 
-    fn frame_removed(&mut self, index: usize) {
-        for k in &mut self.keys {
-            if k.frame > index {
-                k.frame -= 1;
-            }
-        }
+    /// Frame `index` of `count` frames was deleted: every other frame keeps
+    /// its rect (also when the deleted frame had a key of its own).
+    fn frame_removed(&mut self, index: usize, count: usize) {
+        let rects: Vec<Option<Rect>> = (0..count).filter(|f| *f != index).map(|f| self.rect_at(f)).collect();
+        self.keys = rects.into_iter().enumerate().map(|(frame, rect)| RegionKey { frame, rect }).collect();
         self.normalize();
+        if self.keys.is_empty() {
+            // it was only on the deleted frame: keep the name, hidden everywhere
+            self.keys.push(RegionKey { frame: 0, rect: None });
+        }
     }
 }
 
@@ -481,6 +485,97 @@ pub struct Document {
     pub regions: Vec<Region>,
     /// Color ramps for shading (see `Ramp`).
     pub ramps: Vec<Ramp>,
+    /// A guide picture under or over the canvas (never exported).
+    pub reference: Option<Reference>,
+}
+
+/// What a reference shows: an image file (PNG/JPG) or another document.
+/// Paths are relative to the document's folder.
+#[derive(Clone, Debug, PartialEq)]
+pub enum RefSource {
+    Image(String),
+    /// Another document; it shows the frame with the current frame's index
+    /// (its last frame when it has fewer).
+    Document(String),
+}
+
+impl RefSource {
+    pub fn path(&self) -> &str {
+        match self {
+            RefSource::Image(p) | RefSource::Document(p) => p,
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            RefSource::Image(_) => "image",
+            RefSource::Document(_) => "document",
+        }
+    }
+}
+
+/// A semi-transparent guide ("Referenzebene") laid under or over the canvas
+/// to trace or compare against. It is part of the document file but never
+/// of the pixels: no export, preview or pixel tool sees it.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Reference {
+    pub source: RefSource,
+    /// Top-left corner in canvas pixels (may be negative).
+    pub x: f32,
+    pub y: f32,
+    /// Size factor: 1.0 = one reference pixel per canvas pixel.
+    pub scale: f32,
+    pub opacity: f32,
+    /// Over the pixels instead of under them.
+    pub above: bool,
+    pub visible: bool,
+    /// Locked: the GUI does not move or scale it by dragging.
+    pub locked: bool,
+}
+
+pub const REF_SCALE: std::ops::RangeInclusive<f32> = 0.01..=64.0;
+
+impl Reference {
+    pub fn new(source: RefSource) -> Reference {
+        Reference { source, x: 0.0, y: 0.0, scale: 1.0, opacity: 0.5, above: false, visible: true, locked: false }
+    }
+
+    pub fn check(&self) -> Result<(), String> {
+        if self.source.path().trim().is_empty() {
+            return Err("reference: path must not be empty".into());
+        }
+        if !(REF_SCALE.contains(&self.scale)) {
+            return Err(format!("reference: scale {} must be within 0.01..=64", self.scale));
+        }
+        if !(0.0..=1.0).contains(&self.opacity) {
+            return Err(format!("reference: opacity {} must be within 0..1", self.opacity));
+        }
+        if !self.x.is_finite() || !self.y.is_finite() {
+            return Err("reference: x/y must be numbers".into());
+        }
+        Ok(())
+    }
+
+    /// "image sketch.png at 3,-2 ×1.5 50% under, hidden, locked".
+    pub fn describe(&self) -> String {
+        let mut s = format!(
+            "{} {} at {},{} ×{} {}% {}",
+            self.source.kind(),
+            self.source.path(),
+            self.x,
+            self.y,
+            self.scale,
+            (self.opacity * 100.0).round(),
+            if self.above { "over" } else { "under" }
+        );
+        if !self.visible {
+            s += ", hidden";
+        }
+        if self.locked {
+            s += ", locked";
+        }
+        s
+    }
 }
 
 pub fn is_valid_key(key: u8) -> bool {
@@ -502,6 +597,7 @@ impl Document {
             tags: Vec::new(),
             regions: Vec::new(),
             ramps: Vec::new(),
+            reference: None,
         };
         doc.add_layer("Ebene 1", 0);
         Ok(doc)
@@ -832,12 +928,13 @@ impl Document {
         if self.frames[index].locked {
             return Err(format!("frame {} is locked", self.frame_label_long(index)));
         }
+        let count = self.frames.len();
         self.frames.remove(index);
         for layer in &mut self.layers {
             layer.remove_frame(index);
         }
         for r in &mut self.regions {
-            r.frame_removed(index);
+            r.frame_removed(index, count);
         }
         self.tags.retain(|t| !(t.from == index && t.to == index));
         for tag in &mut self.tags {
@@ -851,17 +948,125 @@ impl Document {
         Ok(())
     }
 
-    /// Move a frame (with its cels). Tags are positional and stay as they are.
+    /// Move a frame (with its cels) so that it ends up at index `to`.
+    /// Tags, regions and links follow as in `move_frames`.
     pub fn move_frame(&mut self, from: usize, to: usize) -> Result<(), String> {
         self.check_frame(from)?;
         self.check_frame(to)?;
-        if from == to {
-            return Ok(());
+        self.move_frames(&[from], to).map(|_| ())
+    }
+
+    /// Move several frames as one block (in their current order) so that the
+    /// first of them ends up at index `to` of the new order. Returns the new
+    /// index of every old frame (`result[old] = new`).
+    ///
+    /// Everything belonging to a frame goes with it: its cels on every layer
+    /// (links stay links), its name, duration and lock, and the region rects
+    /// of that frame. A tag keeps its frames: it follows the frames of it
+    /// that stay where they are (a tag whose frames all move goes along); a
+    /// moved frame that lands inside the tag's range joins it, one that
+    /// leaves the range leaves the tag, and moved frames of the tag that land
+    /// right next to it stay in it (reordering inside a tag keeps the tag).
+    pub fn move_frames(&mut self, frames: &[usize], to: usize) -> Result<Vec<usize>, String> {
+        let n = self.frames.len();
+        let mut sel: Vec<usize> = frames.to_vec();
+        sel.sort_unstable();
+        sel.dedup();
+        if sel.is_empty() {
+            return Err("no frames to move".into());
         }
-        let f = self.frames.remove(from);
-        self.frames.insert(to, f);
+        for f in &sel {
+            self.check_frame(*f)?;
+        }
+        let k = sel.len();
+        if to > n - k {
+            return Err(format!("cannot move {k} frame(s) to {to}: the first one can go to 0..={}", n - k));
+        }
+        let moved = |f: usize| sel.binary_search(&f).is_ok();
+        let stay: Vec<usize> = (0..n).filter(|f| !moved(*f)).collect();
+        let order: Vec<usize> = [&stay[..to], &sel[..], &stay[to..]].concat();
+        let mut new_pos = vec![0; n];
+        for (new, old) in order.iter().enumerate() {
+            new_pos[*old] = new;
+        }
+        if order.iter().enumerate().all(|(i, o)| i == *o) {
+            return Ok(new_pos);
+        }
+        self.frames = order.iter().map(|o| self.frames[*o].clone()).collect();
         for layer in &mut self.layers {
-            layer.move_frame(from, to);
+            layer.permute(&order);
+        }
+        for r in &mut self.regions {
+            let rects: Vec<Option<Rect>> = order.iter().map(|o| r.rect_at(*o)).collect();
+            r.keys = rects.into_iter().enumerate().map(|(frame, rect)| RegionKey { frame, rect }).collect();
+            r.normalize();
+        }
+        let block = to..to + k;
+        for t in &mut self.tags {
+            let member = |old: usize| t.contains(old);
+            let stayed: Vec<usize> = (t.from..=t.to).filter(|f| !moved(*f)).map(|f| new_pos[f]).collect();
+            let (mut lo, mut hi) = match (stayed.iter().min(), stayed.iter().max()) {
+                (Some(lo), Some(hi)) => (*lo, *hi),
+                // every frame of the tag moved: the tag goes with them
+                _ => {
+                    let p: Vec<usize> = (t.from..=t.to).map(|f| new_pos[f]).collect();
+                    (*p.iter().min().unwrap(), *p.iter().max().unwrap())
+                }
+            };
+            // moved frames of the tag placed right before / after it stay in it
+            if block.end == lo {
+                while lo > block.start && member(order[lo - 1]) {
+                    lo -= 1;
+                }
+            }
+            if block.start == hi + 1 {
+                while hi + 1 < block.end && member(order[hi + 1]) {
+                    hi += 1;
+                }
+            }
+            t.from = lo;
+            t.to = hi;
+        }
+        Ok(new_pos)
+    }
+
+    /// Copies of `frames` (in order) inserted right after the last of them,
+    /// each with its own cels (or linked to its source with `linked`).
+    /// Returns the indices of the copies.
+    pub fn duplicate_frames(&mut self, frames: &[usize], linked: bool) -> Result<Vec<usize>, String> {
+        let mut sel: Vec<usize> = frames.to_vec();
+        sel.sort_unstable();
+        sel.dedup();
+        for f in &sel {
+            self.check_frame(*f)?;
+        }
+        let Some(&last) = sel.last() else {
+            return Err("no frames to duplicate".into());
+        };
+        let mut out = Vec::new();
+        for (i, src) in sel.iter().enumerate() {
+            out.push(self.add_frame(last + 1 + i, Some(*src), linked)?);
+        }
+        Ok(out)
+    }
+
+    /// Delete several frames (all or nothing: locked frames refuse, and at
+    /// least one frame has to stay).
+    pub fn delete_frames(&mut self, frames: &[usize]) -> Result<(), String> {
+        let mut sel: Vec<usize> = frames.to_vec();
+        sel.sort_unstable();
+        sel.dedup();
+        for f in &sel {
+            self.check_frame(*f)?;
+            if self.frames[*f].locked {
+                return Err(format!("frame {} is locked", self.frame_label_long(*f)));
+            }
+        }
+        if sel.len() >= self.frames.len() {
+            return Err("cannot delete every frame".into());
+        }
+        for f in sel.iter().rev() {
+            self.delete_frame(*f)?;
         }
         Ok(())
     }
@@ -1182,6 +1387,9 @@ impl Document {
         for (i, r) in self.ramps.iter().enumerate() {
             self.check_ramp(r, Some(i))?;
         }
+        if let Some(r) = &self.reference {
+            r.check()?;
+        }
         for t in &self.tags {
             if t.from > t.to || t.to >= self.frames.len() {
                 return Err(format!(
@@ -1451,5 +1659,141 @@ mod tests {
         d.remove_palette_color(k);
         assert_eq!(d.get(0, 0, 0, 0), TRANSPARENT);
         d.validate().unwrap();
+    }
+
+    /// Six frames f0..f5: tags a 0..2 and b 3..5, frame 1 linked to 0 on
+    /// layer 0, a region moving per frame, a pixel per frame.
+    fn six() -> Document {
+        let mut d = doc();
+        for i in 1..6 {
+            d.add_frame(i, None, false).unwrap();
+        }
+        for f in 0..6 {
+            d.frames[f].duration_ms = 100 + f as u32;
+            if f != 1 {
+                d.set(0, f, f as i32 % 4, 0, b'8');
+            }
+        }
+        d.layers[0].link(1, 0);
+        d.frames[4].locked = true;
+        d.set_tag(Tag::new("a", 0, 2)).unwrap();
+        d.set_tag(Tag::new("b", 3, 5)).unwrap();
+        let mut r = Region::new("hand", Rect::new(0, 0, 1, 1));
+        for f in 0..6 {
+            r.set_rect_for(f, f, Some(Rect::new(f as i32, 0, 1, 1)), 6);
+        }
+        d.regions.push(r);
+        d
+    }
+
+    fn names(d: &Document) -> Vec<&str> {
+        d.frames.iter().map(|f| f.name.as_str()).collect()
+    }
+
+    #[test]
+    fn move_frames_takes_cels_links_regions_and_tags_along() {
+        let mut d = six();
+        let before = d.clone();
+        // f0 (linked with f1) to the end of tag b: it leaves a and joins nothing new
+        let pos = d.move_frames(&[0], 5).unwrap();
+        assert_eq!(pos, vec![5, 0, 1, 2, 3, 4]);
+        assert_eq!(names(&d), ["f1", "f2", "f3", "f4", "f5", "f0"]);
+        d.validate().unwrap();
+        for (old, &new) in pos.iter().enumerate() {
+            assert_eq!(d.cel(0, new), before.cel(0, old), "cel of f{old}");
+            assert_eq!(d.frames[new], before.frames[old], "name, duration, lock of f{old}");
+            assert_eq!(d.regions[0].rect_at(new), before.regions[0].rect_at(old), "region rect of f{old}");
+        }
+        assert_eq!(d.layers[0].linked_frames(0), vec![0, 5], "the link stays a link");
+        let tag = |d: &Document, n: &str| d.tags.iter().find(|t| t.name == n).map(|t| (t.from, t.to)).unwrap();
+        // a keeps f1 f2; b keeps f3 f4 f5 and f0 lands right after it: not one of b's
+        assert_eq!(tag(&d, "a"), (0, 1));
+        assert_eq!(tag(&d, "b"), (2, 4));
+        // and back
+        d.move_frames(&[5], 0).unwrap();
+        assert_eq!(names(&d), names(&before));
+        assert_eq!(tag(&d, "a"), (1, 2), "f0 was not in a any more: the tag does not grab it back");
+    }
+
+    #[test]
+    fn move_frames_tag_rules() {
+        let tag = |d: &Document, n: &str| d.tags.iter().find(|t| t.name == n).map(|t| (t.from, t.to)).unwrap();
+        // reordering inside a tag keeps it
+        let mut d = six();
+        d.move_frames(&[2], 0).unwrap();
+        assert_eq!(names(&d), ["f2", "f0", "f1", "f3", "f4", "f5"]);
+        assert_eq!((tag(&d, "a"), tag(&d, "b")), ((0, 2), (3, 5)));
+        let mut d = six();
+        d.move_frames(&[3], 5).unwrap();
+        assert_eq!((tag(&d, "a"), tag(&d, "b")), ((0, 2), (3, 5)));
+        // a whole tag moves along
+        let mut d = six();
+        d.move_frames(&[3, 4, 5], 0).unwrap();
+        assert_eq!(names(&d), ["f3", "f4", "f5", "f0", "f1", "f2"]);
+        assert_eq!((tag(&d, "a"), tag(&d, "b")), ((3, 5), (0, 2)));
+        // a frame moved into the middle of another tag joins it
+        let mut d = six();
+        d.move_frames(&[4], 1).unwrap();
+        assert_eq!(names(&d), ["f0", "f4", "f1", "f2", "f3", "f5"]);
+        assert_eq!((tag(&d, "a"), tag(&d, "b")), ((0, 3), (4, 5)));
+        // several frames, not next to each other, as one block in their order
+        let mut d = six();
+        let pos = d.move_frames(&[5, 1], 2).unwrap();
+        assert_eq!(names(&d), ["f0", "f2", "f1", "f5", "f3", "f4"]);
+        assert_eq!((pos[1], pos[5]), (2, 3));
+        assert_eq!((tag(&d, "a"), tag(&d, "b")), ((0, 2), (3, 5)));
+        d.validate().unwrap();
+        // out of range
+        let mut d = six();
+        assert!(d.move_frames(&[0, 1], 5).is_err());
+        assert!(d.move_frames(&[9], 0).is_err());
+        assert!(d.move_frames(&[], 0).is_err());
+        assert_eq!(d.move_frames(&[2], 2).unwrap(), (0..6).collect::<Vec<_>>(), "no-op");
+    }
+
+    #[test]
+    fn duplicate_and_delete_several_frames() {
+        let mut d = six();
+        let copies = d.duplicate_frames(&[3, 1], false).unwrap();
+        assert_eq!(copies, vec![4, 5]);
+        assert_eq!(d.frames.len(), 8);
+        assert_eq!(d.cel(0, 4), d.cel(0, 1));
+        assert_eq!(d.cel(0, 5), d.cel(0, 3));
+        assert!(!d.layers[0].linked_frames(5).contains(&3), "copies are not linked");
+        assert_eq!(d.frames[5].duration_ms, 103);
+        let linked = d.duplicate_frames(&[0], true).unwrap();
+        assert!(d.layers[0].linked_frames(0).contains(&linked[0]));
+        // f4 is locked: nothing is deleted
+        let mut e = six();
+        assert!(e.delete_frames(&[0, 4]).unwrap_err().contains("locked"));
+        assert_eq!(e.frames.len(), 6);
+        e.delete_frames(&[0, 2, 5]).unwrap();
+        assert_eq!(names(&e), ["f1", "f3", "f4"]);
+        assert!(e.delete_frames(&[0, 1, 2]).is_err(), "one frame has to stay");
+        e.validate().unwrap();
+        // a region only on a deleted frame stays (hidden), every other rect stays put
+        let mut g = six();
+        g.regions.push(Region::new("spark", Rect::new(1, 1, 1, 1)));
+        g.regions[1].set_rect_for(0, 0, None, 6);
+        g.regions[1].set_rect_for(2, 5, None, 6);
+        g.delete_frame(1).unwrap();
+        g.validate().unwrap();
+        assert!((0..5).all(|f| g.regions[1].rect_at(f).is_none()));
+        assert_eq!(g.regions[0].rect_at(1), Some(Rect::new(2, 0, 1, 1)), "f2 keeps its rect");
+    }
+
+    #[test]
+    fn reference_is_checked() {
+        let mut d = doc();
+        let mut r = Reference::new(RefSource::Image("skizze.png".into()));
+        d.reference = Some(r.clone());
+        d.validate().unwrap();
+        r.scale = 0.0;
+        d.reference = Some(r.clone());
+        assert!(d.validate().is_err());
+        r.scale = 2.0;
+        r.opacity = 1.5;
+        d.reference = Some(r);
+        assert!(d.validate().is_err());
     }
 }

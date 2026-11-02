@@ -144,6 +144,10 @@ pub fn summary(old: &Document, new: &Document) -> Vec<String> {
         };
         out.push(format!("tags [{}] -> [{}]", tg(old).join(", "), tg(new).join(", ")));
     }
+    if old.reference != new.reference {
+        let rf = |d: &Document| d.reference.as_ref().map_or("none".to_string(), |r| r.describe());
+        out.push(format!("reference: {} -> {}", rf(old), rf(new)));
+    }
     if old.regions != new.regions {
         let rg = |d: &Document| d.regions.iter().map(|r| r.name.clone()).collect::<Vec<_>>();
         out.push(format!("regions changed: {:?} -> {:?}", rg(old), rg(new)));
@@ -151,8 +155,17 @@ pub fn summary(old: &Document, new: &Document) -> Vec<String> {
     let w = new.width as usize;
     for (li, l) in new.layers.iter().enumerate() {
         let Some(oi) = old.layers.iter().position(|o| o.name == l.name) else { continue };
-        for f in 0..new.frames.len().min(old.frames.len()) {
-            let (a, b) = (old.cel(oi, f), new.cel(li, f));
+        for f in 0..new.frames.len() {
+            // frames by name (moved frames are compared with themselves), else by index
+            let Some(of) = old
+                .frames
+                .iter()
+                .position(|o| o.name == new.frames[f].name)
+                .or((f < old.frames.len() && !new.frames.iter().any(|n| n.name == old.frames[f].name)).then_some(f))
+            else {
+                continue;
+            };
+            let (a, b) = (old.cel(oi, of), new.cel(li, f));
             let changed: Vec<usize> = (0..a.len()).filter(|i| a[*i] != b[*i]).collect();
             if changed.is_empty() {
                 continue;
@@ -190,5 +203,17 @@ mod tests {
         let s = summary(&a, &b);
         assert_eq!(s.len(), 1);
         assert!(s[0].contains("2 changed"), "{s:?}");
+    }
+
+    #[test]
+    fn moved_frames_are_compared_with_themselves() {
+        let mut a = Document::new(2, 1, Document::builtin_palette("pico8").unwrap()).unwrap();
+        a.add_frame(1, None, false).unwrap();
+        a.set(0, 1, 0, 0, b'8');
+        let mut b = a.clone();
+        b.move_frames(&[1], 0).unwrap();
+        let s = summary(&a, &b);
+        assert_eq!(s.len(), 1, "{s:?}");
+        assert!(s[0].starts_with("frames [f0:100ms f1:100ms] -> [f1:100ms f0:100ms]"), "{s:?}");
     }
 }

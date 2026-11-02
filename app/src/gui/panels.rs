@@ -298,6 +298,13 @@ impl EditorApp {
                     format!("Ebene {} {}", self.doc.layers[l].name, if locked { "gesperrt" } else { "entsperrt" });
                 self.edit(desc, |d| d.layers[l].locked = locked);
             }
+            if ui
+                .button("Referenz…")
+                .on_hover_text("Bild oder Dokument als halbtransparente Vorlage (wird nie exportiert)")
+                .clicked()
+            {
+                self.canvas.reference.open = true;
+            }
         });
         let mut opacity = self.doc.layers[l].opacity;
         ui.horizontal(|ui| {
@@ -340,6 +347,15 @@ impl EditorApp {
                 self.edit(format!("Dauer aller Frames = {ms} ms"), |d| {
                     d.frames.iter_mut().for_each(|fr| fr.duration_ms = ms)
                 });
+            }
+            let sel = self.selected_frames();
+            if sel.len() > 1
+                && ui
+                    .button(format!("für Auswahl ({})", sel.len()))
+                    .on_hover_text("Diese Dauer für die gewählten Frames übernehmen")
+                    .clicked()
+            {
+                self.set_duration(&sel, ms);
             }
         });
         let mut locked = self.doc.frames[f].locked;

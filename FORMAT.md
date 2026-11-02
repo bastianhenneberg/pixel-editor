@@ -68,6 +68,7 @@ Der Editor und der MCP-Server lesen und schreiben außerdem `.aseprite`/`.ase` (
 | `frames` | Frames in Reihenfolge, `duration_ms` = Anzeigedauer (Standard 100), `locked` (Standard `false`). Namen müssen eindeutig sein und dürfen kein `/` enthalten; Frames sind außerdem als `<tag>/<n>` adressierbar (n-ter Frame im Bereich des Tags, ab 0, z. B. `walk_down/2`). |
 | `tags` | Animationen wie in Aseprite: ein Frame-Bereich `from`..`to` (Indizes, inklusive), `direction` = `forward` (Standard), `reverse`, `pingpong` (0 1 2 1) oder `pingpong_reverse` (2 1 0 1), `loop` (Standard `true`, sonst einmal abspielen), optional `color` für die Zeitleiste. Tags dürfen sich überlappen. |
 | `regions` | Benannte Bereiche (siehe unten). |
+| `reference` | optional: eine Vorlage zum Nachzeichnen (siehe „Referenz“). Fehlt das Feld, gibt es keine. |
 | `cels` | Pixel je (Ebene, Frame): `layer` und `frame` sind Indizes. Entweder `rows` (genau `height` Zeichenketten mit je `width` Palettentasten) oder `link`: der Index eines anderen Frames, dessen Cel auf dieser Ebene geteilt wird. Fehlende Cels sind komplett transparent. |
 
 ## Farbrampen
@@ -79,6 +80,20 @@ Eine Farbrampe ist eine geordnete Reihe von Palettenfarben **von dunkel nach hel
 - Wird eine Farbe aus der Palette entfernt, verschwindet sie aus allen Rampen; eine Rampe mit nur noch einer Farbe fällt weg.
 - Ohne Rampen schreibt der Editor das Feld nicht. Ältere Dateien (ohne `ramps`) werden also unverändert gelesen und byte-gleich zurückgeschrieben; die Formatversion bleibt `1`. Ein älterer Editor ignoriert das Feld beim Lesen (und verliert es beim Speichern).
 - In `.aseprite`-Dateien werden Rampen nicht gespeichert.
+
+## Referenz
+
+Eine Vorlage, die nur der Editor zeigt, halbtransparent unter oder über den Pixeln. Sie ist nie Teil der Pixel, wird nie exportiert und erscheint in keiner Vorschau.
+
+```json
+"reference": {"image": "skizzen/held.png", "x": -2, "y": 0, "scale": 0.5, "opacity": 0.4, "above": true, "locked": true},
+```
+
+- genau eins von `image` (PNG oder JPG) und `document` (`.pxe.json`/`.aseprite`; gezeigt wird der Frame mit der Nummer des aktuellen Frames, bei weniger Frames der letzte). Pfade relativ zum Ordner des Dokuments.
+- `x`, `y`: linke obere Ecke in Leinwandpixeln (Kommazahlen und negative Werte erlaubt), Standard 0.
+- `scale`: Größenfaktor 0,01–64 (1 = ein Bildpixel je Leinwandpixel), Standard 1. Gezeichnet wird per Nearest Neighbour.
+- `opacity`: 0–1, Standard 0,5. `above` (Standard `false`: unter den Pixeln), `visible` (Standard `true`), `locked` (Standard `false`: nicht per Maus verschiebbar).
+- Ohne Referenz schreibt der Editor das Feld nicht; ältere Dateien bleiben byte-gleich, die Formatversion bleibt `1`. Ein älterer Editor ignoriert das Feld (und verliert es beim Speichern). In `.aseprite` wird die Referenz nicht gespeichert.
 
 ## Verknüpfte Cels
 
@@ -95,7 +110,11 @@ Eine Region ist ein benanntes Rechteck („left_shoe“, „face“), über das 
 - `locked`: bei einem Bereich (`area`) sind die Pixel darin und die Definition vor jeder Änderung geschützt (GUI und MCP). Bei einem Marker schützt `locked` nur die Definition (kein Verschieben, Umbenennen, Löschen, kein anderer `kind`); Pixel am Marker bleiben bearbeitbar.
 - `color` (optional): Farbe der Umrandung.
 
-Beim Einfügen und Löschen von Frames wandern die Schlüssel mit.
+Beim Einfügen, Löschen und Verschieben von Frames wandern die Schlüssel mit: jeder Frame behält sein Rechteck. Lag eine Region nur auf einem gelöschten Frame, bleibt sie (unter ihrem Namen) überall ausgeblendet.
+
+## Frames verschieben
+
+Verschiebt man Frames (Editor: Ziehen in der Zeitleiste, MCP `move_frames`), nehmen sie alles mit, was zu ihnen gehört: Cels aller Ebenen (verknüpfte bleiben verknüpft; der Writer verweist danach auf den neuen ersten Frame der Gruppe), Name, Dauer, Sperre und die Regions-Rechtecke dieses Frames. Tags sind Bereiche und werden so angepasst, dass sie ihre Frames behalten: Ein Tag folgt seinen liegen gebliebenen Frames; ein verschobener Frame, der innerhalb dieses Bereichs landet, gehört danach dazu, einer, der hinaus wandert, nicht mehr; verschobene Frames des Tags, die direkt an ihn anschließen, bleiben drin (Umsortieren innerhalb eines Tags ändert ihn nicht); wandern alle Frames eines Tags, wandert der Tag mit. Die „KI zeigen“-Markierungen in `.pxe-history/<datei>/marks.json` folgen dem Frame-Namen.
 
 ## Palettentasten
 
@@ -106,7 +125,7 @@ Beim Einfügen und Löschen von Frames wandern die Schlüssel mit.
 
 ## Darstellung
 
-Ebenen werden von unten nach oben mit ihrer Deckkraft übereinandergelegt (normale Alpha-Überblendung); unsichtbare Ebenen zählen nicht, auch nicht in PNG/GIF/Godot/Unity-Exporten. Skaliert wird überall nur ganzzahlig per Nearest Neighbour.
+Ebenen werden von unten nach oben mit ihrer Deckkraft übereinandergelegt (normale Alpha-Überblendung); unsichtbare Ebenen zählen nicht. Das gilt für Leinwand, Vorschauen und alle PNG/GIF/Godot/Unity-Exporte (GIF: Pixel mit weniger als 50 % Deckung werden durchsichtig, die übrigen deckend in ihrer Mischfarbe). Die Referenz gehört nicht dazu. Skaliert wird überall nur ganzzahlig per Nearest Neighbour.
 
 ## Regeln beim Laden
 

@@ -12,8 +12,8 @@ use serde_json::json;
 
 use crate::color::Rgba;
 use crate::document::{
-    Direction, Document, Frame, PaletteEntry, Ramp, Rect, Region, RegionKey, RegionKind, Tag, FORMAT_VERSION,
-    TRANSPARENT,
+    Direction, Document, Frame, PaletteEntry, Ramp, Rect, RefSource, Reference, Region, RegionKey, RegionKind, Tag,
+    FORMAT_VERSION, TRANSPARENT,
 };
 
 pub const EXTENSION: &str = ".pxe.json";
@@ -37,7 +37,31 @@ struct FileDoc {
     #[serde(default)]
     ramps: Vec<FileRamp>,
     #[serde(default)]
+    reference: Option<FileReference>,
+    #[serde(default)]
     cels: Vec<FileCel>,
+}
+
+#[derive(Deserialize)]
+struct FileReference {
+    #[serde(default)]
+    image: Option<String>,
+    #[serde(default)]
+    document: Option<String>,
+    #[serde(default)]
+    x: f32,
+    #[serde(default)]
+    y: f32,
+    #[serde(default = "one")]
+    scale: f32,
+    #[serde(default = "half")]
+    opacity: f32,
+    #[serde(default)]
+    above: bool,
+    #[serde(default = "yes")]
+    visible: bool,
+    #[serde(default)]
+    locked: bool,
 }
 
 #[derive(Deserialize)]
@@ -151,6 +175,9 @@ fn yes() -> bool {
 }
 fn one() -> f32 {
     1.0
+}
+fn half() -> f32 {
+    0.5
 }
 fn default_ms() -> u32 {
     100
@@ -287,6 +314,23 @@ pub fn from_json(text: &str) -> Result<Document, String> {
         doc.tags.push(Tag { name: t.name, from, to, direction, looping: t.looping, color });
     }
     doc.ramps = f.ramps.into_iter().map(|r| Ramp { name: r.name, keys: r.keys.into_bytes() }).collect();
+    if let Some(r) = f.reference {
+        let source = match (r.image, r.document) {
+            (Some(p), None) => RefSource::Image(p),
+            (None, Some(p)) => RefSource::Document(p),
+            _ => return Err("reference needs either \"image\" or \"document\"".into()),
+        };
+        doc.reference = Some(Reference {
+            source,
+            x: r.x,
+            y: r.y,
+            scale: r.scale,
+            opacity: r.opacity,
+            above: r.above,
+            visible: r.visible,
+            locked: r.locked,
+        });
+    }
     doc.validate()?;
     Ok(doc)
 }
@@ -381,6 +425,24 @@ pub fn to_json(doc: &Document) -> String {
         let items = doc.ramps.iter().map(|r| line(json!({"name": r.name, "keys": r.keys_str()}))).collect();
         format!("\n  \"ramps\": {},", list(items))
     };
+    // the reference likewise
+    let reference = match &doc.reference {
+        None => String::new(),
+        Some(r) => {
+            let mut v = json!({r.source.kind(): r.source.path(), "x": round3(r.x), "y": round3(r.y),
+                               "scale": round3(r.scale), "opacity": round3(r.opacity)});
+            if r.above {
+                v["above"] = json!(true);
+            }
+            if !r.visible {
+                v["visible"] = json!(false);
+            }
+            if r.locked {
+                v["locked"] = json!(true);
+            }
+            format!("\n  \"reference\": {},", line(v))
+        }
+    };
     let mut cels = Vec::new();
     for (li, l) in doc.layers.iter().enumerate() {
         for fi in 0..doc.frames.len() {
@@ -401,7 +463,7 @@ pub fn to_json(doc: &Document) -> String {
     }
     format!(
         "{{\n  \"format\": \"{FORMAT_NAME}\",\n  \"version\": {FORMAT_VERSION},\n  \"width\": {},\n  \"height\": {},\n  \
-         \"palette\": {},{ramps}\n  \"layers\": {},\n  \"frames\": {},\n  \"tags\": {},\n  \"regions\": {},\n  \"cels\": {}\n}}\n",
+         \"palette\": {},{ramps}{reference}\n  \"layers\": {},\n  \"frames\": {},\n  \"tags\": {},\n  \"regions\": {},\n  \"cels\": {}\n}}\n",
         doc.width,
         doc.height,
         list(palette),
@@ -571,5 +633,40 @@ mod tests {
     fn stem_strips_extension() {
         assert_eq!(stem(Path::new("/a/hero.pxe.json")), "hero");
         assert_eq!(stem(Path::new("/a/sheet.png")), "sheet");
+    }
+
+    #[test]
+    fn reference_round_trip_and_files_without_it_stay_identical() {
+        use crate::document::{RefSource, Reference};
+        let mut d = Document::new(2, 2, Document::builtin_palette("pico8").unwrap()).unwrap();
+        let plain = to_json(&d);
+        assert!(!plain.contains("reference"));
+        assert_eq!(to_json(&from_json(&plain).unwrap()), plain);
+        let mut r = Reference::new(RefSource::Document("../walk_up.pxe.json".into()));
+        r.x = -3.5;
+        r.y = 2.0;
+        r.scale = 1.5;
+        r.opacity = 0.25;
+        r.above = true;
+        r.locked = true;
+        r.visible = false;
+        d.reference = Some(r);
+        let text = to_json(&d);
+        assert!(
+            text.contains(
+                "\"reference\": {\"document\": \"../walk_up.pxe.json\", \"x\": -3.5, \"y\": 2.0, \"scale\": 1.5, \
+                 \"opacity\": 0.25, \"above\": true, \"visible\": false, \"locked\": true},"
+            ),
+            "{text}"
+        );
+        let back = from_json(&text).unwrap();
+        assert_eq!(back, d);
+        // short form by hand: defaults
+        let hand = plain.replace("\"layers\"", "\"reference\": {\"image\": \"a.jpg\"},\n  \"layers\"");
+        let r = from_json(&hand).unwrap().reference.unwrap();
+        assert_eq!((r.source.kind(), r.scale, r.opacity, r.visible, r.above), ("image", 1.0, 0.5, true, false));
+        let both =
+            plain.replace("\"layers\"", "\"reference\": {\"image\": \"a.png\", \"document\": \"b\"},\n  \"layers\"");
+        assert!(from_json(&both).is_err());
     }
 }
