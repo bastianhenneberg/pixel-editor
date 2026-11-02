@@ -12,7 +12,8 @@ use serde_json::json;
 
 use crate::color::Rgba;
 use crate::document::{
-    Direction, Document, Frame, PaletteEntry, Rect, Region, RegionKey, RegionKind, Tag, FORMAT_VERSION, TRANSPARENT,
+    Direction, Document, Frame, PaletteEntry, Ramp, Rect, Region, RegionKey, RegionKind, Tag, FORMAT_VERSION,
+    TRANSPARENT,
 };
 
 pub const EXTENSION: &str = ".pxe.json";
@@ -34,7 +35,16 @@ struct FileDoc {
     #[serde(default)]
     regions: Vec<FileRegion>,
     #[serde(default)]
+    ramps: Vec<FileRamp>,
+    #[serde(default)]
     cels: Vec<FileCel>,
+}
+
+#[derive(Deserialize)]
+struct FileRamp {
+    name: String,
+    /// Palette keys from dark to light, e.g. "389a".
+    keys: String,
 }
 
 #[derive(Deserialize)]
@@ -276,6 +286,7 @@ pub fn from_json(text: &str) -> Result<Document, String> {
         };
         doc.tags.push(Tag { name: t.name, from, to, direction, looping: t.looping, color });
     }
+    doc.ramps = f.ramps.into_iter().map(|r| Ramp { name: r.name, keys: r.keys.into_bytes() }).collect();
     doc.validate()?;
     Ok(doc)
 }
@@ -363,6 +374,13 @@ pub fn to_json(doc: &Document) -> String {
             line(v)
         })
         .collect();
+    // ramps only appear when there are some, so older files stay byte-identical
+    let ramps = if doc.ramps.is_empty() {
+        String::new()
+    } else {
+        let items = doc.ramps.iter().map(|r| line(json!({"name": r.name, "keys": r.keys_str()}))).collect();
+        format!("\n  \"ramps\": {},", list(items))
+    };
     let mut cels = Vec::new();
     for (li, l) in doc.layers.iter().enumerate() {
         for fi in 0..doc.frames.len() {
@@ -383,7 +401,7 @@ pub fn to_json(doc: &Document) -> String {
     }
     format!(
         "{{\n  \"format\": \"{FORMAT_NAME}\",\n  \"version\": {FORMAT_VERSION},\n  \"width\": {},\n  \"height\": {},\n  \
-         \"palette\": {},\n  \"layers\": {},\n  \"frames\": {},\n  \"tags\": {},\n  \"regions\": {},\n  \"cels\": {}\n}}\n",
+         \"palette\": {},{ramps}\n  \"layers\": {},\n  \"frames\": {},\n  \"tags\": {},\n  \"regions\": {},\n  \"cels\": {}\n}}\n",
         doc.width,
         doc.height,
         list(palette),
@@ -508,6 +526,26 @@ mod tests {
         assert_eq!(back.regions[1].kind, RegionKind::Marker);
         assert_eq!(back.regions[0].kind, RegionKind::Area, "old files / no kind = area");
         assert!(text.contains("      \"0g.\",\n"));
+    }
+
+    #[test]
+    fn ramps_roundtrip_and_old_files() {
+        let mut d = Document::new(2, 1, Document::builtin_palette("sweetie16").unwrap()).unwrap();
+        let plain = to_json(&d);
+        assert!(!plain.contains("ramps"), "no ramps, no field: older files stay unchanged");
+        d.set_ramps(vec![Ramp::new("crust", b"389a"), Ramp::new("leaf", b"56")]).unwrap();
+        let text = to_json(&d);
+        assert!(text.contains("\"ramps\": [\n    {\"name\": \"crust\", \"keys\": \"389a\"},"), "{text}");
+        let back = from_json(&text).unwrap();
+        assert_eq!(back.ramps, d.ramps);
+        assert_eq!(to_json(&back), text);
+        // a file written before ramps existed loads without them
+        assert!(from_json(&plain).unwrap().ramps.is_empty());
+        // keys outside the palette or a single color are refused
+        let bad = text.replace("\"389a\"", "\"38z\"");
+        assert!(from_json(&bad).unwrap_err().contains("not in the palette"));
+        let short = text.replace("\"56\"", "\"5\"");
+        assert!(from_json(&short).unwrap_err().contains("at least two"));
     }
 
     #[test]

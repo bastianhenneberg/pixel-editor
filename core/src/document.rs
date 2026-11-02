@@ -44,6 +44,25 @@ impl PaletteEntry {
     }
 }
 
+/// A color ramp: palette keys ordered from dark to light (e.g. crust
+/// `3 8 9 a`). The shading tool steps a pixel along its ramp.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Ramp {
+    pub name: String,
+    pub keys: Vec<u8>,
+}
+
+impl Ramp {
+    pub fn new(name: &str, keys: &[u8]) -> Ramp {
+        Ramp { name: name.to_string(), keys: keys.to_vec() }
+    }
+
+    /// The keys as a string, "389a".
+    pub fn keys_str(&self) -> String {
+        self.keys.iter().map(|k| *k as char).collect()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Layer {
     pub name: String,
@@ -460,6 +479,8 @@ pub struct Document {
     pub frames: Vec<Frame>,
     pub tags: Vec<Tag>,
     pub regions: Vec<Region>,
+    /// Color ramps for shading (see `Ramp`).
+    pub ramps: Vec<Ramp>,
 }
 
 pub fn is_valid_key(key: u8) -> bool {
@@ -480,6 +501,7 @@ impl Document {
             frames: vec![Frame { name: "f0".into(), duration_ms: 100, locked: false }],
             tags: Vec::new(),
             regions: Vec::new(),
+            ramps: Vec::new(),
         };
         doc.add_layer("Ebene 1", 0);
         Ok(doc)
@@ -565,9 +587,14 @@ impl Document {
         self.layers.iter().any(|l| l.pool.iter().any(|c| c.contains(&key)))
     }
 
-    /// Remove a palette entry; pixels using it become transparent.
+    /// Remove a palette entry; pixels using it become transparent, ramps
+    /// lose the key (a ramp left with fewer than two keys is removed).
     pub fn remove_palette_color(&mut self, key: u8) {
         self.palette.retain(|p| p.key != key);
+        for r in &mut self.ramps {
+            r.keys.retain(|k| *k != key);
+        }
+        self.ramps.retain(|r| r.keys.len() >= 2);
         for layer in &mut self.layers {
             for cel in &mut layer.pool {
                 if cel.contains(&key) {
@@ -924,6 +951,67 @@ impl Document {
         }
     }
 
+    // ---- ramps ---------------------------------------------------------
+
+    /// The first ramp that contains `key` and the key's position in it.
+    pub fn ramp_of(&self, key: u8) -> Option<(usize, usize)> {
+        self.ramps.iter().enumerate().find_map(|(ri, r)| r.keys.iter().position(|k| *k == key).map(|i| (ri, i)))
+    }
+
+    /// The key `steps` places further along the ramp of `key` (positive =
+    /// lighter, negative = darker), stopping at the ends. None if `key` is
+    /// in no ramp (transparent never is).
+    pub fn shade_key(&self, key: u8, steps: i32) -> Option<u8> {
+        let (ri, i) = self.ramp_of(key)?;
+        let keys = &self.ramps[ri].keys;
+        let j = (i as i64 + steps as i64).clamp(0, keys.len() as i64 - 1) as usize;
+        Some(keys[j])
+    }
+
+    /// Check a ramp against the palette and the other ramps (`except` = the
+    /// index of the ramp it replaces).
+    pub fn check_ramp(&self, ramp: &Ramp, except: Option<usize>) -> Result<(), String> {
+        if ramp.name.trim().is_empty() {
+            return Err("ramp name must not be empty".into());
+        }
+        if self.ramps.iter().enumerate().any(|(i, r)| Some(i) != except && r.name == ramp.name) {
+            return Err(format!("ramp name {:?} is used twice", ramp.name));
+        }
+        if ramp.keys.len() < 2 {
+            return Err(format!("ramp {:?} needs at least two colors (dark to light)", ramp.name));
+        }
+        for (i, k) in ramp.keys.iter().enumerate() {
+            if *k == TRANSPARENT || !self.has_key(*k) {
+                return Err(format!(
+                    "ramp {:?}: key {:?} is not in the palette (valid keys: \"{}\")",
+                    ramp.name,
+                    *k as char,
+                    self.palette_keys()
+                ));
+            }
+            if ramp.keys[..i].contains(k) {
+                return Err(format!("ramp {:?}: key {:?} appears twice", ramp.name, *k as char));
+            }
+        }
+        Ok(())
+    }
+
+    /// Replace all ramps (checked first; nothing changes on an error).
+    pub fn set_ramps(&mut self, ramps: Vec<Ramp>) -> Result<(), String> {
+        let old = std::mem::replace(&mut self.ramps, ramps);
+        let checked = self.ramps.iter().enumerate().try_for_each(|(i, r)| self.check_ramp(r, Some(i)));
+        if checked.is_err() {
+            self.ramps = old;
+        }
+        checked
+    }
+
+    /// "crust 3>8>9>a" with color names where there are some.
+    pub fn ramp_label(&self, ramp: &Ramp) -> String {
+        let keys: Vec<String> = ramp.keys.iter().map(|k| self.key_label(*k)).collect();
+        format!("{}: {}", ramp.name, keys.join(" > "))
+    }
+
     pub fn palette_entry(&self, key: u8) -> Option<&PaletteEntry> {
         self.palette.iter().find(|p| p.key == key)
     }
@@ -1091,6 +1179,9 @@ impl Document {
                 return Err(format!("region {:?}: keys must exist and lie within the frames", r.name));
             }
         }
+        for (i, r) in self.ramps.iter().enumerate() {
+            self.check_ramp(r, Some(i))?;
+        }
         for t in &self.tags {
             if t.from > t.to || t.to >= self.frames.len() {
                 return Err(format!(
@@ -1119,6 +1210,26 @@ mod tests {
 
     fn doc() -> Document {
         Document::new(4, 3, Document::builtin_palette("pico8").unwrap()).unwrap()
+    }
+
+    #[test]
+    fn ramps_shade_and_follow_the_palette() {
+        let mut d = doc();
+        assert!(d.set_ramps(vec![Ramp::new("a", b"12"), Ramp::new("a", b"34")]).unwrap_err().contains("twice"));
+        assert!(d.set_ramps(vec![Ramp::new("a", b"121")]).unwrap_err().contains("twice"));
+        assert!(d.set_ramps(vec![Ramp::new("a", b"1.")]).is_err());
+        assert!(d.ramps.is_empty(), "a refused set changes nothing");
+        d.set_ramps(vec![Ramp::new("crust", b"1234"), Ramp::new("x", b"56")]).unwrap();
+        assert_eq!(d.shade_key(b'2', 1), Some(b'3'));
+        assert_eq!(d.shade_key(b'2', -5), Some(b'1'), "stops at the dark end");
+        assert_eq!(d.shade_key(b'4', 1), Some(b'4'));
+        assert_eq!((d.shade_key(b'7', 1), d.shade_key(TRANSPARENT, 1)), (None, None));
+        d.remove_palette_color(b'2');
+        assert_eq!(d.ramps[0].keys, b"134");
+        d.remove_palette_color(b'5');
+        assert_eq!(d.ramps.len(), 1, "a ramp with one color left is dropped");
+        d.validate().unwrap();
+        assert_eq!(d.ramp_label(&d.ramps[0]), "crust: 1 > 3 > 4");
     }
 
     #[test]

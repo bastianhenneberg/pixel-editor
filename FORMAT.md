@@ -19,6 +19,9 @@ Der Editor und der MCP-Server lesen und schreiben außerdem `.aseprite`/`.ase` (
     {"key": "6", "color": "#38b764", "name": "slime"},
     {"key": "g", "color": "#ffffff80"}
   ],
+  "ramps": [
+    {"name": "slime", "keys": "06g"}
+  ],
   "layers": [
     {"name": "Körper", "visible": true, "opacity": 1.0, "locked": true},
     {"name": "Glanz", "visible": true, "opacity": 0.5}
@@ -60,11 +63,22 @@ Der Editor und der MCP-Server lesen und schreiben außerdem `.aseprite`/`.ase` (
 | `version` | Formatversion, aktuell `1`. Neuere Versionen werden abgelehnt. |
 | `width`, `height` | Größe in Pixeln (1–1024). Alle Ebenen und Frames haben diese Größe. |
 | `palette` | geordnete Liste `{key, color, name?}`. `key` ist genau ein ASCII-Zeichen, `color` ist `#rrggbb` oder `#rrggbbaa` (auch `#rgb`), `name` ein lesbarer Name (z. B. `"crust_dark"`, mindestens 2 Zeichen), über den die Farbe auch angesprochen werden kann. |
+| `ramps` | optional: Farbrampen zum Schattieren (siehe unten). Fehlt das Feld, gibt es keine. |
 | `layers` | Ebenen von **unten nach oben** (Index 0 = unterste). `visible` (Standard `true`), `opacity` 0–1 (Standard `1.0`), `locked` (Standard `false`: gesperrte Ebenen nehmen keine Pixeländerungen an). |
 | `frames` | Frames in Reihenfolge, `duration_ms` = Anzeigedauer (Standard 100), `locked` (Standard `false`). Namen müssen eindeutig sein und dürfen kein `/` enthalten; Frames sind außerdem als `<tag>/<n>` adressierbar (n-ter Frame im Bereich des Tags, ab 0, z. B. `walk_down/2`). |
 | `tags` | Animationen wie in Aseprite: ein Frame-Bereich `from`..`to` (Indizes, inklusive), `direction` = `forward` (Standard), `reverse`, `pingpong` (0 1 2 1) oder `pingpong_reverse` (2 1 0 1), `loop` (Standard `true`, sonst einmal abspielen), optional `color` für die Zeitleiste. Tags dürfen sich überlappen. |
 | `regions` | Benannte Bereiche (siehe unten). |
 | `cels` | Pixel je (Ebene, Frame): `layer` und `frame` sind Indizes. Entweder `rows` (genau `height` Zeichenketten mit je `width` Palettentasten) oder `link`: der Index eines anderen Frames, dessen Cel auf dieser Ebene geteilt wird. Fehlende Cels sind komplett transparent. |
+
+## Farbrampen
+
+Eine Farbrampe ist eine geordnete Reihe von Palettenfarben **von dunkel nach hell**, z. B. die Kruste des Toast-Kriegers `{"name": "Kruste", "keys": "b89a"}`. Das Werkzeug Schattieren (GUI) und `shade` (MCP) ersetzen eine Farbe durch ihren hellen oder dunklen Nachbarn in der Rampe.
+
+- `name`: frei, nicht leer, eindeutig im Dokument.
+- `keys`: die Palettentasten als Zeichenkette, dunkelste zuerst. Mindestens zwei, jede Taste muss in der Palette stehen und darf in einer Rampe nur einmal vorkommen; `.` ist nicht erlaubt. Eine Farbe darf in mehreren Rampen stehen, beim Schattieren gilt dann die erste.
+- Wird eine Farbe aus der Palette entfernt, verschwindet sie aus allen Rampen; eine Rampe mit nur noch einer Farbe fällt weg.
+- Ohne Rampen schreibt der Editor das Feld nicht. Ältere Dateien (ohne `ramps`) werden also unverändert gelesen und byte-gleich zurückgeschrieben; die Formatversion bleibt `1`. Ein älterer Editor ignoriert das Feld beim Lesen (und verliert es beim Speichern).
+- In `.aseprite`-Dateien werden Rampen nicht gespeichert.
 
 ## Verknüpfte Cels
 
@@ -96,7 +110,7 @@ Ebenen werden von unten nach oben mit ihrer Deckkraft übereinandergelegt (norma
 
 ## Regeln beim Laden
 
-Abgelehnt werden Dateien, bei denen Zeilenlänge oder Zeilenzahl nicht zur Größe passen, eine Taste nicht in der Palette steht, eine Taste doppelt definiert ist, ein Link auf einen fehlenden Frame zeigt oder ein Tag-Bereich nicht passt. Die Fehlermeldung nennt Ebene, Frame und Zeile.
+Abgelehnt werden Dateien, bei denen Zeilenlänge oder Zeilenzahl nicht zur Größe passen, eine Taste nicht in der Palette steht, eine Taste doppelt definiert ist, eine Rampe ungültig ist (siehe „Farbrampen“), ein Link auf einen fehlenden Frame zeigt oder ein Tag-Bereich nicht passt. Die Fehlermeldung nennt Ebene, Frame und Zeile.
 
 Ältere Dateien dieses Editors werden weiter gelesen: `"pingpong": true` wird zu `direction: "pingpong"`, eine Tag-Liste `"frames": [0, 1, 2]` wird zum Bereich 0..2 (nur zusammenhängende Listen; für Wiederholungen verknüpfte Frames nutzen).
 

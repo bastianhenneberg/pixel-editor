@@ -10,7 +10,7 @@ use super::{EditorApp, Tool};
 
 /// Tool groups: name and tools, the first one is the default.
 pub const GROUPS: [(&str, &[Tool]); 8] = [
-    ("Stift", &[Tool::Pencil]),
+    ("Stift", &[Tool::Pencil, Tool::Shade]),
     ("Radierer", &[Tool::Eraser]),
     ("Füllen", &[Tool::Fill]),
     ("Linie", &[Tool::Line]),
@@ -67,6 +67,15 @@ pub fn paint_tool_icon(p: &egui::Painter, r: Rect, t: Tool, c: Color32) {
         Tool::Pencil => {
             p.line_segment([at(3.0, 13.0), at(12.0, 4.0)], Stroke::new(3.0 * s, c));
             p.add(Shape::convex_polygon(vec![at(1.5, 14.5), at(4.0, 13.8), at(2.2, 12.0)], c, Stroke::NONE));
+        }
+        Tool::Shade => {
+            // a pencil over three steps of a ramp, dark to light
+            for (i, a) in [90u8, 160, 235].into_iter().enumerate() {
+                let col = Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), a);
+                p.rect_filled(Rect::from_min_size(at(1.0 + 4.0 * i as f32, 11.0), Vec2::new(4.0, 4.0) * s), 0.0, col);
+            }
+            p.line_segment([at(6.0, 9.0), at(13.0, 2.0)], Stroke::new(2.6 * s, c));
+            p.add(Shape::convex_polygon(vec![at(4.5, 10.5), at(6.8, 9.9), at(5.1, 8.2)], c, Stroke::NONE));
         }
         Tool::Eraser => {
             let body = vec![at(2.0, 10.0), at(8.0, 4.0), at(14.0, 8.0), at(8.0, 14.0)];

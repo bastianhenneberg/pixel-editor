@@ -20,6 +20,31 @@ struct Gesture {
     last: (i32, i32),
     key: u8,
     painted: usize,
+    /// Freehand tools: the stroke so far in canvas pixels (before wrapping
+    /// and symmetry), redrawn as a whole on every move, so Pixel-Perfect
+    /// can take back corners and shading changes each pixel once.
+    path: Vec<(i32, i32)>,
+    /// The cel before the stroke (what a taken-back pixel returns to).
+    base: Vec<u8>,
+    /// Image pixels the stroke has written so far.
+    written: Vec<(i32, i32)>,
+    /// Schattieren: +1 lighter (left button), -1 darker (right).
+    steps: i32,
+}
+
+impl Gesture {
+    fn new(start: (i32, i32), key: u8) -> Gesture {
+        Gesture {
+            start,
+            last: start,
+            key,
+            painted: 0,
+            path: vec![start],
+            base: Vec::new(),
+            written: Vec::new(),
+            steps: 0,
+        }
+    }
 }
 
 /// A running gesture of a selection tool. `base` is the selection before
@@ -580,17 +605,17 @@ impl EditorApp {
                         self.edit(desc, |d| d.set_points(layer, frame, &pts, key));
                     }
                 }
-                Tool::Pencil | Tool::Eraser => {
+                Tool::Pencil | Tool::Eraser | Tool::Shade => {
                     let key = if self.tool == Tool::Eraser { TRANSPARENT } else { key };
                     self.history.push(self.doc.clone(), "Stift");
-                    let pts = self.paint_points(vec![p]);
-                    if self.doc.set_points(layer, frame, &pts, key) > 0 {
-                        self.touch();
-                    }
-                    self.canvas.gesture = Some(Gesture { start: p, last: p, key, painted: 1 });
+                    let mut g = Gesture::new(p, key);
+                    g.base = self.doc.cel(layer, frame).to_vec();
+                    g.steps = if pointer.secondary_pressed() { -1 } else { 1 };
+                    self.canvas.gesture = Some(g);
+                    self.redraw_stroke();
                 }
                 Tool::Line | Tool::Rect | Tool::Ellipse => {
-                    self.canvas.gesture = Some(Gesture { start: p, last: p, key, painted: 0 });
+                    self.canvas.gesture = Some(Gesture::new(p, key));
                 }
                 _ => {}
             }
@@ -605,17 +630,10 @@ impl EditorApp {
         let down = pointer.primary_down() || pointer.secondary_down();
         if let Some(p) = pos {
             if down && p != g.last {
-                if matches!(self.tool, Tool::Pencil | Tool::Eraser) {
-                    let (from, key) = (g.last, g.key);
+                if matches!(self.tool, Tool::Pencil | Tool::Eraser | Tool::Shade) {
+                    g.path.extend(draw::line(g.last.0, g.last.1, p.0, p.1).into_iter().skip(1));
                     g.last = p;
-                    let pts = self.paint_points(draw::line(from.0, from.1, p.0, p.1));
-                    let n = self.doc.set_points(layer, frame, &pts, key);
-                    if let Some(g) = &mut self.canvas.gesture {
-                        g.painted += n;
-                    }
-                    if n > 0 {
-                        self.touch();
-                    }
+                    self.redraw_stroke();
                 } else {
                     g.last = p;
                 }
@@ -631,10 +649,11 @@ impl EditorApp {
                 Tool::Ellipse => draw::ellipse_in_box(s.0, s.1, e.0, e.1, filled),
                 _ => {
                     // stroke finished: one undo step with a description
-                    let what = if self.tool == Tool::Eraser {
-                        "Radierer".to_string()
-                    } else {
-                        format!("Stift {}", self.doc.key_label(g.key))
+                    let what = match self.tool {
+                        Tool::Eraser => "Radierer".to_string(),
+                        Tool::Shade if g.steps > 0 => "Schattieren heller".to_string(),
+                        Tool::Shade => "Schattieren dunkler".to_string(),
+                        _ => format!("Stift {}", self.doc.key_label(g.key)),
                     };
                     let desc = format!("{what}: {} Pixel · {}", g.painted, self.here());
                     self.history.describe_last(&desc);
@@ -648,6 +667,44 @@ impl EditorApp {
             let pts = self.paint_points(pts);
             let desc = format!("{} {} · {}", self.tool.label(), self.doc.key_label(g.key), self.here());
             self.edit(desc, |d| d.set_points(layer, frame, &pts, g.key));
+        }
+    }
+
+    /// Freehand tools: write the whole stroke again from the cel it started
+    /// on. With Pixel-Perfect (Stift, Radierer) the corner pixels of the
+    /// path's "L"s are left out, and pixels a corner had already painted
+    /// return to their color before the stroke. Wrapping (Kachel-Modus) and
+    /// symmetry apply to the cleaned path, so every copy is clean too.
+    /// Schattieren steps each pixel once from its color before the stroke.
+    fn redraw_stroke(&mut self) {
+        let (layer, frame, tool) = (self.layer, self.frame, self.tool);
+        let Some(g) = &self.canvas.gesture else { return };
+        let path =
+            if self.pixel_perfect && tool != Tool::Shade { draw::pixel_perfect(&g.path) } else { g.path.clone() };
+        let pts = self.paint_points(path);
+        let keep: std::collections::HashSet<(i32, i32)> = pts.iter().copied().collect();
+        let Some(g) = &mut self.canvas.gesture else { return };
+        let w = self.doc.width as i32;
+        let base = |(x, y): (i32, i32)| g.base[(y * w + x) as usize];
+        let mut changed = false;
+        for &p in &g.written {
+            if !keep.contains(&p) {
+                changed |= self.doc.set(layer, frame, p.0, p.1, base(p));
+            }
+        }
+        let mut painted = 0;
+        for &p in &pts {
+            let k = match tool {
+                Tool::Shade => self.doc.shade_key(base(p), g.steps).unwrap_or(base(p)),
+                _ => g.key,
+            };
+            changed |= self.doc.set(layer, frame, p.0, p.1, k);
+            painted += usize::from(k != base(p));
+        }
+        g.painted = painted;
+        g.written = pts;
+        if changed {
+            self.touch();
         }
     }
 

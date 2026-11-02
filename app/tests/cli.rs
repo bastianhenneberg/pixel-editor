@@ -163,3 +163,41 @@ fn world_txt_and_tilemap_cli() {
     assert!(out.contains("tiles_atlas.png"), "{out}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+/// The real binary as MCP server over stdio: ramps and shading end to end.
+#[test]
+fn mcp_server_shades_along_a_ramp() {
+    use std::io::Write;
+    let dir = std::env::temp_dir().join(format!("pxe-cli-shade-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let doc = r##"{"version":1,"width":4,"height":1,"palette":[{"key":"b","color":"#64280e"},
+        {"key":"8","color":"#b76010"},{"key":"9","color":"#ebb056"},{"key":"0","color":"#000000"}],
+        "layers":[{"name":"l"}],"frames":[{"name":"a"}],"cels":[{"layer":0,"frame":0,"rows":["b890"]}]}"##;
+    std::fs::write(dir.join("t.pxe.json"), doc).unwrap();
+    let calls = [
+        r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"clientInfo":{"name":"claude-code"}}}"#,
+        r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"set_ramps","arguments":{"path":"t","ramps":[{"name":"Kruste","keys":"b89"}]}}}"#,
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"shade","arguments":{"path":"t","layer":0,"frame":0,"rect":{"x":0,"y":0,"w":4,"h":1},"steps":1}}}"#,
+    ];
+    let mut child = Command::new(env!("CARGO_BIN_EXE_pixel-editor"))
+        .args(["mcp", dir.to_str().unwrap()])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all((calls.join("\n") + "\n").as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Kruste: b > 8 > 9") && text.contains("2 pixels changed"), "{text}");
+    let saved = std::fs::read_to_string(dir.join("t.pxe.json")).unwrap();
+    assert!(
+        saved.contains(
+            r#""ramps": [
+    {"name": "Kruste", "keys": "b89"}
+  ],"#
+        ) && saved.contains(r#""8990""#),
+        "{saved}"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}

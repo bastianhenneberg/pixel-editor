@@ -2805,3 +2805,267 @@ fn tilemap_screenshot_of_the_world() {
     eprintln!("saved {}", shot.display());
     std::fs::remove_dir_all(&dir).unwrap();
 }
+
+// ---- Pixel-Perfect and shading ------------------------------------------------
+
+/// A freehand stroke that visits the canvas pixels `pts` one after another.
+fn stroke(h: &mut Harness<'_, EditorApp>, pts: &[(i32, i32)], button: PointerButton) {
+    let a = px_center(h, pts[0].0, pts[0].1);
+    h.hover_at(a);
+    h.step();
+    press_btn(h, a, button, true);
+    h.step();
+    for &(x, y) in &pts[1..] {
+        h.hover_at(px_center(h, x, y));
+        h.step();
+    }
+    let b = px_center(h, pts[pts.len() - 1].0, pts[pts.len() - 1].1);
+    press_btn(h, b, button, false);
+    h.step();
+}
+
+/// A hand moving right, down, right, down ...: each step is an "L".
+fn staircase(x: i32, y: i32, n: i32) -> Vec<(i32, i32)> {
+    let mut v = vec![(x, y)];
+    for i in 0..n {
+        v.push((x + i + 1, y + i));
+        v.push((x + i + 1, y + i + 1));
+    }
+    v
+}
+
+/// The ramp buttons share their labels with others further right.
+fn leftmost<'a>(h: &'a Harness<'_, EditorApp>, label: &'a str) -> egui_kittest::Node<'a> {
+    h.get_all_by_label(label).min_by(|a, b| a.rect().min.x.total_cmp(&b.rect().min.x)).unwrap()
+}
+
+fn doc_app(w: u32, h: u32) -> EditorApp {
+    let mut app = EditorApp::new(None);
+    app.doc = Document::new(w, h, Document::builtin_palette("sweetie16").unwrap()).unwrap();
+    app
+}
+
+#[test]
+fn pixel_perfect_pencil_and_eraser() {
+    let _gpu = gpu_lock();
+    let mut h = harness(doc_app(24, 16));
+    h.run_steps(3);
+    assert!(h.state().pixel_perfect, "on by default");
+    let get = |h: &Harness<'_, EditorApp>, x: i32, y: i32| h.state().doc.get(0, 0, x, y);
+    h.state_mut().color = b'2';
+    // a pixel under a future corner keeps its color
+    h.state_mut().doc.set(0, 0, 2, 1, b'9');
+    stroke(&mut h, &staircase(1, 1, 4), PointerButton::Primary);
+    for i in 0..5 {
+        assert_eq!(get(&h, 1 + i, 1 + i), b'2', "diagonal ({}, {})", 1 + i, 1 + i);
+    }
+    assert_eq!(get(&h, 2, 1), b'9', "corner taken back to its old color");
+    for i in 1..4 {
+        assert_eq!(get(&h, 2 + i, 1 + i), TRANSPARENT, "no L corner at ({}, {})", 2 + i, 1 + i);
+    }
+    let steps = h.state().history.undo_steps().len();
+    assert!(h.state().history.undo_steps().last().unwrap().contains("Stift 2"));
+    // the same stroke without Pixel-Perfect keeps the corners
+    h.state_mut().pixel_perfect = false;
+    stroke(&mut h, &staircase(12, 1, 4), PointerButton::Primary);
+    for i in 0..4 {
+        assert_eq!((get(&h, 13 + i, 1 + i), get(&h, 13 + i, 2 + i)), (b'2', b'2'));
+    }
+    assert_eq!(h.state().history.undo_steps().len(), steps + 1, "one undo step per stroke");
+    // the eraser cleans its strokes too: on a filled block it leaves the corners standing
+    h.state_mut().pixel_perfect = true;
+    h.state_mut().doc.set_points(0, 0, &pixel_core::draw::rect(0, 8, 9, 15, true), b'5');
+    h.key_press(egui::Key::E);
+    h.step();
+    stroke(&mut h, &staircase(1, 9, 4), PointerButton::Primary);
+    assert_eq!((get(&h, 1, 9), get(&h, 3, 11), get(&h, 5, 13)), (TRANSPARENT, TRANSPARENT, TRANSPARENT));
+    assert_eq!((get(&h, 2, 9), get(&h, 3, 10), get(&h, 4, 11)), (b'5', b'5', b'5'));
+    // undo takes the whole stroke back
+    h.state_mut().undo();
+    assert_eq!(get(&h, 3, 11), b'5');
+}
+
+#[test]
+fn pixel_perfect_with_symmetry_and_tiles() {
+    use super::tiled::TileMode;
+    use super::transform::{SymMode, Symmetry};
+    let _gpu = gpu_lock();
+    let mut h = harness(doc_app(16, 16));
+    h.run_steps(3);
+    let get = |h: &Harness<'_, EditorApp>, x: i32, y: i32| h.state().doc.get(0, 0, x, y);
+    h.state_mut().color = b'2';
+    // symmetry: the mirrored stroke is just as clean
+    h.state_mut().symmetry = Symmetry { mode: SymMode::Vertical, x2: None, y2: None };
+    stroke(&mut h, &staircase(1, 1, 3), PointerButton::Primary);
+    for i in 0..4 {
+        assert_eq!((get(&h, 1 + i, 1 + i), get(&h, 14 - i, 1 + i)), (b'2', b'2'), "step {i}");
+    }
+    for i in 0..3 {
+        assert_eq!((get(&h, 2 + i, 1 + i), get(&h, 13 - i, 1 + i)), (TRANSPARENT, TRANSPARENT), "corner {i}");
+    }
+    h.state_mut().symmetry.mode = SymMode::Off;
+    // Kachel-Modus: a stroke over the right edge, cleaned across the wrap
+    h.state_mut().tile_mode = TileMode::Both;
+    h.state_mut().fit_pending = true;
+    h.run_steps(3);
+    stroke(&mut h, &staircase(13, 8, 4), PointerButton::Primary);
+    // canvas (13,8) (14,9) (15,10) (16,11) (17,12) -> image x 13 14 15 0 1
+    for (x, y) in [(13, 8), (14, 9), (15, 10), (0, 11), (1, 12)] {
+        assert_eq!(get(&h, x, y), b'2', "({x}, {y})");
+    }
+    for (x, y) in [(14, 8), (15, 9), (0, 10), (1, 11)] {
+        assert_eq!(get(&h, x, y), TRANSPARENT, "corner ({x}, {y})");
+    }
+}
+
+#[test]
+fn ramps_from_the_palette_and_shading() {
+    let _gpu = gpu_lock();
+    let mut h = harness(doc_app(8, 4));
+    h.run_steps(3);
+    let get = |h: &Harness<'_, EditorApp>, y: usize| h.state().doc.rows(0, 0)[y].clone();
+    h.key_press(egui::Key::D);
+    h.step();
+    assert_eq!(h.state().tool, Tool::Shade);
+    h.run_steps(2);
+    let _ = h.get_by_label_contains("Noch keine Farbrampe");
+    // Strg+Klick order 3 9 8 a: a ramp in that order
+    h.state_mut().ramp_pick = b"398a".to_vec();
+    h.run_steps(2);
+    h.get_by_label("Rampe anlegen (4 Farben)").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.ramps, vec![pixel_core::Ramp::new("Rampe 1", b"398a")]);
+    assert!(h.state().ramp_pick.is_empty());
+    // reorder: 9 one place lighter -> 3 8 9 a
+    h.state_mut().color = b'9';
+    h.run_steps(2);
+    leftmost(&h, ">").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.ramps[0].keys, b"389a");
+    assert!(h.state().history.undo_steps().last().unwrap().contains("umsortiert"));
+    h.state_mut().doc.set_rows(0, 0, 0, 0, &["3389a1..".into(), "3389a1..".into()]).unwrap();
+    // left drag there and back: each pixel one step lighter, once; 1 and '.' stay
+    stroke(&mut h, &[(0, 0), (7, 0), (0, 0)], PointerButton::Primary);
+    assert_eq!(get(&h, 0), "889aa1..");
+    assert!(h.state().history.undo_steps().last().unwrap().contains("Schattieren heller: 4 Pixel"));
+    // right drag: darker
+    stroke(&mut h, &[(0, 1), (7, 1)], PointerButton::Secondary);
+    assert_eq!(get(&h, 1), "333891..");
+    assert!(h.state().history.undo_steps().last().unwrap().contains("Schattieren dunkler: 3 Pixel"));
+    // delete the ramp: shading changes nothing any more
+    leftmost(&h, "×").click();
+    h.run_steps(2);
+    assert!(h.state().doc.ramps.is_empty());
+    stroke(&mut h, &[(0, 0), (7, 0)], PointerButton::Primary);
+    assert_eq!(get(&h, 0), "889aa1..");
+    // undo brings the ramp back
+    h.state_mut().undo();
+    assert_eq!(h.state().doc.ramps.len(), 1);
+}
+
+/// A quarter circle as a hand moves the mouse: one pixel right or down at a
+/// time, so every bend is an "L" (canvas pixels from `(x, y)`).
+fn hand_arc(x: i32, y: i32, r: i32) -> Vec<(i32, i32)> {
+    let mut pts = vec![(x, y)];
+    let (mut cx, mut cy) = (0, 0);
+    for i in 1..=24 {
+        let a = std::f64::consts::FRAC_PI_2 * i as f64 / 24.0;
+        let (tx, ty) = ((r as f64 * a.sin()).round() as i32, (r as f64 * (1.0 - a.cos())).round() as i32);
+        while (cx, cy) != (tx, ty) {
+            if cx < tx {
+                cx += 1;
+            } else {
+                cy += 1;
+            }
+            pts.push((x + cx, y + cy));
+        }
+    }
+    pts
+}
+
+/// `target/pixelperfect-compare.png`: the same freehand curve with
+/// Pixel-Perfect (left) and without (right).
+#[test]
+fn pixel_perfect_compare_screenshot() {
+    let _gpu = gpu_lock();
+    let mut app = doc_app(40, 20);
+    app.preview.settings.open = false; // it would sit over the right curve
+    let mut h = harness(app);
+    h.run_steps(3);
+    h.state_mut().color = b'0';
+    let arc = hand_arc(2, 2, 15);
+    stroke(&mut h, &arc, PointerButton::Primary);
+    h.state_mut().pixel_perfect = false;
+    let right: Vec<(i32, i32)> = arc.iter().map(|&(x, y)| (x + 21, y)).collect();
+    stroke(&mut h, &right, PointerButton::Primary);
+    let count = |h: &Harness<'_, EditorApp>, x0: i32| {
+        (0..20)
+            .flat_map(|y| (x0..x0 + 20).map(move |x| (x, y)))
+            .filter(|&(x, y)| h.state().doc.get(0, 0, x, y) != TRANSPARENT)
+            .count()
+    };
+    let (clean, raw) = (count(&h, 0), count(&h, 20));
+    assert_eq!(raw, arc.len());
+    assert!(clean < raw, "{clean} vs {raw}");
+    h.state_mut().pixel_perfect = true;
+    h.state_mut().status = format!("links Pixel-Perfect: {clean} Pixel · rechts ohne: {raw} Pixel");
+    h.hover_at(px_center(&h, 20, 19));
+    h.run_steps(3);
+    let shot = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/pixelperfect-compare.png");
+    h.render().unwrap().save(&shot).unwrap();
+    eprintln!("saved {}", shot.display());
+}
+
+/// `target/shading-screenshot.png`: a COPY of toast_warrior/walk_side, the
+/// crust ramp made in the palette, part of the crust shaded.
+#[test]
+fn shading_screenshot_of_the_toast() {
+    let _gpu = gpu_lock();
+    let src =
+        std::path::Path::new(env!("HOME")).join("Development/pixelart-studio/art/toast_warrior/walk_side.pxe.json");
+    let Ok(doc) = io::load(&src) else {
+        eprintln!("walk_side not found, no screenshot");
+        return;
+    };
+    let dir = scratch_dir("shading");
+    let path = dir.join("walk_side.pxe.json");
+    io::save(&doc, &path).unwrap(); // a copy: the original stays untouched
+    let mut app = EditorApp::new(Some(path.clone()));
+    app.preview.settings.open = false; // it would cover the shaded crust
+    let mut h = harness(app);
+    h.run_steps(3);
+    h.key_press(egui::Key::D);
+    h.step();
+    // the crust from dark to light, picked with Strg+Klick, then named
+    h.state_mut().ramp_pick = b"b89a".to_vec();
+    h.run_steps(2);
+    h.get_by_label("Rampe anlegen (4 Farben)").click();
+    h.run_steps(2);
+    h.state_mut().ramp_rename = Some((0, "Kruste".into()));
+    h.run_steps(2);
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    h.state_mut().ramp_pick = b"321c".to_vec();
+    h.run_steps(2);
+    h.get_by_label("Rampe anlegen (4 Farben)").click();
+    h.run_steps(2);
+    assert_eq!(h.state().doc.ramps[0], pixel_core::Ramp::new("Kruste", b"b89a"));
+    let before = h.state().doc.clone();
+    // darker along the bottom crust, lighter over the top-left crust
+    stroke(&mut h, &[(16, 35), (33, 35)], PointerButton::Secondary);
+    stroke(&mut h, &[(13, 14), (20, 14), (13, 15), (20, 15), (12, 16), (15, 16)], PointerButton::Primary);
+    let d = &h.state().doc;
+    assert_eq!((before.get(0, 0, 20, 35), d.get(0, 0, 20, 35)), (b'8', b'b'));
+    assert_eq!((before.get(0, 0, 14, 15), d.get(0, 0, 14, 15)), (b'8', b'9'));
+    assert_eq!((before.get(0, 0, 15, 15), d.get(0, 0, 15, 15)), (b'9', b'a'));
+    assert_eq!(d.get(0, 0, 13, 14), b'0', "the outline is in no ramp and stays");
+    assert_eq!(d.get(0, 1, 20, 35), before.get(0, 1, 20, 35), "other frames untouched");
+    h.state_mut().color = b'9';
+    h.hover_at(px_center(&h, 30, 15));
+    h.run_steps(3);
+    let shot = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../target/shading-screenshot.png");
+    h.render().unwrap().save(&shot).unwrap();
+    eprintln!("saved {}", shot.display());
+    assert_eq!(io::load(&src).unwrap(), doc, "original unchanged");
+    std::fs::remove_dir_all(&dir).unwrap();
+}

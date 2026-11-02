@@ -66,6 +66,8 @@ fn protocol_and_tools() {
         "transform (op flip_h",
         "tiled: true",
         "check_seams",
+        "set_ramps",
+        "shade(pixels|rect|region",
     ] {
         assert!(instructions.contains(part), "instructions lack {part:?}: {instructions}");
     }
@@ -112,6 +114,8 @@ fn protocol_and_tools() {
         "transform",
         "mirror_document",
         "check_seams",
+        "set_ramps",
+        "shade",
     ] {
         assert!(names.contains(&required), "missing tool {required}");
     }
@@ -127,6 +131,70 @@ fn protocol_and_tools() {
     let doc = load(&dir, "hero.pxe.json");
     assert_eq!(doc.rows(0, 0)[1], ".22.....");
     assert_eq!(doc.rows(0, 1)[7], "99999999");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn ramps_and_shading() {
+    let (s, dir) = server("shade");
+    ok(&s, "create_document", json!({"name": "toast", "width": 6, "height": 2}));
+    ok(&s, "set_palette_color", json!({"path": "toast", "key": "3", "name": "crust_dark"}));
+    let e = err(
+        &s,
+        "shade",
+        json!({"path": "toast", "layer": 0, "frame": 0, "rect": {"x": 0, "y": 0, "w": 1, "h": 1}, "steps": 1}),
+    );
+    assert!(e.contains("set_ramps first"), "{e}");
+    // keys as a string or as names; checked against the palette
+    let e = err(&s, "set_ramps", json!({"path": "toast", "ramps": [{"name": "crust", "keys": "38Z"}]}));
+    assert!(e.contains("ramps[0]") && e.contains("valid keys"), "{e}");
+    let t = ok(
+        &s,
+        "set_ramps",
+        json!({"path": "toast", "ramps": [{"name": "crust", "keys": ["crust_dark", "8", "9", "a"]}, {"name": "leaf", "keys": "56"}]}),
+    );
+    assert!(
+        t.contains("crust: 3 crust_dark > 8 > 9 > a") && t.contains("ramps [] -> [\"crust 389a\", \"leaf 56\"]"),
+        "{t}"
+    );
+    let t = ok(&s, "get_document", json!({"path": "toast"}));
+    assert!(t.contains("color ramps (dark > light") && t.contains("leaf: 5 > 6"), "{t}");
+    ok(&s, "set_rows", json!({"path": "toast", "layer": 0, "frame": 0, "rows": ["3389a1", "5.6..."]}));
+    // a rect: every ramp pixel one step lighter, 1 and '.' stay, a is at the end
+    let t = ok(
+        &s,
+        "shade",
+        json!({"path": "toast", "layer": 0, "frame": 0, "rect": {"x": 0, "y": 0, "w": 6, "h": 2}, "steps": 1, "dry_run": true}),
+    );
+    assert!(t.starts_with("DRY RUN") && t.contains("5 pixels changed"), "{t}");
+    let t = ok(
+        &s,
+        "shade",
+        json!({"path": "toast", "layer": 0, "frame": 0, "rect": {"x": 0, "y": 0, "w": 6, "h": 2}, "steps": 1}),
+    );
+    assert!(t.contains("5 pixels changed") && t.contains("not in any ramp"), "{t}");
+    assert_eq!(load(&dir, "toast.pxe.json").rows(0, 0), vec!["889aa1", "6.6..."]);
+    // single pixels, darker; a pixel listed twice changes once
+    let t = ok(
+        &s,
+        "shade",
+        json!({"path": "toast", "layer": 0, "frame": 0, "steps": -2, "pixels": [{"x": 3, "y": 0}, {"x": 3, "y": 0}, {"x": 5, "y": 0}]}),
+    );
+    assert!(t.contains("1 pixels changed") && t.contains("Claude: shade f0 Ebene 1"), "{t}");
+    assert_eq!(load(&dir, "toast.pxe.json").rows(0, 0)[0], "8898a1");
+    assert!(err(&s, "shade", json!({"path": "toast", "layer": 0, "frame": 0, "steps": 1})).contains("give pixels"));
+    assert!(err(&s, "shade", json!({"path": "toast", "layer": 0, "frame": 0, "steps": 0, "pixels": []}))
+        .contains("not be 0"));
+    // undo takes back the last shade; removing a palette color shortens its ramp
+    ok(&s, "undo", json!({"path": "toast"}));
+    assert_eq!(load(&dir, "toast.pxe.json").rows(0, 0)[0], "889aa1");
+    ok(&s, "set_palette_color", json!({"path": "toast", "key": "6", "remove": true}));
+    assert_eq!(load(&dir, "toast.pxe.json").ramps.len(), 1, "leaf lost a color and is gone");
+    // .aseprite has no place for ramps
+    let t = ok(&s, "save_as", json!({"path": "toast", "to": "toast.aseprite"}));
+    assert!(t.contains("1 color ramp(s) are not stored"), "{t}");
+    let e = err(&s, "set_ramps", json!({"path": "toast.aseprite", "ramps": []}));
+    assert!(e.contains(".pxe.json only"), "{e}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

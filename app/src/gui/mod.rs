@@ -28,6 +28,8 @@ use select::Selection;
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Tool {
     Pencil,
+    /// Shading: left steps a pixel one color lighter along its ramp, right darker.
+    Shade,
     Eraser,
     Fill,
     Line,
@@ -47,8 +49,9 @@ pub enum Tool {
 }
 
 impl Tool {
-    pub const ALL: [Tool; 12] = [
+    pub const ALL: [Tool; 13] = [
         Tool::Pencil,
+        Tool::Shade,
         Tool::Eraser,
         Tool::Fill,
         Tool::Line,
@@ -65,6 +68,7 @@ impl Tool {
     pub fn label(self) -> &'static str {
         match self {
             Tool::Pencil => "Stift",
+            Tool::Shade => "Schattieren",
             Tool::Eraser => "Radierer",
             Tool::Fill => "Füllen",
             Tool::Line => "Linie",
@@ -83,6 +87,7 @@ impl Tool {
     pub fn key(self) -> (Key, bool) {
         match self {
             Tool::Pencil => (Key::B, false),
+            Tool::Shade => (Key::D, false),
             Tool::Eraser => (Key::E, false),
             Tool::Fill => (Key::G, false),
             Tool::Line => (Key::L, false),
@@ -196,6 +201,13 @@ pub struct EditorApp {
     tool: Tool,
     color: u8,
     filled: bool,
+    /// Stift/Radierer: drop the corner pixel of every "L" in a freehand
+    /// stroke (as Aseprite's Pixel-Perfect), kept in the settings.
+    pixel_perfect: bool,
+    /// Palette colors marked with Strg+Klick for a new ramp, in click order.
+    ramp_pick: Vec<u8>,
+    /// The ramp whose name is being edited, and the draft.
+    ramp_rename: Option<(usize, String)>,
     layer: usize,
     frame: usize,
     /// Frame the right panel shows: the current frame, but frozen while
@@ -317,6 +329,9 @@ impl EditorApp {
             rev: 0,
             tool: Tool::Pencil,
             filled: false,
+            pixel_perfect: true,
+            ramp_pick: Vec::new(),
+            ramp_rename: None,
             layer: 0,
             frame: 0,
             panel_frame: 0,
@@ -383,7 +398,12 @@ impl EditorApp {
                 open_tabs.insert(key, paths);
             }
         }
-        settings::Settings { preview: self.preview.settings.clone(), open_tabs, tile_modes: self.tile_memory.clone() }
+        settings::Settings {
+            preview: self.preview.settings.clone(),
+            open_tabs,
+            tile_modes: self.tile_memory.clone(),
+            pixel_perfect: self.pixel_perfect,
+        }
     }
 
     /// Load settings from `path` and save changes there from now on.
@@ -397,6 +417,7 @@ impl EditorApp {
         self.preview.settings = s.preview.clone();
         self.preview.settings.scale = s.preview.scale.clamp(1, 3);
         self.tile_memory = s.tile_modes.clone();
+        self.pixel_perfect = s.pixel_perfect;
         self.saved_settings = s.clone();
     }
 
@@ -620,6 +641,9 @@ impl EditorApp {
                 self.external_conflict = false;
                 self.disk_mtime = mtime(&path);
                 self.status = format!("Gespeichert: {}", path.display());
+                if !self.doc.ramps.is_empty() && pixel_core::aseprite::is_aseprite_path(&path) {
+                    self.status += " · Farbrampen stehen nur in .pxe.json, nicht in .aseprite";
+                }
             }
             Err(e) => self.status = format!("Fehler beim Speichern: {e}"),
         }

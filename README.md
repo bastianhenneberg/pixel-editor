@@ -58,7 +58,7 @@ Der Editor prüft Datei und Journal etwa alle 100 ms und spielt jede neue Änder
 
 ## Werkzeugleiste
 
-Links steht eine Symbolleiste mit Werkzeuggruppen wie in Photoshop: Stift, Radierer, Füllen, Linie, **Formen** (Rechteck, Ellipse), Pipette, **Auswahl-Werkzeuge** (Auswahl, Auswahl-Pinsel, Zauberstab, Lasso) und KI zeigen. Jeder Knopf zeigt das zuletzt benutzte Werkzeug seiner Gruppe; ein kleines Dreieck unten rechts heißt, dass die Gruppe mehr enthält. Klick wählt das gezeigte Werkzeug. **Rechtsklick, langes Drücken oder Klick auf das Dreieck** klappt die Gruppe auf (Symbol, Name, Kürzel); ein Klick daneben oder Esc schließt sie. Der Tooltip nennt Name und Kürzel. Darunter stehen Name und Kürzel des aktiven Werkzeugs, seine Hinweise und Einstellungen (gefüllt, Symmetrie mit Achsen, Ablegen vorne/hinten, Zauberstab-Modus, Markierungsknöpfe). Das Menü **Werkzeuge** ist genauso gruppiert (Untermenüs „Formen“ und „Auswahl-Werkzeuge“).
+Links steht eine Symbolleiste mit Werkzeuggruppen wie in Photoshop: **Stift** (Stift, Schattieren), Radierer, Füllen, Linie, **Formen** (Rechteck, Ellipse), Pipette, **Auswahl-Werkzeuge** (Auswahl, Auswahl-Pinsel, Zauberstab, Lasso) und KI zeigen. Jeder Knopf zeigt das zuletzt benutzte Werkzeug seiner Gruppe; ein kleines Dreieck unten rechts heißt, dass die Gruppe mehr enthält. Klick wählt das gezeigte Werkzeug. **Rechtsklick, langes Drücken oder Klick auf das Dreieck** klappt die Gruppe auf (Symbol, Name, Kürzel); ein Klick daneben oder Esc schließt sie. Der Tooltip nennt Name und Kürzel. Darunter stehen Name und Kürzel des aktiven Werkzeugs, seine Hinweise und Einstellungen (gefüllt, Symmetrie mit Achsen, Ablegen vorne/hinten, Zauberstab-Modus, Markierungsknöpfe). Das Menü **Werkzeuge** ist genauso gruppiert (Untermenüs „Formen“ und „Auswahl-Werkzeuge“).
 
 ## Auswählen und Verschieben
 
@@ -142,6 +142,19 @@ Ein nicht quadratischer Bereich, um 90° gedreht, belegt das gedrehte Rechteck a
 
 **Symmetrisch zeichnen** (Werkzeugfeld bei Stift, Radierer, Füllen, Linie, Rechteck, Ellipse; Menü Bild; **Alt+S** schaltet Aus → Vertikal → Horizontal → Beide): jeder Strich, jede Form und jede Füllung wird an der vertikalen Achse (links/rechts), der horizontalen (oben/unten) oder an beiden gespiegelt, auch in der Vorschau beim Ziehen. Die Achsen liegen zuerst in der Leinwandmitte und erscheinen als gestrichelte Linien. Verschieben: am dreieckigen Griff über (vertikale Achse) bzw. links neben der Leinwand (horizontale Achse) ziehen, oder die Zahl im Werkzeugfeld eingeben (in halben Pixeln: `12` liegt auf einer Pixelkante, `12.5` geht durch die Pixelmitte). „Mitte“ setzt sie zurück. Die Einstellung gilt je Tab.
 
+## Saubere Linien und Schattieren
+
+**Pixel-Perfect** (Werkzeugfeld bei Stift und Radierer, standardmäßig an, gemerkt in `~/.config/pixel-editor/settings.json`): Wie in Aseprite entfernt der Editor beim Freihandzeichnen die doppelten Eckpixel. Wo der Strich ein „L“ macht (ein Pixel berührt seinen Vorgänger und Nachfolger gerade, diese beiden einander aber nur schräg), bleibt die Ecke weg; ein Pixel, das die Ecke schon gemalt hatte, bekommt seine Farbe von vor dem Strich zurück. Linien und Kurven bleiben so 1 Pixel dünn. Mit Symmetrie und im Kachel-Modus gilt das für alle Kopien, weil erst der Strich bereinigt und dann gespiegelt bzw. gewrappt wird. Linie, Rechteck und Ellipse betrifft die Option nicht (die sind ohnehin sauber).
+
+**Farbrampen**: geordnete Reihen von Palettenfarben, von dunkel nach hell (z. B. Kruste `b 8 9 a`). Sie stehen im Dokument (siehe FORMAT.md) und als Reihen über der Palette:
+- **Anlegen**: Farben in der Palette mit **Strg+Klick** markieren, in der Reihenfolge dunkel → hell (eine kleine Nummer zeigt die Reihenfolge, nochmal Strg+Klick nimmt eine heraus), dann „Rampe anlegen (n Farben)“. Sie heißt erst „Rampe 1“; **Doppelklick auf den Namen** benennt sie um (Enter).
+- **Umsortieren**: Klick auf eine Farbe der Reihe wählt sie; `<` / `>` schieben die aktuelle Farbe eine Stelle dunkler / heller, „hell“ sortiert die ganze Rampe nach Helligkeit. `+` hängt die aktuelle Farbe hell an, `-` nimmt sie heraus.
+- **Löschen**: `×` (die Farben bleiben in der Palette). Wird eine Palettenfarbe entfernt, verschwindet sie auch aus ihren Rampen. Alles ist ein Schritt im Verlauf (Strg+Z).
+
+**Schattieren** (Werkzeug in der Stift-Gruppe, Taste **D**): Klick oder Ziehen ersetzt jedes Pixel durch die nächsthellere Farbe seiner Rampe, die **rechte Maustaste** durch die nächstdunklere. Am Ende der Rampe bleibt die Farbe stehen. Pixel, deren Farbe in keiner Rampe liegt (z. B. die Kontur oder Transparenz), bleiben unverändert. In einem Strich ändert sich jedes Pixel nur einmal, auch wenn man mehrmals darüberfährt; für eine zweite Stufe setzt man neu an. Symmetrie, Kachel-Modus, Auswahl und gesperrte Regionen wirken wie beim Stift. Liegt eine Farbe in mehreren Rampen, gilt die erste.
+
+Für Claude: `set_ramps` legt die Rampen fest, `get_document` zeigt sie, `shade` schattiert Pixel, ein Rechteck oder eine Region (siehe Werkzeuge).
+
 ## Kachel-Modus (Tiles nahtlos zeichnen)
 
 Wie der „Tiled Mode“ von Aseprite: Die Leinwand zeigt das Bild wiederholt, damit man beim Zeichnen sieht, ob ein Tile nahtlos kachelt.
@@ -220,7 +233,7 @@ Tastenkürzel (soweit sinnvoll wie in Aseprite):
 
 | Taste / Maus | Funktion |
 |---|---|
-| B / E / G / I / L / U / Umschalt+U / M / Umschalt+M / W / Q / K | Stift / Radierer / Füllen / Pipette / Linie / Rechteck / Ellipse / Auswahl / Auswahl-Pinsel / Zauberstab / Lasso / KI zeigen (auch im Menü Werkzeuge) |
+| B / D / E / G / I / L / U / Umschalt+U / M / Umschalt+M / W / Q / K | Stift / Schattieren / Radierer / Füllen / Pipette / Linie / Rechteck / Ellipse / Auswahl / Auswahl-Pinsel / Zauberstab / Lasso / KI zeigen (auch im Menü Werkzeuge) |
 | Auswahl (M): ziehen | Rechteck auswählen; in der Auswahl ziehen oder Pfeiltasten (Umschalt = 8 px) verschieben die Pixel; Enter legt ab, Esc bricht ab |
 | Auswahl-Pinsel (Umschalt+M) | Klicken oder Ziehen malt einzelne Pixel in die Auswahl; Alt/Strg+Klick oder Ziehen mit der rechten Taste nimmt sie heraus; Rechtsklick ohne Ziehen öffnet das Auswahl-Menü |
 | Zauberstab (W) | Klick wählt die zusammenhängende Fläche gleicher Farbe auf der Ebene (4 Nachbarn); Schalter „alle gleichfarbigen“ im Werkzeugfeld und im Menü Werkzeuge; in der Auswahl ziehen verschiebt sie |
@@ -233,7 +246,8 @@ Tastenkürzel (soweit sinnvoll wie in Aseprite):
 | Strg+C / Strg+X / Strg+V | Auswahl kopieren / ausschneiden / einfügen (schwebend, verschiebbar, Enter legt ab) |
 | Strg+A / Strg+D / Strg+Umschalt+I / Entf | alles auswählen / Auswahl aufheben / Auswahl umkehren / Auswahl löschen (auch im Menü Auswahl und per Rechtsklick auf die Leinwand) |
 | Linksklick | mit der gewählten Farbe zeichnen |
-| Rechtsklick | mit Transparenz zeichnen (bei jedem Werkzeug) |
+| Rechtsklick | mit Transparenz zeichnen (bei jedem Malwerkzeug); beim Schattieren eine Stufe dunkler |
+| Strg+Klick auf eine Palettenfarbe | für eine neue Farbrampe markieren (siehe „Saubere Linien und Schattieren“) |
 | Alt + Klick | Farbe aufnehmen |
 | Mausrad | zoomen in ganzen Stufen, um den Mauszeiger herum |
 | Mittlere Maustaste / Leertaste + ziehen | verschieben |
@@ -255,7 +269,7 @@ Tastenkürzel (soweit sinnvoll wie in Aseprite):
 - **Neu** bietet die Vorlagen Figur 48×48, Tile 32×32 und 16×16 (diese mit Kachel-Modus) sowie eine eingebaute Palette.
 - **Zeitleisten-Leiste**: Abspielen, Animation (Tag) wählen, Onion Skin, Vorschaubilder; Frame: `+ Neu` (Kopie), `+ Leer`, `+ Verknüpft` (neuer Frame mit verknüpften Cels), Löschen, `<`/`>` verschieben; Ebene: Neu, Löschen, Hoch, Runter.
 - **Eigenschaften**: Ebene (Name, sichtbar, gesperrt, Deckkraft), Frame (Name, Dauer, „für alle“, gesperrt, Status der Cel: leer, eigenständig oder verknüpft mit Frames …, „Verknüpfung lösen“, „Mit vorherigem Frame verknüpfen“), Tag (Name, Bereich, Richtung, Loop, Farbe; „Übernehmen“, „Löschen“, „Neu“; **Folge** für eine beliebige Reihenfolge wie `0 1 0 2`, angelegt als verknüpfte Frames, damit der Tag ein Bereich bleibt wie in Aseprite), Regionen (Liste mit Rechteck im aktuellen Frame, Sperre, Löschen; Klick übernimmt sie als Auswahl; neue Region aus der Auswahl, auf Wunsch nur für diesen Frame), Verlauf (Schritte mit Beschreibung, Rückgängig/Wiederholen, Schnappschüsse).
-- **Palette**: Klick wählt, Name der Farbe, Farbe ändern (Farbwähler oder Hex-Feld), „+ Farbe“, „Entfernen“ (betroffene Pixel werden transparent). Tooltips zeigen Taste, Name und Farbwert.
+- **Palette**: darüber die Farbrampen (siehe oben). Klick wählt, Strg+Klick markiert für eine Rampe, Name der Farbe, Farbe ändern (Farbwähler oder Hex-Feld), „+ Farbe“, „Entfernen“ (betroffene Pixel werden transparent). Tooltips zeigen Taste, Name und Farbwert.
 - **Öffnen/Speichern** nutzt den Dateidialog des Systems (xdg-portal) für `.pxe.json` und `.aseprite`. Ohne Portal oder bei Abbruch erscheint ein eigener Pfad-Dialog.
 - **Live-Neuladen**: etwa alle 0,3 s. Ein Neuladen lässt sich mit Strg+Z zurücknehmen. Bei ungespeicherten eigenen Änderungen wird nichts überschrieben, ein Hinweisbalken fragt nach.
 - **Export** (Menü): PNG-Sheet, Godot, Unity, GIF, Aseprite nach `<Ordner des Dokuments>/export/<name>/`.
@@ -304,6 +318,8 @@ oder `claude mcp add pixel-editor -- /home/bastian/Development/pixel-editor/targ
 | `add_frame(copy_from?, linked?, …)`, `delete_frame`, `set_frame_duration`, `set_frame(name?, duration_ms?, locked?, move_to?)`, `link_cel` | Frames und verknüpfte Cels |
 | `set_tag(name, from/to \| frames, direction?, loop?, color?, delete?)` | Tags (Bereich + Richtung; `frames` in beliebiger Reihenfolge über verknüpfte Frames) |
 | `set_palette_color(key, color?, name?, remove?)` | Palette mit Namen |
+| `set_ramps(path, ramps[{name, keys}])` | Farbrampen setzen (ersetzt alle, `[]` löscht sie): `keys` von dunkel nach hell als Tastenfolge `"b89a"` oder Liste von Tasten/Farbnamen. Nur in `.pxe.json` (bei `.aseprite` abgelehnt). `get_document` listet sie |
+| `shade(path, layer, frame, pixels \| rect \| region, steps, dry_run?, note?)` | entlang der Rampen schattieren: `steps` +n = n Stufen heller, −n = dunkler, am Ende der Rampe bleibt die Farbe. Farben ohne Rampe und Transparenz bleiben, jedes Pixel ändert sich höchstens einmal. Diff, Verlauf, `undo` wie die anderen Schreibwerkzeuge |
 | `render_preview(path, frame? \| frames?, layer?, zoom?, grid?, regions?, tiled?, inline?)` | Vorschau ansehen; `tiled: true` zeigt jeden Frame 3×3 wie gekachelt (Datei `…_tiled.png`, Raster und Regionen dann nur auf Wunsch) |
 | `check_seams(path, frame?, layer?, threshold?)` | Nahtstellen eines Tiles prüfen: rechte Spalte gegen linke, unterste Zeile gegen oberste, wie sie beim Kacheln aneinanderstoßen. Je Naht: wie viele Paare sich unterscheiden, welche harte Kanten sind (Farbabstand ≥ `threshold`, Standard 0,25; als Läufe mit beiden Tasten, z. B. `y 9..14: E cliff earth dark \| r stone`) und ob die Naht mehr Kontrast hat als das Innere des Tiles („VISIBLE SEAM“). Nur lesend |
 | `render_animation(path, tag, region?, track?, zoom?, jump_threshold?, inline?)` | Animation als Standbild prüfen (siehe unten) |
@@ -394,5 +410,6 @@ Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen n
 - Keine Ebenengruppen, Blend-Modi, Cel-Deckkraft; Aseprite-Tilemap-Ebenen werden beim Import übersprungen und gemeldet (Karten sind ein eigenes Format, siehe oben). Frame-Namen und -Sperren gehen beim Umweg über `.aseprite` verloren (Aseprite kennt sie nicht).
 - Tags sind Bereiche wie in Aseprite. Eine beliebige Reihenfolge entsteht über angehängte verknüpfte Frames (GUI „Folge“, MCP `set_tag frames`).
 - Palette: Tasten lassen sich in der GUI nicht umbenennen oder umsortieren (Farbnamen schon).
+- Farbrampen werden nur in `.pxe.json` gespeichert; `.aseprite` hat keinen Platz dafür (die GUI weist beim Speichern darauf hin, MCP `save_as` ebenfalls). Rampen-Farben verschiebt man per Knopf, nicht per Ziehen. Schattieren nutzt kein Pixel-Perfect (es soll jedes überstrichene Pixel treffen).
 - Kein direkter Import von `.pxs` (Umweg: `pxa build` → PNG-Sheet → `import_png` mit Tile-Größe).
 - Fehlermeldungen des Kerns (auch in der GUI-Statuszeile) sind englisch, weil sie mit dem MCP-Server geteilt werden.

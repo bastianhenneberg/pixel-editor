@@ -116,6 +116,10 @@ pub fn summary(old: &Document, new: &Document) -> Vec<String> {
             out.push(format!("palette: removed {}", o.label()));
         }
     }
+    if old.ramps != new.ramps {
+        let rs = |d: &Document| d.ramps.iter().map(|r| format!("{} {}", r.name, r.keys_str())).collect::<Vec<_>>();
+        out.push(format!("ramps {:?} -> {:?}", rs(old), rs(new)));
+    }
     let names = |d: &Document| d.layers.iter().map(|l| l.name.clone()).collect::<Vec<_>>();
     if names(old) != names(new) {
         out.push(format!("layers {:?} -> {:?}", names(old), names(new)));

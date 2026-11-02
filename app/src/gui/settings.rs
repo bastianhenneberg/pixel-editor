@@ -63,7 +63,7 @@ impl Default for PreviewSettings {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct Settings {
     pub preview: PreviewSettings,
@@ -71,6 +71,19 @@ pub struct Settings {
     pub open_tabs: std::collections::BTreeMap<String, Vec<PathBuf>>,
     /// Kachel-Modus per document (absolute path).
     pub tile_modes: std::collections::BTreeMap<String, super::tiled::TileMode>,
+    /// Pixel-Perfect for Stift and Radierer (on unless switched off).
+    pub pixel_perfect: bool,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            preview: Default::default(),
+            open_tabs: Default::default(),
+            tile_modes: Default::default(),
+            pixel_perfect: true,
+        }
+    }
 }
 
 pub fn default_path() -> Option<PathBuf> {

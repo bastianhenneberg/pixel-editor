@@ -20,6 +20,6 @@ pub mod tilemap;
 pub mod transform;
 
 pub use color::Rgba;
-pub use document::{Document, Frame, Layer, PaletteEntry, Rect, Region, Tag, SKIP, TRANSPARENT};
+pub use document::{Document, Frame, Layer, PaletteEntry, Ramp, Rect, Region, Tag, SKIP, TRANSPARENT};
 pub use history::History;
 pub use render::Image;

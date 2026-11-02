@@ -25,7 +25,7 @@ use std::sync::OnceLock;
 use base64::Engine;
 use pixel_core::aseprite::ColorMode;
 use pixel_core::diff::{self, rows_block};
-use pixel_core::document::{Direction, Rect, Region, RegionKind, Tag, KEY_ORDER};
+use pixel_core::document::{Direction, Ramp, Rect, Region, RegionKind, Tag, KEY_ORDER};
 use pixel_core::export::{self, ExportOptions, Target};
 use pixel_core::journal::{Focus, Journal};
 use pixel_core::render::PreviewOptions;
@@ -394,6 +394,7 @@ impl Server {
             }
         }
         if before.palette != doc.palette
+            || before.ramps != doc.ramps
             || before.frames != doc.frames
             || before.tags != doc.tags
             || (before.regions != doc.regions && !regions_may_change)
@@ -804,6 +805,61 @@ impl Server {
                 let p = d.palette_entry(key).unwrap();
                 Ok(format!("{} {} = {}", if added { "added" } else { "changed" }, p.label(), p.color))
             }),
+            "set_ramps" => {
+                if pixel_core::aseprite::is_aseprite_path(Path::new(str_arg(a, "path")?)) {
+                    return Err("color ramps are stored in .pxe.json only; .aseprite has no place for them \
+                                (save_as a .pxe.json copy first)"
+                        .into());
+                }
+                self.meta_edit(a, "set_ramps", |d| {
+                    let list = a.get("ramps").and_then(Value::as_array).ok_or("missing array \"ramps\"")?;
+                    let mut ramps = Vec::with_capacity(list.len());
+                    for (i, r) in list.iter().enumerate() {
+                        let at = |e: String| format!("ramps[{i}]: {e}");
+                        let name =
+                            r.get("name").and_then(Value::as_str).ok_or_else(|| at("missing \"name\"".into()))?;
+                        let keys = ramp_keys(d, r.get("keys")).map_err(at)?;
+                        ramps.push(Ramp { name: name.to_string(), keys });
+                    }
+                    d.set_ramps(ramps)?;
+                    if d.ramps.is_empty() {
+                        return Ok("no ramps".into());
+                    }
+                    let lines: Vec<String> = d.ramps.iter().map(|r| d.ramp_label(r)).collect();
+                    Ok(format!("ramps (dark > light):\n  {}", lines.join("\n  ")))
+                })
+            }
+            "shade" => self.pixel_write(a, "shade", |d, s| {
+                let steps = int_of(a, "steps")?;
+                if steps == 0 {
+                    return Err("steps must not be 0 (+n = n colors lighter, -n = darker)".into());
+                }
+                if d.ramps.is_empty() {
+                    return Err("the document has no color ramps; define them with set_ramps first".into());
+                }
+                let pts: Vec<(i32, i32)> = match (a.get("pixels").and_then(Value::as_array), s.clip) {
+                    (Some(px), _) => px
+                        .iter()
+                        .enumerate()
+                        .map(|(i, p)| Ok((int_of(p, "x").map_err(|e| format!("pixels[{i}]: {e}"))?, int_of(p, "y")?)))
+                        .collect::<Result<_, String>>()?,
+                    (None, Some(c)) => {
+                        (c.y..c.y + c.h as i32).flat_map(|y| (c.x..c.x + c.w as i32).map(move |x| (x, y))).collect()
+                    }
+                    (None, None) => return Err("give pixels, rect or region: what to shade".into()),
+                };
+                let skipped = pts
+                    .iter()
+                    .filter(|&&(x, y)| d.in_bounds(x, y) && d.ramp_of(d.get(s.layer, s.frame, x, y)).is_none())
+                    .count();
+                let n = draw::shade(d, s.layer, s.frame, &pts, steps);
+                let dir = if steps > 0 { "lighter" } else { "darker" };
+                Ok(format!(
+                    "shade {} step(s) {dir}: {n} pixels changed, {skipped} not in any ramp (unchanged), the rest \
+                     already at the end of their ramp",
+                    steps.abs()
+                ))
+            }),
             "render_preview" => self.render_preview(a),
             "check_seams" => self.check_seams(a),
             "focus" => {
@@ -921,6 +977,9 @@ impl Server {
                 let dest = self.new_doc_path(str_arg(a, "to")?, bool_arg(a, "overwrite", false))?;
                 io::save(&doc, &dest)?;
                 let mut msg = format!("wrote {} as {}", self.rel(&src), self.rel(&dest));
+                if !doc.ramps.is_empty() && pixel_core::aseprite::is_aseprite_path(&dest) {
+                    msg += &format!("\nnote: the {} color ramp(s) are not stored in .aseprite", doc.ramps.len());
+                }
                 if !warnings.is_empty() {
                     msg += &format!("\nwarnings while reading:\n  {}", warnings.join("\n  "));
                 }
@@ -2139,6 +2198,18 @@ fn first_line(s: &str) -> &str {
     s.lines().next().unwrap_or("")
 }
 
+/// Ramp keys: a string of keys ("389a") or an array of keys or color names.
+fn ramp_keys(d: &Document, v: Option<&Value>) -> Result<Vec<u8>, String> {
+    match v {
+        Some(Value::String(s)) => s.bytes().map(|k| d.check_key(k).map(|_| k)).collect(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|k| k.as_str().ok_or("keys must be strings".to_string()).and_then(|k| d.find_key(k)))
+            .collect(),
+        _ => Err("missing \"keys\": dark to light, e.g. \"389a\" or [\"crust_dark\", \"crust\", ...]".into()),
+    }
+}
+
 fn clock(secs: u64) -> String {
     format!("{:02}:{:02}:{:02}Z", secs / 3600 % 24, secs / 60 % 60, secs % 60)
 }
@@ -2155,6 +2226,12 @@ fn describe(doc: &Document, rel: &str, a: &Value) -> Result<String, String> {
     );
     for p in &doc.palette {
         s += &format!("  {} {}\n", p.label(), p.color);
+    }
+    if !doc.ramps.is_empty() {
+        s += "color ramps (dark > light; shade steps along them):\n";
+        for r in &doc.ramps {
+            s += &format!("  {}\n", doc.ramp_label(r));
+        }
     }
     s += "layers (0 = bottom):\n";
     for (i, l) in doc.layers.iter().enumerate() {
@@ -2400,6 +2477,9 @@ weg') and their pixels. Marks are the user's instructions; after handling them r
 Mirroring/rotating: transform (op flip_h|flip_v|rot90|rot180|rot270; scope rect/region/cel of one layer+frame, or \
 frame/frames/tag/all around the canvas centre; regions follow). A facing-left animation from a facing-right one: \
 mirror_document(src, dst) writes a mirrored copy with tags, durations, linked cels and regions kept; never redraw it. \
+Shading: a document can have color ramps (palette keys dark to light, e.g. crust 3>8>9>a; set_ramps, shown by \
+get_document); shade(pixels|rect|region, steps +n lighter / -n darker) moves pixels along their ramp and leaves \
+colors outside any ramp alone. \
 Tiles must repeat seamlessly: render_preview with tiled: true shows a frame 3x3, check_seams reports hard edges where \
 the right/bottom edge meets the left/top one. \
 Environments are tilemaps (.tilemap.json): a grid of one-character keys whose legend maps each key to a tile (a frame \
@@ -2589,6 +2669,15 @@ fn tool_list() -> Value {
                 "key": {"type": "string", "description": "palette key (one character)"}, "color": {"type": "string"},
                 "name": {"type": "string", "description": "color name, at least 2 characters; \"\" removes it"},
                 "remove": boolean("remove the key")})), &["path", "key"]),
+        tool("set_ramps", "Set the color ramps of a document (replaces all; [] removes them): ordered rows of palette colors from dark to light, e.g. crust 3 > 8 > 9 > a. shade and the editor's Schattieren tool step pixels along them. Stored in .pxe.json only. get_document lists them.", meta(json!({
+                "ramps": {"type": "array", "description": "the ramps, each {name, keys}", "items": {"type": "object", "properties": {
+                    "name": {"type": "string"},
+                    "keys": {"type": ["string", "array"], "items": {"type": "string"}, "description": "dark to light: a key string (\"389a\") or keys/color names"}},
+                    "required": ["name", "keys"]}}})), &["path", "ramps"]),
+        tool("shade", "Shade along the color ramps: each target pixel becomes the color steps places lighter (+) or darker (-) in its ramp, stopping at the ramp's end. Pixels whose color is in no ramp (and transparent ones) stay unchanged; each pixel changes at most once. Target: pixels, or every pixel of rect/region.", write(json!({
+                "steps": int("+n = n colors lighter, -n = n colors darker"),
+                "pixels": {"type": "array", "description": "pixels to shade (instead of a whole rect/region)", "items": {"type": "object", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}}, "required": ["x", "y"]}}})),
+            &w_req(&["steps"])),
         tool("render_preview", "Render frames to preview/<name>.png and return the image: per frame a label (index, name, ms, tags), coordinate rulers, the zoomed frame with pixel grid (brighter every 8 px) and region outlines with names, 1x and 2x thumbnails; palette swatches with keys. Nearest-neighbour only. Look at it before calling art done. On a tilemap (.tilemap.json): the whole map with objects, tile grid (grid) and cell numbers, zoom default 1 (preview/<name>_map.png).", json!({
                 "path": path, "frame": {"type": ["integer", "string"], "description": "one frame; default all"},
                 "frames": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "several frames"},

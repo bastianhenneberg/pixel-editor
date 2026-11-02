@@ -26,6 +26,47 @@ pub fn line(x0: i32, y0: i32, x1: i32, y1: i32) -> Vec<(i32, i32)> {
     }
 }
 
+/// Pixel-perfect freehand path (as in Aseprite): drops the corner pixel of
+/// every "L" (a pixel whose neighbours before and after touch it straight
+/// but each other only diagonally), so strokes stay one pixel thin.
+/// Repeated points are dropped too. Expects an 8-connected path, e.g.
+/// consecutive `line` segments.
+pub fn pixel_perfect(path: &[(i32, i32)]) -> Vec<(i32, i32)> {
+    let mut out: Vec<(i32, i32)> = Vec::with_capacity(path.len());
+    for &p in path {
+        if out.last() == Some(&p) {
+            continue;
+        }
+        if let [.., a, c] = out[..] {
+            let straight = |q: (i32, i32)| (q.0 == c.0) != (q.1 == c.1) && (q.0 - c.0).abs() + (q.1 - c.1).abs() == 1;
+            if straight(a) && straight(p) && a.0 != p.0 && a.1 != p.1 {
+                out.pop();
+            }
+        }
+        out.push(p);
+    }
+    out
+}
+
+/// Shade: step each pixel `steps` places along its color ramp (positive =
+/// lighter, see `Document::shade_key`). Pixels whose color is in no ramp
+/// stay; a point listed twice is shaded once. Returns the changed count.
+pub fn shade(doc: &mut Document, layer: usize, frame: usize, points: &[(i32, i32)], steps: i32) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    let mut changed = 0;
+    for &(x, y) in points {
+        if !doc.in_bounds(x, y) || !seen.insert((x, y)) {
+            continue;
+        }
+        if let Some(k) = doc.shade_key(doc.get(layer, frame, x, y), steps) {
+            if doc.set(layer, frame, x, y, k) {
+                changed += 1;
+            }
+        }
+    }
+    changed
+}
+
 fn ordered(a: i32, b: i32) -> (i32, i32) {
     (a.min(b), a.max(b))
 }
@@ -140,6 +181,89 @@ mod tests {
         assert_eq!(l.len(), 6);
         assert_eq!(line(3, 3, 3, 3), vec![(3, 3)]);
         assert_eq!(line(2, 0, 0, 0), vec![(2, 0), (1, 0), (0, 0)]);
+    }
+
+    /// A freehand path: consecutive Bresenham segments through `pts`.
+    fn path(pts: &[(i32, i32)]) -> Vec<(i32, i32)> {
+        let mut out = vec![pts[0]];
+        for w in pts.windows(2) {
+            out.extend(line(w[0].0, w[0].1, w[1].0, w[1].1).into_iter().skip(1));
+        }
+        out
+    }
+
+    /// No pixel of the result has both a horizontal and a vertical neighbour
+    /// in the stroke where those two touch diagonally (no "L" corners).
+    fn has_l_corner(pts: &[(i32, i32)]) -> bool {
+        pts.windows(3).any(|w| {
+            let (a, c, b) = (w[0], w[1], w[2]);
+            (a.0 - c.0).abs() + (a.1 - c.1).abs() == 1
+                && (b.0 - c.0).abs() + (b.1 - c.1).abs() == 1
+                && a.0 != b.0
+                && a.1 != b.1
+        })
+    }
+
+    #[test]
+    fn pixel_perfect_diagonal() {
+        // a mouse that moves right, then down, then right ... (a staircase of Ls)
+        let raw = path(&[(0, 0), (1, 0), (1, 1), (2, 1), (2, 2), (3, 2), (3, 3)]);
+        assert!(has_l_corner(&raw));
+        assert_eq!(pixel_perfect(&raw), vec![(0, 0), (1, 1), (2, 2), (3, 3)]);
+        // a clean diagonal is kept as it is
+        let diag = line(0, 0, 5, 5);
+        assert_eq!(pixel_perfect(&diag), diag);
+    }
+
+    #[test]
+    fn pixel_perfect_staircase() {
+        // steps of two pixels: only the inner corner of each step goes
+        let raw = path(&[(0, 0), (2, 0), (2, 2), (4, 2), (4, 4)]);
+        let pp = pixel_perfect(&raw);
+        assert!(!has_l_corner(&pp));
+        assert_eq!(pp, vec![(0, 0), (1, 0), (2, 1), (3, 2), (4, 3), (4, 4)]);
+        // straight lines and repeated points stay
+        assert_eq!(pixel_perfect(&[(0, 0), (1, 0), (1, 0), (2, 0)]), vec![(0, 0), (1, 0), (2, 0)]);
+    }
+
+    #[test]
+    fn pixel_perfect_curve() {
+        // a quarter circle drawn by a wobbly hand: every L corner goes,
+        // the curve stays connected (8-neighbourhood) and keeps its ends
+        let raw = path(&[
+            (0, 8),
+            (1, 8),
+            (1, 7),
+            (2, 7),
+            (3, 6),
+            (3, 5),
+            (4, 5),
+            (5, 4),
+            (5, 3),
+            (6, 3),
+            (6, 2),
+            (7, 1),
+            (8, 1),
+            (8, 0),
+        ]);
+        let pp = pixel_perfect(&raw);
+        assert!(has_l_corner(&raw) && !has_l_corner(&pp));
+        assert!(pp.len() < raw.len());
+        assert_eq!((pp[0], *pp.last().unwrap()), ((0, 8), (8, 0)));
+        assert!(pp.windows(2).all(|w| (w[0].0 - w[1].0).abs() <= 1 && (w[0].1 - w[1].1).abs() <= 1));
+    }
+
+    #[test]
+    fn shade_steps_along_the_ramp_once() {
+        use crate::document::Ramp;
+        let mut d = Document::new(4, 1, Document::builtin_palette("sweetie16").unwrap()).unwrap();
+        d.set_ramps(vec![Ramp::new("crust", b"389a")]).unwrap();
+        d.set_rows(0, 0, 0, 0, &["38a5".to_string()]).unwrap();
+        let row = [(0, 0), (1, 0), (2, 0), (3, 0), (1, 0)];
+        assert_eq!(shade(&mut d, 0, 0, &row, 1), 2, "a stays at the light end, 5 is in no ramp");
+        assert_eq!(d.rows(0, 0), vec!["89a5"]);
+        assert_eq!(shade(&mut d, 0, 0, &row, -2), 3);
+        assert_eq!(d.rows(0, 0), vec!["3385"]);
     }
 
     #[test]

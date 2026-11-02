@@ -33,6 +33,24 @@ impl EditorApp {
         if matches!(self.tool, Tool::Rect | Tool::Ellipse) {
             ui.checkbox(&mut self.filled, "gefüllt");
         }
+        if matches!(self.tool, Tool::Pencil | Tool::Eraser) {
+            ui.checkbox(&mut self.pixel_perfect, "Pixel-Perfect").on_hover_text(
+                "Entfernt beim Freihandzeichnen die doppelten Eckpixel (L-Ecken), damit Linien 1 Pixel dünn bleiben",
+            );
+        }
+        if self.tool == Tool::Shade {
+            ui.label(
+                RichText::new(
+                    "Klick/Ziehen = eine Stufe heller entlang der Farbrampe, Rechtsklick = dunkler; \
+                     Farben ohne Rampe bleiben, jedes Pixel ändert sich einmal pro Strich",
+                )
+                .small()
+                .weak(),
+            );
+            if self.doc.ramps.is_empty() {
+                ui.label(RichText::new(NO_RAMPS_HELP).small().color(Color32::from_rgb(230, 180, 90)));
+            }
+        }
         self.symmetry_panel(ui);
         self.tile_panel(ui);
         if self.tool == Tool::Point {
@@ -82,19 +100,20 @@ impl EditorApp {
                 }
             });
         }
-        if !self.tool.selects() {
+        if !self.tool.selects() && self.tool != Tool::Shade {
             ui.label(RichText::new("Rechtsklick = transparent, Alt+Klick = Pipette").small().weak());
         }
 
         ui.separator();
         ui.heading("Palette");
+        self.ramps_ui(ui);
         let current = self.color;
         ui.horizontal(|ui| {
             swatch(ui, self.doc.color_of(current), 28.0, true);
             ui.label(self.doc.key_label(current));
         });
         ui.add_space(4.0);
-        let mut picked = None;
+        let (mut picked, mut toggled) = (None, None);
         ui.horizontal_wrapped(|ui| {
             ui.spacing_mut().item_spacing = Vec2::splat(3.0);
             let r = swatch(ui, None, 22.0, current == TRANSPARENT).on_hover_text("'.' transparent");
@@ -107,15 +126,32 @@ impl EditorApp {
                 } else {
                     format!("Taste '{}' · {} · {}", p.key as char, p.name, p.color)
                 };
-                let r = swatch(ui, Some(p.color), 22.0, current == p.key).on_hover_text(tip);
+                let r = swatch(ui, Some(p.color), 22.0, current == p.key)
+                    .on_hover_text(format!("{tip}\nStrg+Klick = für eine Rampe markieren"));
+                if let Some(n) = self.ramp_pick.iter().position(|k| *k == p.key) {
+                    pick_badge(ui, r.rect, n + 1);
+                }
                 if r.clicked() {
-                    picked = Some(p.key);
+                    if ui.input(|i| i.modifiers.command) {
+                        toggled = Some(p.key);
+                    } else {
+                        picked = Some(p.key);
+                    }
                 }
             }
         });
         if let Some(k) = picked {
             self.color = k;
         }
+        if let Some(k) = toggled {
+            match self.ramp_pick.iter().position(|q| *q == k) {
+                Some(i) => {
+                    self.ramp_pick.remove(i);
+                }
+                None => self.ramp_pick.push(k),
+            }
+        }
+        self.ramp_pick_ui(ui);
         ui.add_space(4.0);
         if let Some(mut c) = self.doc.color_of(self.color) {
             let key = self.color;
@@ -622,6 +658,195 @@ impl EditorApp {
             });
         }
     }
+}
+
+const NO_RAMPS_HELP: &str =
+    "Noch keine Farbrampe: Farben in der Palette mit Strg+Klick von dunkel nach hell markieren, dann „Rampe anlegen“";
+
+/// What a click in a ramp row asks for (applied after the row is drawn).
+enum RampAction {
+    Pick(u8),
+    /// Move the current color one place darker (-1) or lighter (+1).
+    Move(usize, i32),
+    SortByBrightness(usize),
+    AddCurrent(usize),
+    RemoveCurrent(usize),
+    Delete(usize),
+    Rename(usize, String),
+}
+
+impl EditorApp {
+    /// The color ramps as rows above the palette: a click picks a color,
+    /// the buttons reorder, extend, shorten or delete the ramp.
+    fn ramps_ui(&mut self, ui: &mut egui::Ui) {
+        if self.doc.ramps.is_empty() {
+            return;
+        }
+        ui.label(RichText::new("Farbrampen (dunkel > hell)").small().strong());
+        let cur = self.color;
+        let mut act = None;
+        for (ri, ramp) in self.doc.ramps.iter().enumerate() {
+            ui.horizontal(|ui| {
+                ui.spacing_mut().item_spacing = Vec2::new(2.0, 2.0);
+                match &mut self.ramp_rename {
+                    Some((i, draft)) if *i == ri => {
+                        let r = ui.add(egui::TextEdit::singleline(draft).desired_width(60.0));
+                        if r.lost_focus() || (r.has_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter))) {
+                            act = Some(RampAction::Rename(ri, draft.clone()));
+                        } else if !r.has_focus() {
+                            r.request_focus();
+                        }
+                    }
+                    _ => {
+                        let r = ui
+                            .add(egui::Label::new(RichText::new(&ramp.name).small()).sense(Sense::click()))
+                            .on_hover_text("Doppelklick = umbenennen");
+                        if r.double_clicked() {
+                            self.ramp_rename = Some((ri, ramp.name.clone()));
+                        }
+                    }
+                }
+                for &k in &ramp.keys {
+                    let r = swatch(ui, self.doc.color_of(k), 18.0, k == cur).on_hover_text(self.doc.key_label(k));
+                    if r.clicked() {
+                        act = Some(RampAction::Pick(k));
+                    }
+                }
+                let at = ramp.keys.iter().position(|k| *k == cur);
+                let small = |t: &str| egui::Button::new(RichText::new(t).small()).min_size(Vec2::new(16.0, 18.0));
+                if ui
+                    .add_enabled(at.is_some_and(|i| i > 0), small("<"))
+                    .on_hover_text("Aktuelle Farbe eine Stelle dunkler einsortieren")
+                    .clicked()
+                {
+                    act = Some(RampAction::Move(ri, -1));
+                }
+                if ui
+                    .add_enabled(at.is_some_and(|i| i + 1 < ramp.keys.len()), small(">"))
+                    .on_hover_text("Aktuelle Farbe eine Stelle heller einsortieren")
+                    .clicked()
+                {
+                    act = Some(RampAction::Move(ri, 1));
+                }
+                if ui.add(small("hell")).on_hover_text("Nach Helligkeit sortieren").clicked() {
+                    act = Some(RampAction::SortByBrightness(ri));
+                }
+                if ui
+                    .add_enabled(at.is_none() && cur != TRANSPARENT, small("+"))
+                    .on_hover_text("Aktuelle Farbe hell ans Ende anfügen")
+                    .clicked()
+                {
+                    act = Some(RampAction::AddCurrent(ri));
+                }
+                if ui
+                    .add_enabled(at.is_some() && ramp.keys.len() > 2, small("-"))
+                    .on_hover_text("Aktuelle Farbe aus der Rampe nehmen")
+                    .clicked()
+                {
+                    act = Some(RampAction::RemoveCurrent(ri));
+                }
+                if ui.add(small("×")).on_hover_text("Rampe löschen (die Farben bleiben)").clicked() {
+                    act = Some(RampAction::Delete(ri));
+                }
+            });
+        }
+        ui.add_space(4.0);
+        let Some(act) = act else { return };
+        let name = |d: &pixel_core::Document, ri: usize| d.ramps[ri].name.clone();
+        match act {
+            RampAction::Pick(k) => self.color = k,
+            RampAction::Move(ri, dir) => {
+                let i = self.doc.ramps[ri].keys.iter().position(|k| *k == cur).unwrap();
+                let desc = format!("Rampe {}: {} umsortiert", name(&self.doc, ri), self.doc.key_label(cur));
+                self.edit(desc, |d| d.ramps[ri].keys.swap(i, (i as i32 + dir) as usize));
+            }
+            RampAction::SortByBrightness(ri) => {
+                let desc = format!("Rampe {} nach Helligkeit sortiert", name(&self.doc, ri));
+                self.edit(desc, |d| {
+                    let lum = |k: &u8| d.color_of(*k).map_or(0.0, brightness);
+                    let mut keys = d.ramps[ri].keys.clone();
+                    keys.sort_by(|a, b| lum(a).total_cmp(&lum(b)));
+                    d.ramps[ri].keys = keys;
+                });
+            }
+            RampAction::AddCurrent(ri) => {
+                let desc = format!("Rampe {}: {} angefügt", name(&self.doc, ri), self.doc.key_label(cur));
+                self.edit(desc, |d| d.ramps[ri].keys.push(cur));
+            }
+            RampAction::RemoveCurrent(ri) => {
+                let desc = format!("Rampe {}: {} entfernt", name(&self.doc, ri), self.doc.key_label(cur));
+                self.edit(desc, |d| d.ramps[ri].keys.retain(|k| *k != cur));
+            }
+            RampAction::Delete(ri) => {
+                let desc = format!("Rampe {} gelöscht", name(&self.doc, ri));
+                self.edit(desc, |d| d.ramps.remove(ri));
+            }
+            RampAction::Rename(ri, new) => {
+                self.ramp_rename = None;
+                let new = new.trim().to_string();
+                let taken = self.doc.ramps.iter().enumerate().any(|(i, r)| i != ri && r.name == new);
+                if new.is_empty() || taken {
+                    self.status = format!("Rampenname {new:?} ist leer oder schon vergeben");
+                } else if new != self.doc.ramps[ri].name {
+                    let desc = format!("Rampe {} heißt jetzt {new:?}", name(&self.doc, ri));
+                    self.edit(desc, |d| d.ramps[ri].name = new);
+                }
+            }
+        }
+    }
+
+    /// Under the palette: the colors marked with Strg+Klick become a ramp.
+    fn ramp_pick_ui(&mut self, ui: &mut egui::Ui) {
+        self.ramp_pick.retain(|k| self.doc.has_key(*k) && *k != TRANSPARENT);
+        if self.ramp_pick.is_empty() {
+            if self.doc.ramps.is_empty() {
+                ui.label(RichText::new("Strg+Klick markiert Farben für eine Farbrampe (dunkel > hell)").small().weak());
+            }
+            return;
+        }
+        ui.horizontal(|ui| {
+            let n = self.ramp_pick.len();
+            if ui
+                .add_enabled(n >= 2, egui::Button::new(format!("Rampe anlegen ({n} Farben)")))
+                .on_hover_text("Reihenfolge = Reihenfolge der Strg+Klicks, von dunkel nach hell")
+                .clicked()
+            {
+                let name =
+                    (1..).map(|i| format!("Rampe {i}")).find(|n| !self.doc.ramps.iter().any(|r| &r.name == n)).unwrap();
+                let ramp = pixel_core::Ramp { name: name.clone(), keys: std::mem::take(&mut self.ramp_pick) };
+                match self.doc.check_ramp(&ramp, None) {
+                    Ok(()) => {
+                        let desc = format!("Farbrampe {}", self.doc.ramp_label(&ramp));
+                        self.edit(desc, |d| d.ramps.push(ramp));
+                        self.status = format!("Farbrampe {name:?} angelegt; Doppelklick auf den Namen benennt sie um");
+                    }
+                    Err(e) => self.status = e,
+                }
+            }
+            if ui.button("Markierung aufheben").clicked() {
+                self.ramp_pick.clear();
+            }
+        });
+    }
+}
+
+/// Perceived brightness 0..1 (Rec. 601 weights).
+fn brightness(c: Rgba) -> f32 {
+    let [r, g, b, _] = c.0;
+    (0.299 * r as f32 + 0.587 * g as f32 + 0.114 * b as f32) / 255.0
+}
+
+/// The number of a color marked for a new ramp, in the swatch's corner.
+fn pick_badge(ui: &egui::Ui, r: egui::Rect, n: usize) {
+    let c = egui::Rect::from_min_size(r.right_top() - Vec2::new(10.0, 0.0), Vec2::splat(10.0));
+    ui.painter().rect_filled(c, 2.0, Color32::from_rgb(90, 200, 255));
+    ui.painter().text(
+        c.center(),
+        egui::Align2::CENTER_CENTER,
+        n.to_string(),
+        egui::FontId::proportional(8.5),
+        Color32::BLACK,
+    );
 }
 
 pub fn direction_label(d: Direction) -> &'static str {
