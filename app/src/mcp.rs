@@ -29,7 +29,7 @@ use pixel_core::document::{Direction, Ramp, Rect, RefSource, Reference, Region, 
 use pixel_core::export::{self, ExportOptions, Target};
 use pixel_core::journal::{Focus, Journal};
 use pixel_core::recolor::{self, Area, Outline, OutlineMode, Pattern};
-use pixel_core::render::PreviewOptions;
+use pixel_core::render::{PreviewOptions, View};
 use pixel_core::seams;
 use pixel_core::transform::{self, Op};
 use pixel_core::{draw, import, io, palettes, render, Document, PaletteEntry, Rgba, TRANSPARENT};
@@ -102,6 +102,8 @@ struct Server {
     saved: std::cell::RefCell<Vec<PathBuf>>,
     /// Hash of the command already reported as untrusted (reported once).
     untrusted_told: std::cell::RefCell<Option<String>>,
+    /// Folder of the personal parts library (see `parts`); tests set it.
+    personal_parts: Option<PathBuf>,
 }
 
 /// Display name of an MCP client: "claude-code"/"claude…" -> "Claude",
@@ -136,6 +138,7 @@ impl Server {
             trust,
             saved: Default::default(),
             untrusted_told: Default::default(),
+            personal_parts: parts::personal_dir_from_env(),
         }
     }
 
@@ -658,6 +661,14 @@ impl Server {
     fn call(&self, name: &str, a: &Value) -> Result<Out, String> {
         if let Some(r) = self.tilemap_call(name, a) {
             return r;
+        }
+        // review tools and the parts library
+        match name {
+            "lint" => return self.lint(a),
+            "save_part" => return self.save_part(a),
+            "place_part" => return self.place_part(a),
+            "list_parts" => return self.list_parts(a),
+            _ => {}
         }
         match name {
             "list_documents" => self.list_documents(),
@@ -2084,6 +2095,8 @@ impl Server {
             area: area("region")?,
             track: area("track")?,
             jump_threshold: opt_int(a, "jump_threshold")?.unwrap_or(2).max(0) as u32,
+            trace: trace_arg(&doc, a.get("trace"))?,
+            trace_threshold: opt_int(a, "trace_threshold")?.unwrap_or(3).max(0) as u32,
         };
         let analysis = animation::analyze(&doc, tag, &opts)?;
         let img = animation::render(&doc, tag, &analysis, &opts)?;
@@ -2095,10 +2108,16 @@ impl Server {
         let text = format!(
             "wrote {} ({}x{} px). Rows: frames (red dashed line = first step's ground row; cyan box/yellow path = track), \
              onion (previous step cool at 35%, current warm), diff (magenta = changed vs previous step). The last cell \
-             repeats step 0 after the loop.\n{}",
+             repeats step 0 after the loop.{}\n{}",
             self.rel(&out),
             img.width,
             img.height,
+            if opts.trace.is_empty() {
+                ""
+            } else {
+                " Traces: each cell shows the whole path dotted (pink, green, orange, violet per trace) and this \
+                 step's point as a ring."
+            },
             animation::summary(&doc, &analysis)
         );
         if bool_arg(a, "inline", true) {
@@ -2125,12 +2144,21 @@ impl Server {
         let tiled = bool_arg(a, "tiled", false);
         let auto = if tiled { PreviewOptions::auto_zoom_tiled(&doc) } else { PreviewOptions::auto_zoom(&doc) };
         let zoom = opt_int(a, "zoom")?.map(|z| z.clamp(1, 64) as u32).unwrap_or(auto);
+        let views: Vec<View> = match a.get("view") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::String(v)) => vec![View::parse(v)?],
+            Some(Value::Array(list)) => {
+                list.iter().map(|v| View::parse(v.as_str().ok_or("view: give names")?)).collect::<Result<_, _>>()?
+            }
+            Some(_) => return Err("view must be a name or a list of names".into()),
+        };
         let opts = PreviewOptions {
             zoom,
             grid: bool_arg(a, "grid", !tiled),
             layer,
             regions: bool_arg(a, "regions", !tiled),
             tiled,
+            views: views.clone(),
         };
         let img = render::preview(&doc, &frames, &opts);
         let stem = io::stem(&path);
@@ -2146,6 +2174,9 @@ impl Server {
         if tiled {
             file += "_tiled";
         }
+        for v in views.iter().filter(|v| **v != View::Normal || views.len() > 1) {
+            file += &format!("_{}", v.id());
+        }
         let out = dir.join(format!("{file}.png"));
         let png = img.encode_png()?;
         io::write_atomic(&out, &png)?;
@@ -2158,11 +2189,21 @@ impl Server {
         let text = format!(
             "wrote {} ({}x{} px, zoom {zoom}, frames {frames:?}{}). Each frame: label (index name / ms [tags]), \
              rulers with pixel coordinates, grid (brighter every 8 px), region outlines with names, 1x and 2x \
-             thumbnails; palette swatches with keys at the bottom.{tiling}",
+             thumbnails; palette swatches with keys at the bottom.{tiling}{}",
             self.rel(&out),
             img.width,
             img.height,
-            layer.map(|l| format!(", layer {l} only")).unwrap_or_default()
+            layer.map(|l| format!(", layer {l} only")).unwrap_or_default(),
+            if views.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    " Views side by side per frame: {} (preview only; silhouette = shape in one dark color, \
+                     grayscale = values without hue, mirrored = flipped left-right with rulers/regions naming the \
+                     real pixels).",
+                    views.iter().map(|v| v.id()).collect::<Vec<_>>().join(", ")
+                )
+            }
         );
         if bool_arg(a, "inline", true) {
             Ok(Out::TextAndImage(text, png))
@@ -2821,6 +2862,50 @@ fn int_of(a: &Value, name: &str) -> Result<i32, String> {
     opt_int(a, name)?.ok_or_else(|| format!("missing integer argument \"{name}\""))
 }
 
+/// render_animation `trace`: marker/region names, or {key, area?} for the
+/// topmost pixel of a key.
+fn trace_arg(d: &Document, v: Option<&Value>) -> Result<Vec<pixel_core::trace::Trace>, String> {
+    use pixel_core::animation::Area;
+    use pixel_core::trace::{Trace, TraceSource};
+    let list = match v {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(l)) => l.clone(),
+        Some(one) => vec![one.clone()],
+    };
+    list.iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let at = |m: String| format!("trace[{i}]: {m}");
+            let source = match e {
+                Value::String(n) => {
+                    d.find_region(n).map_err(at)?;
+                    TraceSource::Region(n.clone())
+                }
+                Value::Object(_) => {
+                    let key = key_of(d, e.get("key")).map_err(at)?;
+                    if key == TRANSPARENT {
+                        return Err(at("key must be a color, not transparent".into()));
+                    }
+                    let area = match e.get("area") {
+                        None | Some(Value::Null) => None,
+                        Some(Value::String(s)) => {
+                            let ar = Area::parse(s).map_err(at)?;
+                            if let Area::Region(n) = &ar {
+                                d.find_region(n).map_err(at)?;
+                            }
+                            Some(ar)
+                        }
+                        Some(r) => Some(Area::Rect(rect_arg(r).map_err(at)?)),
+                    };
+                    TraceSource::Key { key, area }
+                }
+                _ => return Err(at("give a region/marker name or {key, area?}".into())),
+            };
+            Ok(Trace { source })
+        })
+        .collect()
+}
+
 /// Layer/frame references may be given as index or name.
 fn index_or_name(v: Option<&Value>) -> Option<String> {
     match v? {
@@ -2973,13 +3058,21 @@ set_legend, size with resize_tilemap, look with render_preview. Editing a tile i
 the map. The sandbox game's world.txt: import_world / export_world (byte-exact round trip; the game adds edges, cliff \
 faces and decor itself). Godot: export target godot on a map (TileSet + TileMapLayer scene) or godot_tileset on a tileset. \
 A workdir may define an on_save hook (.pxe-project.json, e.g. the project's own export); after a write that saves a \
-document the result says \"on_save started\", and hook_status shows whether it succeeded and its output.";
+document the result says \"on_save started\", and hook_status shows whether it succeeded and its output. \
+Reviewing craft: render_preview view silhouette|grayscale|mirrored (or a list, side by side) checks shape, values and \
+proportions in the preview only; lint reports orphans, doubles (L-corners), jaggies (uneven line steps) and colors \
+outside the ramps with coordinates; render_animation trace (marker names or {key, area}) follows hands, feet or head \
+and warns where they leave their arc. Parts library: save_part stores an approved piece (e.g. the sword at one angle) \
+under a name, place_part puts it into cels again (a pixel write; colors mapped by value), list_parts shows them; \
+reuse a saved part instead of redrawing it.";
 
 fn tools() -> &'static Value {
     static TOOLS: OnceLock<Value> = OnceLock::new();
     TOOLS.get_or_init(|| {
         let mut list = tool_list();
         list.as_array_mut().unwrap().extend(tilemap::tool_defs());
+        list.as_array_mut().unwrap().extend(lint::tool_defs());
+        list.as_array_mut().unwrap().extend(parts::tool_defs());
         list
     })
 }
@@ -3222,17 +3315,20 @@ fn tool_list() -> Value {
                 "zoom": int("screen pixels per art pixel; default fits ~512 px"), "grid": boolean("default true"),
                 "regions": boolean("draw region outlines, default true (false when tiled)"),
                 "tiled": boolean("show each frame repeated 3x3 like a seamless tile (default false); grid off unless asked"),
+                "view": {"description": "how to look at the art, in the preview only: normal (default), silhouette (every opaque pixel one dark color on light: does the shape read?), grayscale (luminance only: do the values hold without hue?), mirrored (flipped left-right: shows proportion errors; rulers and regions keep naming the real pixels); a list renders them side by side per frame", "anyOf": [{"type": "string", "enum": ["normal", "silhouette", "grayscale", "mirrored"]}, {"type": "array", "items": {"type": "string", "enum": ["normal", "silhouette", "grayscale", "mirrored"]}}]},
                 "inline": boolean("also return the PNG as image content; default true")}), &["path"]),
         tool("check_seams", "Check whether tiles repeat seamlessly: the rightmost column is compared with the leftmost, the bottom row with the top row, as they meet when the frame is repeated. Reports per seam how many pairs differ and which are hard edges (color distance >= threshold, as runs with both keys), judged against the hard edges inside the tile: VISIBLE SEAM, or no more contrast than inside. Read-only.", json!({
                 "path": path, "frame": {"type": ["integer", "string"], "description": "one frame; default all"},
                 "layer": {"type": ["integer", "string"], "description": "only this layer; default the visible composite"},
                 "threshold": {"type": "number", "description": "color distance 0..1 from which a pair is a hard edge; default 0.25"}}), &["path"]),
-        tool("render_animation", "Review an animation as still images: one tag in real play order (direction/pingpong expanded, loop transition shown) as a filmstrip, an onion-skin row and a difference row (changed pixels highlighted with counts), plus a text analysis: per-step changed pixels and silhouette shift, total duration, and warnings (ground line changes, silhouette jumps, isolated/new orphan pixels, identical frames). region zooms into an area; track marks an area's opaque bbox per step and plots its centre path (feet, head, sword tip).", json!({
+        tool("render_animation", "Review an animation as still images: one tag in real play order (direction/pingpong expanded, loop transition shown) as a filmstrip, an onion-skin row and a difference row (changed pixels highlighted with counts), plus a text analysis: per-step changed pixels and silhouette shift, total duration, and warnings (ground line changes, silhouette jumps, isolated/new orphan pixels, identical frames). region zooms into an area; track marks an area's opaque bbox per step and plots its centre path (feet, head, sword tip); trace follows points (markers, or the topmost pixel of a key) and checks that they move on arcs.", json!({
                 "path": path, "tag": {"type": "string", "description": "tag name"},
                 "region": {"description": "only this area, enlarged: region name, \"x,y,w,h\" or {x,y,w,h}"},
                 "track": {"description": "area to track: region name, \"x,y,w,h\" or {x,y,w,h}"},
                 "zoom": int("screen pixels per art pixel; default: cells ~200 px"),
                 "jump_threshold": int("silhouette edge moves above this many px are warnings; default 2"),
+                "trace": {"type": "array", "description": "points to follow (hands, feet, head): a marker name (its point), another region name (topmost opaque pixel inside it), or {key, area?} = topmost pixel of that palette key (inside area: region name, \"x,y,w,h\" or {x,y,w,h}). Reports per-step positions and moves, warns about back-and-forth steps, more than two direction reversals and steps above trace_threshold, and draws each path dotted on the filmstrip", "items": {"anyOf": [{"type": "string"}, {"type": "object", "properties": {"key": {"type": "string"}, "area": {}}}]}},
+                "trace_threshold": int("a traced point moving more than this many px in one step is a warning; default 3"),
                 "inline": boolean("also return the PNG as image content; default true")}), &["path", "tag"]),
         tool("focus", "Live hint for an open editor (follow mode): switch to the document's tab, jump to a frame/layer and show an area, with a banner, without changing anything. A document that is not open in the editor is not opened (use open_editor). Use it before drawing, e.g. \"now working on fist_left\".", json!({
                 "path": path, "frame": frame, "layer": {"type": ["integer", "string"], "description": "layer (default 0)"},
@@ -3287,6 +3383,8 @@ pub(crate) fn test_call(workdir: &Path, name: &str, args: Value) -> (bool, Strin
     (res["isError"] == false, res["content"][0]["text"].as_str().unwrap_or("").to_string())
 }
 
+mod lint;
+mod parts;
 #[cfg(test)]
 mod tests;
 mod tilemap;

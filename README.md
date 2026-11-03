@@ -356,9 +356,11 @@ oder `claude mcp add pixel-editor -- /pfad/zu/pixel-editor/target/release/pixel-
 | `set_palette_color(key, color?, name?, remove?)` | Palette mit Namen |
 | `set_ramps(path, ramps[{name, keys}])` | Farbrampen setzen (ersetzt alle, `[]` löscht sie): `keys` von dunkel nach hell als Tastenfolge `"b89a"` oder Liste von Tasten/Farbnamen. Nur in `.pxe.json` (bei `.aseprite` abgelehnt). `get_document` listet sie |
 | `shade(path, layer, frame, pixels \| rect \| region, steps, dry_run?, note?)` | entlang der Rampen schattieren: `steps` +n = n Stufen heller, −n = dunkler, am Ende der Rampe bleibt die Farbe. Farben ohne Rampe und Transparenz bleiben, jedes Pixel ändert sich höchstens einmal. Diff, Verlauf, `undo` wie die anderen Schreibwerkzeuge |
-| `render_preview(path, frame? \| frames?, layer?, zoom?, grid?, regions?, tiled?, inline?)` | Vorschau ansehen; `tiled: true` zeigt jeden Frame 3×3 wie gekachelt (Datei `…_tiled.png`, Raster und Regionen dann nur auf Wunsch) |
+| `render_preview(path, frame? \| frames?, layer?, zoom?, grid?, regions?, tiled?, view?, inline?)` | Vorschau ansehen; `tiled: true` zeigt jeden Frame 3×3 wie gekachelt (Datei `…_tiled.png`, Raster und Regionen dann nur auf Wunsch). `view`: `normal` (Standard), `silhouette` (alle deckenden Pixel dunkel auf hell: liest sich die Form?), `grayscale` (nur Helligkeit: tragen die Werte ohne Farbton?), `mirrored` (links-rechts gespiegelt: zeigt Proportionsfehler; Lineale und Regionen nennen weiter die echten Pixel); eine Liste zeigt die Ansichten je Frame nebeneinander. Nur im Vorschaubild, nie in Pixeln oder Exporten |
+| `lint(path, frame? \| frames? \| tag?, layer?, region? \| rect?, checks?, max?)` | Handwerks-Prüfung, nur lesend, auf dem Gesamtbild oder einer Ebene: verwaiste Pixel, Doppelte (L-Ecken auf 1-px-Linien), Treppen-Unregelmäßigkeiten (ungleichmäßige Stufen wie 2-1-3) und Farben außerhalb aller Rampen, je mit Koordinaten, gruppiert und gekürzt; erste Zeile fasst zusammen (Regeln unten) |
+| `save_part(path, layer, frame, region \| rect, name, library?, overwrite?)`, `place_part(path, layer, frame \| frames, name, x, y, mode?, flip_h?, flip_v?, map?, library?)`, `list_parts(library?)` | Teile-Bibliothek: ein abgenommenes Stück (z. B. das Schwert in einem Winkel) unter einem Namen speichern und später wieder einsetzen statt neu zu zeichnen (siehe unten) |
 | `check_seams(path, frame?, layer?, threshold?)` | Nahtstellen eines Tiles prüfen: rechte Spalte gegen linke, unterste Zeile gegen oberste, wie sie beim Kacheln aneinanderstoßen. Je Naht: wie viele Paare sich unterscheiden, welche harte Kanten sind (Farbabstand ≥ `threshold`, Standard 0,25; als Läufe mit beiden Tasten, z. B. `y 9..14: E cliff earth dark \| r stone`) und ob die Naht mehr Kontrast hat als das Innere des Tiles („VISIBLE SEAM“). Nur lesend |
-| `render_animation(path, tag, region?, track?, zoom?, jump_threshold?, inline?)` | Animation als Standbild prüfen (siehe unten) |
+| `render_animation(path, tag, region?, track?, trace?, trace_threshold?, zoom?, jump_threshold?, inline?)` | Animation als Standbild prüfen (siehe unten) |
 | `history`, `undo(steps?)`, `snapshot(name, note?)`, `list_snapshots`, `diff_snapshot(name, layer?, frame?)`, `restore_snapshot(name)` | Verlauf und Schnappschüsse |
 | `focus(path, frame, layer?, region? \| rect?, note?)`, `open_editor(path)`; `pace_ms` an Schreibwerkzeugen | live zusehen (siehe „KI folgen“) |
 | `get_user_view` | was im Editor gerade offen und ausgewählt ist, samt Pixeln der Auswahl und allen „KI zeigen“-Markierungen mit Notizen (siehe „Was du gerade ansiehst“) |
@@ -392,8 +394,29 @@ Claude sieht nur Standbilder. `render_animation` macht deshalb aus einem Tag ein
   - isolierte Pixel ohne deckenden Nachbarn
   - neue verwaiste Pixel ohne 4-Nachbarn gleicher Taste (verglichen mit dem vorherigen Schritt an der verschobenen Position)
   - Schritte, die mit dem vorherigen identisch sind
+  - Bahnen aus `trace`, die ihren Bogen verlassen (siehe unten)
+- **`trace`** verfolgt Punkte, damit Hände, Füße und Kopf auf Bögen laufen: ein Markername (sein Punkt je Schritt), ein anderer Regionsname (oberster deckender Pixel darin) oder `{key, area?}` (oberster Pixel dieser Taste, wahlweise nur in `area`; bei flacher Oberkante die Mitte der Zeile). Die Antwort nennt je Schritt Position und Bewegung (`trace hand: 0:(3,4) | 1:(5,3) +2,-1 …`), im Filmstreifen ist die ganze Bahn gepunktet eingezeichnet (rosa, grün, orange, violett je Spur), der Punkt des Schritts als Ring. Warnungen: ein einzelner Schritt gegen die Bewegung auf einer Achse („goes back and forth“), mehr als zwei Richtungsumkehrungen (aufeinanderfolgende Bewegungen mehr als 90° auseinander; ein Pendel kehrt zweimal je Loop um, ein Bogen oder Kreis nie) und Sprünge über `trace_threshold` px (Standard 3). Stillstand zählt nicht als Bewegung, und Wackler nur aus 1-px-Schritten (Kopfwippen) werden nicht beurteilt: ein Pixel ist der kleinste Schritt.
 
 Das PNG landet in `preview/<name>_<tag>_anim.png` und wird direkt als Bild zurückgegeben.
+
+### Handwerk prüfen: `lint`
+
+`lint` sucht typische Pixelart-Fehler und nennt sie mit Koordinaten (je Art höchstens `max`, Standard 10). Auswahl über `checks`: `orphans`, `doubles`, `jaggies`, `ramps`.
+
+- **orphans**: Pixel ohne 4-Nachbarn derselben Taste, außer solchen mit einem diagonalen Nachbarn ihrer Taste (Stufen einer Diagonale). Einzelne Lichter (Augen, Glanzpunkte) sind oft Absicht.
+- **doubles**: L-Ecken auf 1-px-Linien. Geprüft werden nur „dünne“ Formen: 8-verbundene Flächen einer Taste mit mindestens 4 Pixeln und ohne 2×2-Block, gefüllte Flächen und dicke Striche also nie. Ein Pixel ist doppelt, wenn genau zwei seiner 4-Nachbarn seine Taste haben, diese im rechten Winkel liegen, jeder andere Nachbar derselben Taste einen der beiden berührt (ohne ihn bleibt die Linie verbunden) und nicht beide Arme gerade weiterlaufen (das ist eine echte Ecke, etwa eines Kastens). Eine Treppenstufe hat oft zwei solche Ecken nebeneinander; sie gelten als ein Fund, einer der beiden Pixel kann weg.
+- **jaggies**: ungleichmäßige Stufen. Die Linie wird an Abzweigungen in einfache Ketten zerlegt (nach Entfernen eines Pixels je Doppelten) und jede Kette in Abschnitte mit Bewegungen in einem Oktanten. Die Pixelläufe entlang der geraden Richtung sind die Stufen; erster und letzter Lauf sind angeschnitten und zählen nicht, nötig sind mindestens 3 innere Läufe. In Ordnung ist ein Abschnitt, wenn seine inneren Läufe höchstens zwei benachbarte Werte haben (gerade Linie jeder Steigung, z. B. 2-1-2-1 oder 3-3-2), nur wachsen oder nur schrumpfen (Kurve) oder sich von Lauf zu Lauf um höchstens 1 ändern; alles andere (2-1-3, 3-1-3, 1-4-1) wird gemeldet. Grenzen: Linien aus mehreren Tasten (Anti-Aliasing, selektive Kontur) zerfallen in mehrere Linien, kurze Linien werden nicht beurteilt, ein gewollter Knick innerhalb eines Oktanten wird ebenfalls gemeldet.
+- **ramps**: Farben, die in keiner Rampe des Dokuments stehen (nur wenn es Rampen hat); Kontur- und Akzentfarben sind das oft mit Absicht.
+- Ein Banding-Check fehlt bewusst: eine billige Heuristik (parallele Schattenbänder entlang der Kontur) lieferte auf kleinen Sprites zu viele Fehlalarme.
+
+### Teile-Bibliothek: `save_part`, `place_part`, `list_parts`
+
+Ein abgenommenes Teil (das Schwert in jedem Winkel, eine Hand) wird einmal gespeichert und danach eingesetzt statt neu gezeichnet. `save_part` nimmt die Pixel einer Ebene und eines Frames in `region` oder `rect`; transparente Pixel bleiben transparent. Die Datei `<name>.json` enthält die Tastenzeilen und zu jeder benutzten Taste Farbe und Name. Namen: Kleinbuchstaben, Ziffern, `-`, `_`.
+
+- **Projekt-Bibliothek** (Standard): `<Arbeitsordner>/.pxe-parts/`.
+- **Persönliche Bibliothek** (für alle Projekte): `$PXE_PARTS_DIR`, sonst `$XDG_DATA_HOME/pixel-editor/parts`, sonst `~/.local/share/pixel-editor/parts`.
+
+`place_part` setzt die linke obere Ecke auf (`x`, `y`) in einen oder mehrere Frames (`frame` oder `frames`) und ist ein normales Schreibwerkzeug: Sperren verweigern, Diff, `dry_run`, `note`, Verlauf, `undo`. Farben werden über den Wert zugeordnet: dieselbe Taste, wenn sie die Farbe des Teils hat, sonst irgendeine Taste mit dieser Farbe. Fehlt eine Farbe in der Zielpalette, schreibt das Werkzeug nichts und nennt sie (`map: {Teil-Taste: Ziel-Taste}` legt die Zuordnung selbst fest). `mode` `over` (Standard) lässt den Cel unter transparenten Teil-Pixeln stehen, `replace` leert ihn dort; `flip_h`/`flip_v` spiegeln das Teil. Ohne `library` sucht es erst im Projekt, dann persönlich. `list_parts` zeigt Name, Größe, Tasten, Herkunft und die Zeilen.
 
 ## Exporte
 

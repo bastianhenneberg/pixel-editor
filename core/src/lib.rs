@@ -13,12 +13,15 @@ pub mod history;
 pub mod import;
 pub mod io;
 pub mod journal;
+pub mod lint;
 pub mod palettes;
+pub mod parts;
 pub mod recolor;
 pub mod reference;
 pub mod render;
 pub mod seams;
 pub mod tilemap;
+pub mod trace;
 pub mod transform;
 
 pub use color::Rgba;

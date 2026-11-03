@@ -179,6 +179,78 @@ pub struct PreviewOptions {
     /// rulers count inside the tile, ticks mark the seams, regions are
     /// drawn on the middle copy.
     pub tiled: bool,
+    /// Ways to look at each frame, side by side (empty = normal only).
+    pub views: Vec<View>,
+}
+
+/// A way of looking at the art in the preview only (pixels and exports stay
+/// as they are): the silhouette checks that the shape reads, grayscale that
+/// the values hold without hue, mirrored shows proportion errors the eye
+/// has got used to.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum View {
+    #[default]
+    Normal,
+    /// Every opaque pixel one dark color on a light background.
+    Silhouette,
+    /// Luminance only.
+    Grayscale,
+    /// Flipped horizontally; rulers and regions still name the real pixels.
+    Mirrored,
+}
+
+/// Silhouette view: the shape and its background.
+const SIL_INK: [u8; 4] = [28, 28, 36, 255];
+const SIL_BG: [u8; 4] = [226, 224, 214, 255];
+
+impl View {
+    pub const ALL: [View; 4] = [View::Normal, View::Silhouette, View::Grayscale, View::Mirrored];
+
+    pub fn id(self) -> &'static str {
+        match self {
+            View::Normal => "normal",
+            View::Silhouette => "silhouette",
+            View::Grayscale => "grayscale",
+            View::Mirrored => "mirrored",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<View, String> {
+        View::ALL
+            .into_iter()
+            .find(|v| v.id() == s)
+            .ok_or_else(|| format!("unknown view {s:?} ({})", View::ALL.map(View::id).join(", ")))
+    }
+
+    /// The frame image as this view shows it.
+    pub fn apply(self, img: &Image) -> Image {
+        let mut out = img.clone();
+        match self {
+            View::Normal => {}
+            View::Silhouette => {
+                for px in out.pixels.as_chunks_mut::<4>().0 {
+                    if px[3] > 0 {
+                        px.copy_from_slice(&SIL_INK);
+                    }
+                }
+            }
+            View::Grayscale => {
+                for px in out.pixels.as_chunks_mut::<4>().0 {
+                    // Rec. 709 luma of the sRGB values
+                    let l = (0.2126 * px[0] as f32 + 0.7152 * px[1] as f32 + 0.0722 * px[2] as f32).round() as u8;
+                    px[..3].copy_from_slice(&[l, l, l]);
+                }
+            }
+            View::Mirrored => {
+                for y in 0..img.height {
+                    for x in 0..img.width {
+                        out.put(img.width - 1 - x, y, img.get(x, y));
+                    }
+                }
+            }
+        }
+        out
+    }
 }
 
 /// A marker on the art pixel whose top-left screen position is (x0, y0) at
@@ -266,10 +338,13 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
     let num_w = text_width(&"0".repeat(digits as usize), ts) + 4;
     let step = [1u32, 2, 4, 8, 16, 32, 64].into_iter().find(|s| s * zoom >= num_w).unwrap_or(64);
     let thumbs_w = dw * 2 + 8;
-    // two label lines per frame: "index name" and "ms [tags] LINK"
-    let labels: Vec<(String, String)> = frames
+    let views: Vec<View> = if opts.views.is_empty() { vec![View::Normal] } else { opts.views.clone() };
+    // one cell per frame and view, the views of a frame side by side
+    let cells: Vec<(usize, View)> = frames.iter().flat_map(|&f| views.iter().map(move |&v| (f, v))).collect();
+    // two label lines per cell: "index name" and "ms [tags] LINK [view]"
+    let labels: Vec<(String, String)> = cells
         .iter()
-        .map(|&f| {
+        .map(|&(f, view)| {
             let fr = &doc.frames[f];
             let mut info = format!("{}ms", fr.duration_ms);
             let tags: Vec<&str> = doc.tags.iter().filter(|t| t.contains(f)).map(|t| t.name.as_str()).collect();
@@ -279,6 +354,9 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
             if doc.layers.iter().any(|l| l.link_source(f) != f) {
                 info += " LINK";
             }
+            if views.len() > 1 || view != View::Normal {
+                info += &format!(" {}", view.id().to_uppercase());
+            }
             (format!("{f} {}", fr.name), info)
         })
         .collect();
@@ -286,8 +364,10 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
     let widest = labels.iter().map(|(a, b)| text_width(a, ts).max(text_width(b, ts))).max().unwrap_or(0) + pad;
     let cell_w = min_cell.max(widest.min(min_cell * 2));
     let cell_h = label_h + ruler_top + th.max(dh * 3 + 6) + pad;
-    let n = frames.len().max(1) as u32;
-    let cols = (1800 / cell_w).clamp(1, n);
+    let n = cells.len().max(1) as u32;
+    // keep the views of one frame in one row
+    let nv = views.len() as u32;
+    let cols = if nv > 1 { ((1800 / cell_w) / nv).max(1) * nv } else { 1800 / cell_w }.clamp(1, n);
     let rows = n.div_ceil(cols);
     let sw = 22;
     let pal_h = if doc.palette.is_empty() { 0 } else { sw + 6 + text_height(ts) + pad };
@@ -307,7 +387,8 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
             img
         }
     };
-    for (i, &f) in frames.iter().enumerate() {
+    for (i, &(f, view)) in cells.iter().enumerate() {
+        let mirrored = view == View::Mirrored;
         let ox = pad + (i as u32 % cols) * cell_w;
         let oy = pad + (i as u32 / cols) * cell_h;
         let (name, info) = &labels[i];
@@ -318,7 +399,9 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
         let gy = oy + label_h + ruler_top;
         // rulers: numbers centred on their pixel column/row
         for x in (0..dw).filter(|x| (x % doc.width).is_multiple_of(step)) {
-            let t = (x % doc.width).to_string();
+            // mirrored: the ruler names the real column shown at this place
+            let real = if mirrored { doc.width - 1 - x % doc.width } else { x % doc.width };
+            let t = real.to_string();
             let cx = gx as i32 + (x * zoom + zoom / 2) as i32 - text_width(&t, ts) as i32 / 2;
             draw_text(&mut out, cx, (gy - ruler_top) as i32, &t, ts, if x % 8 == 0 { TEXT } else { DIM });
         }
@@ -329,12 +412,19 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
             draw_text(&mut out, cx, cy, &t, ts, if y % 8 == 0 { TEXT } else { DIM });
         }
         let cell = (zoom / 2).max(2);
+        let ground = |x: u32, y: u32| {
+            if view == View::Silhouette {
+                SIL_BG
+            } else {
+                CHECKER[((x / cell + y / cell) % 2) as usize]
+            }
+        };
         for y in 0..th {
             for x in 0..tw {
-                out.put(gx + x, gy + y, CHECKER[((x / cell + y / cell) % 2) as usize]);
+                out.put(gx + x, gy + y, ground(x, y));
             }
         }
-        let img = render_frame(f);
+        let img = view.apply(&render_frame(f));
         out.overlay(&img.scaled(zoom), gx, gy);
         if opts.tiled {
             // seam ticks between the rulers and the image, the art stays untouched
@@ -369,7 +459,9 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
                 let t = if zoom >= 6 { 2 } else { 1 };
                 // tiled: on the middle copy
                 let (mx, my) = if opts.tiled { (doc.width * zoom, doc.height * zoom) } else { (0, 0) };
-                let (x0, y0) = ((gx + mx) as i32 + rc.x * zoom as i32, (gy + my) as i32 + rc.y * zoom as i32);
+                // mirrored: the region where its pixels are shown
+                let rx = if mirrored { doc.width as i32 - rc.x - rc.w as i32 } else { rc.x };
+                let (x0, y0) = ((gx + mx) as i32 + rx * zoom as i32, (gy + my) as i32 + rc.y * zoom as i32);
                 let clip = (gx as i32, gy as i32, (gx + tw) as i32, (gy + th) as i32);
                 if r.is_marker() {
                     crosshair(&mut out, x0, y0, zoom, c, clip);
@@ -409,6 +501,10 @@ pub fn preview(doc: &Document, frames: &[usize], opts: &PreviewOptions) -> Image
         }
         // actual-size thumbnails: does it read at 1x and 2x?
         let tx = gx + tw + 8;
+        if view == View::Silhouette {
+            out.fill_rect(tx, gy, dw, dh, SIL_BG);
+            out.fill_rect(tx, gy + dh + 6, dw * 2, dh * 2, SIL_BG);
+        }
         out.overlay(&img, tx, gy);
         out.overlay(&img.scaled(2), tx, gy + dh + 6);
     }
@@ -481,7 +577,11 @@ mod tests {
         let mut d = Document::new(4, 4, Document::builtin_palette("pico8").unwrap()).unwrap();
         d.set_rows(0, 0, 0, 0, &["8c".into(), "c8".into()]).unwrap();
         let zoom = 6;
-        let img = preview(&d, &[0], &PreviewOptions { zoom, grid: false, layer: None, regions: false, tiled: false });
+        let img = preview(
+            &d,
+            &[0],
+            &PreviewOptions { zoom, grid: false, layer: None, regions: false, tiled: false, views: vec![] },
+        );
         // find the zoomed frame: the first run of zoom x zoom pixels of color '8'
         let red = d.color_of(b'8').unwrap().0;
         let (mut found, w) = (None, img.width);
@@ -511,7 +611,11 @@ mod tests {
         m.color = Some(crate::Rgba([0, 255, 0, 255]));
         d.regions.push(m);
         let zoom = 8;
-        let img = preview(&d, &[0], &PreviewOptions { zoom, grid: false, layer: None, regions: true, tiled: false });
+        let img = preview(
+            &d,
+            &[0],
+            &PreviewOptions { zoom, grid: false, layer: None, regions: true, tiled: false, views: vec![] },
+        );
         // the marked art pixel keeps its color; green arms around it
         let red = d.color_of(b'8').unwrap().0;
         // leftmost red pixel = the zoomed frame (thumbnails are to its right)
@@ -543,7 +647,7 @@ mod tests {
         }
         assert_eq!(t.get(4, 2), [0, 0, 0, 0]);
         let zoom = 5;
-        let opts = PreviewOptions { zoom, grid: false, layer: None, regions: false, tiled: true };
+        let opts = PreviewOptions { zoom, grid: false, layer: None, regions: false, tiled: true, views: vec![] };
         let plain = preview(&d, &[0], &PreviewOptions { tiled: false, ..opts.clone() });
         let img = preview(&d, &[0], &opts);
         assert!(img.height > plain.height);
