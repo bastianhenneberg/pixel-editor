@@ -61,7 +61,7 @@ impl Server {
                     },
                 })
                 .collect();
-            let found = lint::lint(&keys, doc.width, doc.height, &checks, &doc.ramps);
+            let found = lint::lint(&keys, doc.width, doc.height, &checks, &doc.ramps, &doc.palette);
             if found.is_empty() {
                 clean.push(doc.frame_label(f));
                 continue;
@@ -75,6 +75,7 @@ impl Server {
             total.orphans.extend(found.orphans);
             total.doubles.extend(found.doubles);
             total.jaggies.extend(found.jaggies);
+            total.bands.extend(found.bands);
             for o in found.off_ramp {
                 match total.off_ramp.iter_mut().find(|t| t.key == o.key) {
                     Some(t) => t.count += o.count,
@@ -100,8 +101,7 @@ impl Server {
         if !clean.is_empty() {
             text += &format!("clean: {}\n", clean.join(", "));
         }
-        text +=
-            "Orphans can be deliberate (eyes, glints); doubles and jaggies are judged on 1-px lines of one key only.";
+        text += "Orphans can be deliberate (eyes, glints); doubles and jaggies are judged on 1-px lines of one key only, shading edges are not lines; banding only sees three shades with parallel edges.";
         Ok(Out::Text(text))
     }
 }
@@ -110,7 +110,7 @@ pub fn tool_defs() -> Vec<Value> {
     let path =
         json!({"type": "string", "description": "document path relative to the workdir; the extension may be omitted"});
     vec![
-        json!({"name": "lint", "description": "Pixel-art craft check, read-only: for one frame, several, a tag or all (default), on the visible composite or one layer, report with coordinates, grouped by kind and capped: orphans (no 4-neighbour of the same key and no diagonal one either, so steps of diagonal lines do not count), doubles (L-corners on 1-px lines where a diagonal step would do; filled areas and real box corners are not flagged), jaggies (uneven step lengths along 1-px lines such as 2-1-3; straight lines of any slope like 2-1-2-1 and smoothly bending curves pass) and colors in no ramp (only when the document has ramps). The first line sums up. No banding check.", "inputSchema": {"type": "object", "properties": {
+        json!({"name": "lint", "description": "Pixel-art craft check, read-only: for one frame, several, a tag or all (default), on the visible composite or one layer, report with coordinates, grouped by kind and capped: orphans (no 4-neighbour of the same key and no diagonal one either, so steps of diagonal lines do not count), doubles (L-corners on 1-px lines where a diagonal step would do; filled areas and real box corners are not flagged), jaggies (uneven step lengths along 1-px lines such as 2-1-3; straight lines of any slope like 2-1-2-1 and smoothly bending curves pass) colors in no ramp (only when the document has ramps) and banding (three shades of one material with a band of constant width whose parallel edges step sideways; dead straight bands, thin straps and a single shade along an outline do not count, so a clean result does not prove there is none). Shades come from the document's ramps, else from color closeness; thin areas that mostly touch a shade of their material are shading edges, not lines, and single pixels in a shading transition are no orphans. The first line sums up.", "inputSchema": {"type": "object", "properties": {
         "path": path,
         "frame": {"type": ["integer", "string"], "description": "one frame (index, name or tag/n); \"all\" or omitted = all frames"},
         "frames": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "these frames"},
@@ -118,7 +118,7 @@ pub fn tool_defs() -> Vec<Value> {
         "layer": {"type": ["integer", "string"], "description": "only this layer; default the visible composite"},
         "region": {"type": "string", "description": "only inside this region (its rect per frame)"},
         "rect": {"type": "object", "description": "only inside {x, y, w, h}", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "w": {"type": "integer"}, "h": {"type": "integer"}}},
-        "checks": {"type": "array", "items": {"type": "string", "enum": ["orphans", "doubles", "jaggies", "ramps"]}, "description": "which checks; default all"},
+        "checks": {"type": "array", "items": {"type": "string", "enum": ["orphans", "doubles", "jaggies", "ramps", "banding"]}, "description": "which checks; default all"},
         "max": {"type": "integer", "description": "entries listed per kind and frame; default 10"}}, "required": ["path"]}}),
     ]
 }

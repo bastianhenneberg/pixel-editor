@@ -80,7 +80,41 @@ fn lint_reports_line_problems_and_passes_clean_shapes() {
     ok(&s, "set_ramps", json!({"path": "a", "ramps": [{"name": "red", "keys": "25"}]}));
     let t = ok(&s, "lint", json!({"path": "a", "frame": 1, "checks": ["ramps"]}));
     assert!(t.contains("2 off-ramp colors") && t.contains("colors in no ramp: 8"), "{t}");
-    assert!(err(&s, "lint", json!({"path": "a", "checks": ["banding"]})).contains("unknown check"));
+    assert!(err(&s, "lint", json!({"path": "a", "checks": ["sparkle"]})).contains("unknown check"));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn lint_finds_banding_and_skips_shade_edges() {
+    let (s, dir) = server("lint-banding");
+    ok(&s, "create_document", json!({"name": "a", "width": 12, "height": 8}));
+    for (key, color) in [("b", "#64280e"), ("8", "#b76010"), ("9", "#ebb056"), ("a", "#e6ce90"), ("0", "#000000")] {
+        ok(&s, "set_palette_color", json!({"path": "a", "key": key, "color": color}));
+    }
+    // frame 0: a banded stair; frame 1: same shades, edges offset
+    ok(
+        &s,
+        "set_rows",
+        json!({"path": "a", "layer": 0, "frame": 0, "x": 0, "y": 0, "rows": [
+        "0b89aaaaaaaa", "0b89aaaaaaaa", "00b89aaaaaaa", "00b89aaaaaaa",
+        "000b89aaaaaa", "000b89aaaaaa", "0000b89aaaaa", "0000b89aaaaa"]}),
+    );
+    ok(&s, "add_frame", json!({"path": "a"}));
+    ok(
+        &s,
+        "set_rows",
+        json!({"path": "a", "layer": 0, "frame": 1, "x": 0, "y": 0, "rows": [
+        "0b89aaaaaaaa", "0bb89aaaaaaa", "00b889aaaaaa", "00bb899aaaaa",
+        "000b88999aaa", "000bb8889aaa", "0000b88899aa", "0000bb88899a"]}),
+    );
+    let t = ok(&s, "lint", json!({"path": "a", "frame": 0, "checks": ["banding"]}));
+    assert!(t.lines().next().unwrap().ends_with(": 2 bands"), "{t}");
+    assert!(t.contains("8|9|a (3,0)->(6,7) 1 px wide over 8 lines"), "{t}");
+    let t = ok(&s, "lint", json!({"path": "a", "frame": 1, "checks": ["banding"]}));
+    assert!(t.lines().next().unwrap().ends_with(": 0 bands"), "{t}");
+    // the 1-px shade bands of frame 0 are thin, but no lines
+    let t = ok(&s, "lint", json!({"path": "a", "frame": 0, "checks": ["doubles", "jaggies"]}));
+    assert!(t.lines().next().unwrap().ends_with(": 0 doubles, 0 jaggy lines"), "{t}");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

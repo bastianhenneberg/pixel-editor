@@ -1,5 +1,5 @@
 //! Pixel-art knowledge in three layers, merged when read:
-//! - built-in: `knowledge/*.md` of the repo, compiled into the binary;
+//! - built-in: `app/knowledge/*.md` of the repo, compiled into the binary;
 //! - personal: owned by this installation (`$PXE_KNOWLEDGE_DIR`, else
 //!   `$XDG_DATA_HOME/pixel-editor/knowledge/`, `~/.local/share/...`);
 //! - project: `<workdir>/.pxe-knowledge/`.
@@ -12,11 +12,11 @@ use std::path::{Path, PathBuf};
 
 /// The topics shipped with the editor (name, text).
 pub const BUILT_IN: &[(&str, &str)] = &[
-    ("workflow", include_str!("../../knowledge/workflow.md")),
-    ("fundamentals", include_str!("../../knowledge/fundamentals.md")),
-    ("animation-principles", include_str!("../../knowledge/animation-principles.md")),
-    ("pixel-animation", include_str!("../../knowledge/pixel-animation.md")),
-    ("checklist", include_str!("../../knowledge/checklist.md")),
+    ("workflow", include_str!("../knowledge/workflow.md")),
+    ("fundamentals", include_str!("../knowledge/fundamentals.md")),
+    ("animation-principles", include_str!("../knowledge/animation-principles.md")),
+    ("pixel-animation", include_str!("../knowledge/pixel-animation.md")),
+    ("checklist", include_str!("../knowledge/checklist.md")),
 ];
 
 /// Folder of the project layer inside the workdir.
