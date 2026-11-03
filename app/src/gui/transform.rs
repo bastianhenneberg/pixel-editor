@@ -429,7 +429,7 @@ impl EditorApp {
             self.status = format!("{}: Endung .pxe.json oder .aseprite fehlt", path.display());
             return;
         }
-        let (doc, clipped) = transform::mirror_document(&self.doc, Op::FlipH);
+        let (doc, clipped) = transform::mirror_document(&self.doc, Op::FlipH, &[]);
         let from = self.path.as_ref().map_or("unbenannt".into(), |p| p.display().to_string());
         let note = format!("gespiegelt dupliziert aus {from}");
         let res = io::save(&doc, path).and_then(|_| Journal::for_document(path).record_edit(&doc, "user", &note, None));

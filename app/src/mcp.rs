@@ -30,6 +30,7 @@ use pixel_core::export::{self, ExportOptions, Target};
 use pixel_core::journal::{Focus, Journal};
 use pixel_core::recolor::{self, Area, Outline, OutlineMode, Pattern};
 use pixel_core::render::PreviewOptions;
+use pixel_core::rigid;
 use pixel_core::seams;
 use pixel_core::transform::{self, Op};
 use pixel_core::{draw, import, io, palettes, render, Document, PaletteEntry, Rgba, TRANSPARENT};
@@ -797,6 +798,8 @@ impl Server {
             "transform" => self.transform_tool(a),
             "replace_color" | "outline" => self.recolor_tool(a, name),
             "mirror_document" => self.mirror_document(a),
+            "check_rigid" => self.check_rigid(a),
+            "shift_frames" => self.shift_frames(a),
             "list_regions" => {
                 let (_, doc, _) = self.load(a)?;
                 Ok(Out::Text(list_regions(&doc, a)?))
@@ -1928,10 +1931,24 @@ impl Server {
         if !matches!(op, Op::FlipH | Op::FlipV) {
             return Err("mirror_document mirrors: op flip_h (default) or flip_v".into());
         }
-        let (mirrored, clipped) = transform::mirror_document(&doc, op);
+        let keep: Vec<usize> = match a.get("keep_layers") {
+            None | Some(Value::Null) => Vec::new(),
+            Some(Value::Array(list)) => list
+                .iter()
+                .map(|v| doc.find_layer(&index_or_name(Some(v)).ok_or("keep_layers: give layer indices or names")?))
+                .collect::<Result<_, _>>()?,
+            Some(_) => return Err("keep_layers must be an array of layer indices or names".into()),
+        };
+        let (mirrored, clipped) = transform::mirror_document(&doc, op, &keep);
         mirrored.validate()?;
+        let kept = if keep.is_empty() {
+            String::new()
+        } else {
+            let names: Vec<String> = keep.iter().map(|l| format!("{:?}", doc.layers[*l].name)).collect();
+            format!("; layers {} kept unmirrored with their regions", names.join(", "))
+        };
         let msg = format!(
-            "{} frames, {} layers, {} tags, {} regions mirrored ({}); durations and linked cels kept{}",
+            "{} frames, {} layers, {} tags, {} regions mirrored ({}); durations and linked cels kept{kept}{}",
             mirrored.frames.len(),
             mirrored.layers.len(),
             mirrored.tags.len(),
@@ -1950,6 +1967,225 @@ impl Server {
         let note = note_arg(a, || format!("{}: mirror_document {} from {}", self.author(), op.id(), self.rel(&src)));
         Journal::for_document(&dest).record_edit(&mirrored, &self.author(), &note, None)?;
         Ok(Out::Text(format!("wrote {}: {msg}\nrecorded as {note:?}", self.rel(&dest))))
+    }
+
+    /// Does a part of one layer (sword, shield) stay pixel-identical over
+    /// the frames and only move? Read-only.
+    fn check_rigid(&self, a: &Value) -> Result<Out, String> {
+        let (_, doc, _) = self.load(a)?;
+        let layer = doc.find_layer(&index_or_name(a.get("layer")).ok_or("missing \"layer\"")?)?;
+        let (frames, label) = self.scope_frames(&doc, a, frame_selection(a)?)?;
+        let reference = match index_or_name(a.get("reference")) {
+            Some(f) => doc.find_frame(&f)?,
+            None => frames[0],
+        };
+        let max_shift = opt_int(a, "max_shift")?.unwrap_or(4);
+        if !(0..=32).contains(&max_shift) {
+            return Err(format!("max_shift must be 0..32 (got {max_shift})"));
+        }
+        let max_pixels = opt_int(a, "max_pixels")?.unwrap_or(12).max(0) as usize;
+        let (area, region) = self.part_arg(&doc, a, layer)?;
+        let area = match (area, region) {
+            (_, Some(i)) => Some(doc.regions[i].rect_at(reference).ok_or_else(|| {
+                format!("region {:?} does not exist on frame {}", doc.regions[i].name, doc.frame_label_long(reference))
+            })?),
+            (r, None) => r,
+        };
+        let part = rigid::part_area(&doc, layer, reference, area)?;
+        let opaque = (part.y..part.y + part.h as i32)
+            .flat_map(|y| (part.x..part.x + part.w as i32).map(move |x| (x, y)))
+            .filter(|&(x, y)| doc.get(layer, reference, x, y) != TRANSPARENT)
+            .count();
+        let mut out = format!(
+            "check_rigid layer {:?}, {label}, reference frame {}: part {} ({opaque} opaque px{}), max_shift {max_shift}; \
+             offsets are relative to the reference frame\n",
+            doc.layers[layer].name,
+            doc.frame_label(reference),
+            part.describe(),
+            if area.is_none() { ", whole cel: other pixels of the layer count as differences" } else { "" }
+        );
+        let (mut rigid_frames, mut dxs, mut dys) = (0, Vec::new(), Vec::new());
+        for &f in &frames {
+            // a region moved on this frame centres the search on its move
+            let centre =
+                region.and_then(|i| doc.regions[i].rect_at(f)).map_or((0, 0), |r| (r.x - part.x, r.y - part.y));
+            let m = rigid::match_part(&doc, layer, reference, part, area.is_none(), f, centre, max_shift);
+            out += &format!("frame {}: dx {} dy {}, ", doc.frame_label(f), m.dx, m.dy);
+            if m.diffs.is_empty() {
+                rigid_frames += 1;
+                out += "rigid";
+            } else {
+                out += &format!("{} px differ", m.diffs.len());
+            }
+            if centre != (0, 0) {
+                out += &format!(" (region rect moved by ({}, {}))", centre.0, centre.1);
+            }
+            let src = doc.layers[layer].link_source(f);
+            if src != f {
+                out += &format!(" (linked: same cel as frame {})", doc.frame_label(src));
+            }
+            out += "\n";
+            if !m.diffs.is_empty() && max_pixels > 0 {
+                let shown: Vec<String> = m
+                    .diffs
+                    .iter()
+                    .take(max_pixels)
+                    .map(|d| format!("({}, {}) {} -> {}", d.x, d.y, d.expected as char, d.found as char))
+                    .collect();
+                let more = m.diffs.len().saturating_sub(max_pixels);
+                out += &format!(
+                    "  expected -> found: {}{}\n",
+                    shown.join(", "),
+                    if more > 0 { format!(" (+{more} more)") } else { String::new() }
+                );
+            }
+            dxs.push(m.dx.to_string());
+            dys.push(m.dy.to_string());
+        }
+        let dx_line = if dxs.iter().any(|d| d != "0") { format!(" dx: {}", dxs.join(" ")) } else { String::new() };
+        out += &format!("rigid in {rigid_frames}/{} frames; offsets{dx_line} dy: {}", frames.len(), dys.join(" "));
+        Ok(Out::Text(out))
+    }
+
+    /// The area argument of check_rigid / shift_frames: a rect, or the
+    /// index of a named (area) region on `layer`; neither = the whole cel.
+    fn part_arg(&self, doc: &Document, a: &Value, layer: usize) -> Result<(Option<Rect>, Option<usize>), String> {
+        match (a.get("region").and_then(Value::as_str), a.get("rect")) {
+            (Some(_), Some(_)) => Err("give either region or rect, not both".into()),
+            (Some(name), None) => {
+                let i = doc.find_region(name)?;
+                let r = &doc.regions[i];
+                if !r.applies_to_layer(doc, layer) {
+                    return Err(format!(
+                        "region {name:?} belongs to layer {:?}, not {:?}",
+                        r.layer.as_deref().unwrap_or(""),
+                        doc.layers[layer].name
+                    ));
+                }
+                if r.is_marker() {
+                    return Err(format!("{name:?} is a marker (a point); give an area region or rect"));
+                }
+                Ok((None, Some(i)))
+            }
+            (None, Some(r)) => Ok((Some(rect_arg(r).map_err(|e| format!("rect: {e}"))?), None)),
+            (None, None) => Ok((None, None)),
+        }
+    }
+
+    /// Move one layer's pixels (whole cel, region or rect) per frame by a
+    /// list of offsets, in one write and one history entry.
+    fn shift_frames(&self, a: &Value) -> Result<Out, String> {
+        let (path, doc, _) = self.load(a)?;
+        let layer = doc.find_layer(&index_or_name(a.get("layer")).ok_or("missing \"layer\"")?)?;
+        let (frames, _, label) = self.whole_frames(&doc, a, frame_selection(a)?)?;
+        let list = a.get("offsets").and_then(Value::as_array).ok_or("missing array \"offsets\"")?;
+        let offsets: Vec<(i32, i32)> = list
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let int = |v: &Value| v.as_i64().map(|n| n as i32);
+                match v {
+                    Value::Array(p) if p.len() == 2 => int(&p[0]).zip(int(&p[1])),
+                    v => int(v).map(|dy| (0, dy)),
+                }
+                .ok_or(format!("offsets[{i}]: give dy (integer) or [dx, dy], got {v}"))
+            })
+            .collect::<Result<_, _>>()?;
+        if offsets.len() != frames.len() {
+            return Err(format!(
+                "offsets has {} entries but {label} has {} frames; give one offset per frame",
+                offsets.len(),
+                frames.len()
+            ));
+        }
+        let (rect, region) = self.part_arg(&doc, a, layer)?;
+        // one shift per cel: linked frames must agree on their offset
+        let mut cels: Vec<(usize, usize, (i32, i32))> = Vec::new();
+        for (&f, &off) in frames.iter().zip(&offsets) {
+            let src = doc.layers[layer].link_source(f);
+            match cels.iter().find(|c| c.0 == src) {
+                Some(&(_, g, o)) if o != off => {
+                    return Err(format!(
+                        "frames {} and {} share one cel of layer {:?} (linked) but have different offsets {o:?} and \
+                         {off:?}; nothing was written. Unlink them first (link_cel unlink: true) or give the same offset",
+                        doc.frame_label(g),
+                        doc.frame_label(f),
+                        doc.layers[layer].name
+                    ))
+                }
+                Some(_) => {}
+                None => cels.push((src, f, off)),
+            }
+        }
+        let before = doc.clone();
+        let mut doc = doc;
+        let (mut cut, mut scopes) = (0, Vec::new());
+        for &(_, f, (dx, dy)) in cels.iter().filter(|c| c.2 != (0, 0)) {
+            let area = match region {
+                Some(i) => Some(doc.regions[i].rect_at(f).ok_or_else(|| {
+                    format!("region {:?} does not exist on frame {}", doc.regions[i].name, doc.frame_label_long(f))
+                })?),
+                None => rect,
+            };
+            cut += rigid::shift_area(&mut doc, layer, f, area, dx, dy);
+            scopes.push(CelScope { layer, frame: f, clip: area.map(|r| r.union(&r.translate(dx, dy))) });
+        }
+        // region rects follow: the named region, or (whole cel) the regions of this layer
+        let mut region_note = String::new();
+        if bool_arg(a, "update_region", true) && rect.is_none() {
+            let layer_name = doc.layers[layer].name.clone();
+            let n = doc.frames.len();
+            let (mut moved, mut skipped) = (Vec::new(), Vec::new());
+            for (i, r) in doc.regions.iter_mut().enumerate() {
+                let follows = match region {
+                    Some(j) => i == j,
+                    None => r.layer.as_ref() == Some(&layer_name),
+                };
+                if !follows || frames.iter().zip(&offsets).all(|(f, o)| *o == (0, 0) || r.rect_at(*f).is_none()) {
+                    continue;
+                }
+                if r.locked {
+                    skipped.push(r.name.clone());
+                    continue;
+                }
+                for (&f, &(dx, dy)) in frames.iter().zip(&offsets) {
+                    if let Some(rc) = r.rect_at(f).filter(|_| (dx, dy) != (0, 0)) {
+                        r.set_rect_for(f, f, transform::clip_rect(rc.translate(dx, dy), doc.width, doc.height), n);
+                    }
+                }
+                moved.push(r.name.clone());
+            }
+            if !moved.is_empty() {
+                region_note += &format!("; region rects moved along: {}", moved.join(", "));
+            }
+            region_note += &locked_regions_note(&skipped);
+        }
+        let all_dy = offsets.iter().all(|o| o.0 == 0);
+        let offsets_label = if all_dy {
+            format!("dy {}", offsets.iter().map(|o| o.1.to_string()).collect::<Vec<_>>().join(" "))
+        } else {
+            format!("[dx, dy] {}", offsets.iter().map(|o| format!("[{}, {}]", o.0, o.1)).collect::<Vec<_>>().join(" "))
+        };
+        let area_label = match (region, rect) {
+            (Some(i), _) => format!(" [{}]", before.regions[i].name),
+            (None, Some(r)) => format!(" [{}]", r.describe()),
+            (None, None) => String::new(),
+        };
+        let detail = format!(
+            "shift_frames layer {:?}{area_label}, {label}: {offsets_label}; {} cels shifted{}{region_note}",
+            doc.layers[layer].name,
+            scopes.len(),
+            if cut > 0 { format!("; {cut} pixels cut off at the canvas edge") } else { String::new() }
+        );
+        let mut args = a.clone();
+        if args.get("note").and_then(Value::as_str).is_none_or(|n| n.trim().is_empty()) {
+            args["note"] = json!(format!(
+                "{}: shift_frames {label} {}{area_label} {offsets_label}",
+                self.author(),
+                doc.layers[layer].name
+            ));
+        }
+        self.finish_write(&args, &path, &before, doc, &scopes, "shift_frames", detail, true)
     }
 
     fn new_doc_path(&self, name: &str, overwrite: bool) -> Result<PathBuf, String> {
@@ -2821,6 +3057,18 @@ fn int_of(a: &Value, name: &str) -> Result<i32, String> {
     opt_int(a, name)?.ok_or_else(|| format!("missing integer argument \"{name}\""))
 }
 
+/// The frame scope named by tag, frames [..] or from/to (default all
+/// frames), for scope_frames / whole_frames.
+fn frame_selection(a: &Value) -> Result<&'static str, String> {
+    let listed = a.get("frames").is_some() || a.get("from").is_some() || a.get("to").is_some();
+    match (a.get("tag").is_some(), listed) {
+        (true, true) => Err("give either tag or frames/from-to, not both".into()),
+        (true, false) => Ok("tag"),
+        (false, true) => Ok("frames"),
+        (false, false) => Ok("all"),
+    }
+}
+
 /// Layer/frame references may be given as index or name.
 fn index_or_name(v: Option<&Value>) -> Option<String> {
     match v? {
@@ -2952,7 +3200,10 @@ of every document grouped by frame: numbered areas or pixels with an optional no
 weg') and their pixels. Marks are the user's instructions; after handling them remove them with clear_marks. \
 Mirroring/rotating: transform (op flip_h|flip_v|rot90|rot180|rot270; scope rect/region/cel of one layer+frame, or \
 frame/frames/tag/all around the canvas centre; regions follow). A facing-left animation from a facing-right one: \
-mirror_document(src, dst) writes a mirrored copy with tags, durations, linked cels and regions kept; never redraw it. \
+mirror_document(src, dst) writes a mirrored copy with tags, durations, linked cels and regions kept; never redraw it; \
+keep_layers leaves e.g. a weapon layer unmirrored so it stays on its side. Rigid parts (sword, shield, helmet) must stay \
+pixel-identical and only move: check_rigid(layer, region?) reports each frame's offset and differing pixels, \
+shift_frames(layer, offsets) moves a layer per frame (e.g. dy [1, 1, 1, 0] along the body bob). \
 Shading: a document can have color ramps (palette keys dark to light, e.g. crust 3>8>9>a; set_ramps, shown by \
 get_document); shade(pixels|rect|region, steps +n lighter / -n darker) moves pixels along their ramp and leaves \
 colors outside any ramp alone. \
@@ -3143,11 +3394,33 @@ fn tool_list() -> Value {
                 "mode": {"type": "string", "enum": ["outside", "inside"]},
                 "connectivity": {"type": "integer", "enum": [4, 8]},
                 "only_transparent": boolean("outside only: draw only on transparent pixels (default false)")})), &["path", "color"]),
-        tool("mirror_document", "Write a mirrored copy of a document (e.g. walk_left from walk_right): every frame mirrored around the canvas centre; tags, durations, linked cels, layers, locks and regions are kept, region rects and markers are mirrored too. The source is not changed.", json!({
+        tool("mirror_document", "Write a mirrored copy of a document (e.g. walk_left from walk_right): every frame mirrored around the canvas centre; tags, durations, linked cels, layers, locks and regions are kept, region rects and markers are mirrored too. keep_layers copies those layers unmirrored (e.g. a sword carried on one side stays on that side), together with the regions and markers restricted to them; regions on all layers (origin) are mirrored with the body. The source is not changed.", json!({
                 "src": {"type": "string", "description": "source document path relative to the workdir"},
                 "dst": {"type": "string", "description": "new document name (\".pxe.json\" is appended unless given; .aseprite works too)"},
                 "op": {"type": "string", "enum": ["flip_h", "flip_v"], "description": "flip_h (default, left/right) or flip_v"},
+                "keep_layers": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "layers (index or name) copied unmirrored, e.g. [\"sword\"]"},
                 "overwrite": boolean("replace an existing file"), "dry_run": dry.clone(), "note": note.clone()}), &["src", "dst"]),
+        tool("check_rigid", "Check that a rigid part (sword, shield, helmet) stays pixel-identical across frames and only moves. The part is the layer's pixels in region/rect on the reference frame (default: the opaque bounding box of the whole cel; then any other pixel of the layer counts as a difference too). For each frame it finds the shift (dx, dy within max_shift) that matches the part best, comparing every pixel of the part's box including transparent ones, and reports dx, dy, the number of differing pixels (0 = rigid) and their coordinates (expected -> found, capped by max_pixels). A named region whose rect moves on a frame centres the search there. Linked cels are fine (shown as linked). Ends with a summary, e.g. \"rigid in 7/8 frames; offsets dy: 0 0 0 -1 0 0 0 -1\" (relative to the reference frame); fix stray pixels by hand and the motion with shift_frames. Read-only.", json!({
+                "path": path, "layer": layer.clone(),
+                "region": {"type": "string", "description": "the part: this area region's rect on the reference frame"},
+                "rect": {"type": "object", "description": "the part: {x, y, w, h} on the reference frame", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "w": {"type": "integer"}, "h": {"type": "integer"}}},
+                "frames": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "these frames (default all)"},
+                "from": {"type": ["integer", "string"], "description": "first frame"}, "to": {"type": ["integer", "string"], "description": "last frame (inclusive)"},
+                "tag": {"type": "string", "description": "the frames of this tag"},
+                "reference": {"type": ["integer", "string"], "description": "frame the part is taken from; default the first selected frame"},
+                "max_shift": int("largest |dx| and |dy| searched, default 4"),
+                "max_pixels": int("differing pixels listed per frame, default 12")}), &["path", "layer"]),
+        tool("shift_frames", "Move the pixels of one layer frame by frame in one write (e.g. a sword following the body bob): offsets has one entry per selected frame, either dy integers [1, 1, 1, 0] or [dx, dy] pairs [[0, 1], [1, 0]]. The whole cel moves, or only region (its rect on each frame) / rect, like move_region: the area is cleared and its opaque pixels are written at the offset (they may leave the area); pixels leaving the canvas are cut and counted. update_region (default true): the named region's rect follows on each frame, for a whole cel the regions restricted to this layer (locked ones stay). A cel linked between selected frames is shifted once when their offsets agree, otherwise refused (unlink it first); cels linked to frames outside need edit_linked. Locked layers/frames/regions refuse. One diff, dry_run, note and history entry for the whole call.", json!({
+                "path": path, "layer": layer.clone(),
+                "offsets": {"type": "array", "items": {"type": ["integer", "array"], "items": {"type": "integer"}}, "description": "one per selected frame: dy, or [dx, dy]"},
+                "frames": {"type": "array", "items": {"type": ["integer", "string"]}, "description": "these frames (default all)"},
+                "from": {"type": ["integer", "string"], "description": "first frame"}, "to": {"type": ["integer", "string"], "description": "last frame (inclusive)"},
+                "tag": {"type": "string", "description": "the frames of this tag"},
+                "region": {"type": "string", "description": "only the pixels in this area region's rect (on each frame)"},
+                "rect": {"type": "object", "description": "only the pixels in {x, y, w, h} (on every frame)", "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "w": {"type": "integer"}, "h": {"type": "integer"}}},
+                "update_region": boolean("move region rects along, default true"),
+                "edit_linked": boolean("allow changing cels linked to frames outside the selection"),
+                "dry_run": dry.clone(), "note": note.clone()}), &["path", "layer", "offsets"]),
         tool("list_regions", "List named regions with their rects per frame range, layer restriction and lock state. With frame: the rects on that frame.",
             json!({"path": path, "frame": {"type": ["integer", "string"], "description": "only show rects on this frame"}}), &["path"]),
         tool("set_region", "Create or update a named region (a rect the user and the AI assistant use to name a part, e.g. \"left_shoe\"). Without frame/from+to/tag the rect applies to all frames; with them only to those frames (other frames keep their rect). layer restricts it to one layer. locked protects its pixels from every edit. kind marker makes it a named point (origin, hand anchor): locked then protects only its position and name, never the pixels; it can be used as a render_animation track anchor.", meta(json!({

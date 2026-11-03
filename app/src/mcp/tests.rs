@@ -59,6 +59,9 @@ fn protocol_and_tools() {
         "get_user_view",
         "CONSISTENCY RULES: every pixel write needs an explicit target",
         "mirror_document(src, dst)",
+        "keep_layers",
+        "check_rigid(layer",
+        "shift_frames(layer, offsets)",
         "transform (op flip_h",
         "tiled: true",
         "check_seams",
@@ -114,6 +117,8 @@ fn protocol_and_tools() {
         "get_user_view",
         "transform",
         "mirror_document",
+        "check_rigid",
+        "shift_frames",
         "check_seams",
         "set_ramps",
         "shade",
@@ -935,6 +940,139 @@ fn transform_respects_locked_regions_and_mirror_document_copies() {
     assert!(err(&s, "mirror_document", json!({"src": "walk_right", "dst": "x", "op": "rot90"})).contains("flip_h"));
     ok(&s, "mirror_document", json!({"src": "walk_right", "dst": "walk_left.aseprite"}));
     assert_eq!(io::load(&dir.join("walk_left.aseprite")).unwrap().rows(0, 0), ["..21", "...3"]);
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn mirror_document_keeps_layers_unmirrored() {
+    let (s, dir) = server("mirror-keep");
+    ok(&s, "create_document", json!({"name": "walk_right", "width": 4, "height": 2}));
+    ok(&s, "set_rows", json!({"path": "walk_right", "layer": 0, "frame": 0, "rows": ["1...", "2..."]}));
+    ok(&s, "add_layer", json!({"path": "walk_right", "name": "sword"}));
+    ok(&s, "set_rows", json!({"path": "walk_right", "layer": "sword", "frame": 0, "rows": ["..3.", "..3."]}));
+    ok(
+        &s,
+        "set_region",
+        json!({"path": "walk_right", "name": "blade", "x": 2, "y": 0, "w": 1, "h": 2, "layer": "sword"}),
+    );
+    ok(&s, "set_region", json!({"path": "walk_right", "name": "origin", "kind": "marker", "x": 0, "y": 1}));
+    let e = err(&s, "mirror_document", json!({"src": "walk_right", "dst": "x", "keep_layers": ["shield"]}));
+    assert!(e.contains("shield"), "{e}");
+    let t = ok(&s, "mirror_document", json!({"src": "walk_right", "dst": "walk_left", "keep_layers": ["sword"]}));
+    assert!(t.contains("layers \"sword\" kept unmirrored"), "{t}");
+    let m = load(&dir, "walk_left.pxe.json");
+    assert_eq!(m.rows(0, 0), ["...1", "...2"], "body mirrored");
+    assert_eq!(m.rows(1, 0), ["..3.", "..3."], "sword stays on its side");
+    assert_eq!(m.regions[m.find_region("blade").unwrap()].rect_at(0), Some(Rect::new(2, 0, 1, 2)));
+    assert_eq!(m.regions[m.find_region("origin").unwrap()].point_at(0), Some((3, 1)));
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn check_rigid_reports_offsets_and_changed_pixels() {
+    let (s, dir) = server("rigid");
+    ok(&s, "create_document", json!({"name": "w", "width": 6, "height": 5}));
+    ok(&s, "add_layer", json!({"path": "w", "name": "sword"}));
+    ok(&s, "set_rows", json!({"path": "w", "layer": "sword", "frame": 0, "x": 2, "y": 0, "rows": ["3", "3"]}));
+    for _ in 0..3 {
+        ok(&s, "add_frame", json!({"path": "w", "copy_from": 0}));
+    }
+    let t = ok(&s, "check_rigid", json!({"path": "w", "layer": "sword"}));
+    assert!(t.ends_with("rigid in 4/4 frames; offsets dy: 0 0 0 0"), "{t}");
+    ok(&s, "shift_frames", json!({"path": "w", "layer": "sword", "offsets": [0, 1, 1, 0]}));
+    ok(&s, "set_pixels", json!({"path": "w", "layer": "sword", "frame": 2, "pixels": [{"x": 2, "y": 2, "key": "4"}]}));
+    let t = ok(&s, "check_rigid", json!({"path": "w", "layer": "sword"}));
+    assert!(t.contains("frame f1: dx 0 dy 1, rigid"), "{t}");
+    assert!(t.contains("frame f2: dx 0 dy 1, 1 px differ") && t.contains("(2, 2) 3 -> 4"), "{t}");
+    assert!(t.ends_with("rigid in 3/4 frames; offsets dy: 0 1 1 0"), "{t}");
+    // a rect part, a tag, another reference frame, linked cels
+    ok(&s, "set_tag", json!({"path": "w", "name": "walk", "from": 0, "to": 3}));
+    ok(&s, "link_cel", json!({"path": "w", "frame": 3, "to": 1, "layer": "sword"}));
+    let t = ok(
+        &s,
+        "check_rigid",
+        json!({"path": "w", "layer": "sword", "tag": "walk", "reference": 1, "rect": {"x": 1, "y": 1, "w": 3, "h": 2}}),
+    );
+    assert!(t.contains("frame walk/3: dx 0 dy 0, rigid (linked: same cel as frame walk/1)"), "{t}");
+    assert!(t.ends_with("rigid in 3/4 frames; offsets dy: -1 0 0 0"), "{t}");
+    let e = err(&s, "check_rigid", json!({"path": "w", "layer": 0}));
+    assert!(e.contains("empty on the reference frame"), "{e}");
+    let e = err(&s, "check_rigid", json!({"path": "w", "layer": "sword", "tag": "walk", "frames": [0]}));
+    assert!(e.contains("either tag or frames"), "{e}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn shift_frames_offsets_links_locks_and_dry_run() {
+    let (s, dir) = server("shift");
+    ok(&s, "create_document", json!({"name": "w", "width": 6, "height": 5}));
+    ok(&s, "add_layer", json!({"path": "w", "name": "sword"}));
+    ok(&s, "set_rows", json!({"path": "w", "layer": 0, "frame": 0, "rows": ["1....."]}));
+    ok(&s, "set_rows", json!({"path": "w", "layer": "sword", "frame": 0, "x": 2, "y": 0, "rows": ["3", "3"]}));
+    for _ in 0..3 {
+        ok(&s, "add_frame", json!({"path": "w", "copy_from": 0}));
+    }
+    ok(&s, "set_region", json!({"path": "w", "name": "tip", "x": 2, "y": 0, "w": 1, "h": 1, "layer": "sword"}));
+    let rows = |f: usize| load(&dir, "w.pxe.json").rows(1, f);
+    // dry run writes nothing
+    let t = ok(&s, "shift_frames", json!({"path": "w", "layer": "sword", "offsets": [1, 1, 1, 0], "dry_run": true}));
+    assert!(t.starts_with("DRY RUN") && t.contains("dy 1 1 1 0"), "{t}");
+    assert_eq!(rows(0)[0], "..3...");
+    // dy list: one write, one history entry, the sword's regions follow
+    let t = ok(&s, "shift_frames", json!({"path": "w", "layer": "sword", "offsets": [1, 1, 1, 0]}));
+    assert!(t.contains("3 cels shifted") && t.contains("region rects moved along: tip"), "{t}");
+    let d = load(&dir, "w.pxe.json");
+    assert_eq!(d.rows(1, 0)[..3], ["......", "..3...", "..3..."]);
+    assert_eq!(d.rows(1, 3)[..2], ["..3...", "..3..."], "dy 0 stays");
+    assert_eq!(d.rows(0, 0)[0], "1.....", "other layers stay");
+    let tip = &d.regions[d.find_region("tip").unwrap()];
+    assert_eq!((tip.rect_at(0), tip.rect_at(3)), (Some(Rect::new(2, 1, 1, 1)), Some(Rect::new(2, 0, 1, 1))));
+    let h = ok(&s, "history", json!({"path": "w"}));
+    assert_eq!(h.matches("shift_frames").count(), 1, "{h}");
+    // [dx, dy] pairs on some frames; pixels leaving the canvas are cut
+    let t =
+        ok(&s, "shift_frames", json!({"path": "w", "layer": "sword", "frames": [1, 3], "offsets": [[2, 0], [0, -1]]}));
+    assert!(t.contains("[dx, dy] [2, 0] [0, -1]") && t.contains("1 pixels cut off"), "{t}");
+    assert_eq!(rows(1)[1], "....3.");
+    assert_eq!(rows(3)[..2], ["..3...", "......"]);
+    let d = load(&dir, "w.pxe.json");
+    assert_eq!(d.regions[0].rect_at(3), None, "the tip left the canvas on frame 3");
+    // wrong lengths and offsets
+    let e = err(&s, "shift_frames", json!({"path": "w", "layer": "sword", "offsets": [1, 2]}));
+    assert!(e.contains("offsets has 2 entries but all frames has 4 frames"), "{e}");
+    let e = err(&s, "shift_frames", json!({"path": "w", "layer": "sword", "frames": [0], "offsets": ["x"]}));
+    assert!(e.contains("offsets[0]"), "{e}");
+    // linked cels: different offsets refuse, equal ones shift once
+    ok(&s, "link_cel", json!({"path": "w", "frame": 2, "to": 0, "layer": "sword"}));
+    let e = err(&s, "shift_frames", json!({"path": "w", "layer": "sword", "frames": [0, 2], "offsets": [1, 0]}));
+    assert!(e.contains("frames f0 and f2 share one cel") && e.contains("link_cel unlink"), "{e}");
+    let e = err(&s, "shift_frames", json!({"path": "w", "layer": "sword", "frames": [0], "offsets": [1]}));
+    assert!(e.contains("edit_linked"), "{e}");
+    let t = ok(&s, "shift_frames", json!({"path": "w", "layer": "sword", "frames": [0, 2], "offsets": [1, 1]}));
+    assert!(t.contains("1 cels shifted"), "{t}");
+    assert_eq!(rows(2)[2..4], ["..3...", "..3..."]);
+    // a region (its rect on each frame) or rect only
+    let t = ok(
+        &s,
+        "shift_frames",
+        json!({"path": "w", "layer": "sword", "frames": [1], "region": "tip", "offsets": [[1, 0]]}),
+    );
+    assert!(t.contains("[tip]"), "{t}");
+    assert_eq!(rows(1)[1..3], [".....3", "....3."]);
+    let d = load(&dir, "w.pxe.json");
+    assert_eq!(d.regions[0].rect_at(1), Some(Rect::new(5, 1, 1, 1)));
+    let e =
+        err(&s, "shift_frames", json!({"path": "w", "layer": "sword", "frames": [3], "region": "tip", "offsets": [1]}));
+    assert!(e.contains("does not exist on frame 3"), "{e}");
+    // locks refuse
+    ok(&s, "set_layer", json!({"path": "w", "layer": "sword", "locked": true}));
+    let e = err(&s, "shift_frames", json!({"path": "w", "layer": "sword", "frames": [3], "offsets": [1]}));
+    assert!(e.contains("locked") && e.contains("nothing was written"), "{e}");
+    ok(&s, "set_layer", json!({"path": "w", "layer": "sword", "locked": false}));
+    ok(&s, "set_region", json!({"path": "w", "name": "guard", "x": 0, "y": 0, "w": 6, "h": 1, "locked": true}));
+    let e = err(&s, "shift_frames", json!({"path": "w", "layer": "sword", "frames": [3], "offsets": [1]}));
+    assert!(e.contains("locked region \"guard\""), "{e}");
+    assert_eq!(rows(3)[0], "..3...", "nothing written");
     std::fs::remove_dir_all(&dir).unwrap();
 }
 

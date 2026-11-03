@@ -266,17 +266,26 @@ pub fn transform_regions(
 
 /// A copy of `doc` with every frame transformed around the canvas centre:
 /// tags, durations, linked cels, locks and regions are kept, region rects
-/// and markers are transformed too. Returns the copy and the number of
-/// pixels cut off at the canvas edge.
-pub fn mirror_document(doc: &Document, op: Op) -> (Document, usize) {
+/// and markers are transformed too. Layers in `keep` (e.g. a weapon that
+/// stays on its side) are copied untransformed, and so are the regions and
+/// markers restricted to them; regions on all layers (origin) follow the
+/// transformed body. Returns the copy and the number of pixels cut off at
+/// the canvas edge.
+pub fn mirror_document(doc: &Document, op: Op, keep: &[usize]) -> (Document, usize) {
     let mut d = doc.clone();
-    let layers: Vec<usize> = (0..d.layers.len()).collect();
+    let layers: Vec<usize> = (0..d.layers.len()).filter(|l| !keep.contains(l)).collect();
     let frames: Vec<usize> = (0..d.frames.len()).collect();
     let mut clipped = 0;
     for (l, f) in unique_cels(&d, &layers, &frames) {
         clipped += transform_cel(&mut d, l, f, op, false).clipped;
     }
     transform_regions(&mut d, &frames, None, op, false);
+    let kept: Vec<&str> = keep.iter().map(|l| doc.layers[*l].name.as_str()).collect();
+    for (r, old) in d.regions.iter_mut().zip(&doc.regions) {
+        if old.layer.as_deref().is_some_and(|n| kept.contains(&n)) {
+            *r = old.clone();
+        }
+    }
     (d, clipped)
 }
 
@@ -392,7 +401,7 @@ mod tests {
         let mut hand = Region::new("hand", Rect::new(0, 0, 2, 1));
         hand.set_rect_for(2, 2, Some(Rect::new(1, 1, 1, 1)), 3);
         d.regions.push(hand);
-        let (m, clipped) = mirror_document(&d, Op::FlipH);
+        let (m, clipped) = mirror_document(&d, Op::FlipH, &[]);
         assert_eq!(clipped, 0);
         assert_eq!(m.rows(0, 0), ["...1", "...2"]);
         assert!(m.layers[0].is_linked(1), "links stay");
@@ -404,7 +413,24 @@ mod tests {
         assert_eq!(m.regions[1].rect_at(0), Some(Rect::new(2, 0, 2, 1)));
         assert_eq!(m.regions[1].rect_at(2), Some(Rect::new(2, 1, 1, 1)));
         // mirroring twice gives the original back
-        assert_eq!(mirror_document(&m, Op::FlipH).0.layers, d.layers);
+        assert_eq!(mirror_document(&m, Op::FlipH, &[]).0.layers, d.layers);
+        m.validate().unwrap();
+    }
+
+    #[test]
+    fn mirror_document_keeps_layers_on_their_side() {
+        let mut d = doc(&["1...", "2..."]);
+        d.add_layer("sword", 1);
+        d.set_rows(1, 0, 0, 0, &["..3.".to_string()]).unwrap();
+        let mut grip = Region::marker("grip", 2, 0);
+        grip.layer = Some("sword".into());
+        d.regions.push(grip);
+        d.regions.push(Region::marker("origin", 0, 1));
+        let (m, _) = mirror_document(&d, Op::FlipH, &[1]);
+        assert_eq!(m.rows(0, 0), ["...1", "...2"], "body mirrored");
+        assert_eq!(m.rows(1, 0), d.rows(1, 0), "sword stays");
+        assert_eq!(m.regions[0].point_at(0), Some((2, 0)), "the sword's marker stays");
+        assert_eq!(m.regions[1].point_at(0), Some((3, 1)), "origin follows the body");
         m.validate().unwrap();
     }
 }

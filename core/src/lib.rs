@@ -17,6 +17,7 @@ pub mod palettes;
 pub mod recolor;
 pub mod reference;
 pub mod render;
+pub mod rigid;
 pub mod seams;
 pub mod tilemap;
 pub mod transform;
