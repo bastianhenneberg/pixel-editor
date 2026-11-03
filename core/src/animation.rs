@@ -1,8 +1,9 @@
 //! Animation review for Claude, who only sees still images: a tag in its
 //! real play order as a filmstrip (plus the loop transition), an onion-skin
 //! row, a difference row, an optional tracked area with its centre path,
-//! and a numeric analysis with warnings (ground line, jumps, stray pixels,
-//! duplicate frames).
+//! traced points with their dotted paths (see `trace`), and a numeric
+//! analysis with warnings (ground line, jumps, stray pixels, duplicate
+//! frames, paths that leave their arc).
 
 use crate::document::{Document, Rect, TRANSPARENT};
 use crate::draw;
@@ -70,11 +71,15 @@ pub struct AnimOptions {
     pub track: Option<Area>,
     /// Silhouette edge moves larger than this (px) are reported as jumps.
     pub jump_threshold: u32,
+    /// Points to follow from step to step (hands, feet, head).
+    pub trace: Vec<crate::trace::Trace>,
+    /// Traced points moving more than this (px) in one step are reported.
+    pub trace_threshold: u32,
 }
 
 impl Default for AnimOptions {
     fn default() -> Self {
-        AnimOptions { zoom: None, area: None, track: None, jump_threshold: 2 }
+        AnimOptions { zoom: None, area: None, track: None, jump_threshold: 2, trace: Vec::new(), trace_threshold: 3 }
     }
 }
 
@@ -147,6 +152,7 @@ pub struct Analysis {
     pub total_ms: u32,
     pub warnings: Vec<String>,
     pub track_label: Option<String>,
+    pub traces: Vec<crate::trace::TracePath>,
 }
 
 fn changed(a: &Image, b: &Image) -> usize {
@@ -202,12 +208,16 @@ fn key_map(doc: &Document, frame: usize) -> Vec<u8> {
     (0..h).flat_map(|y| (0..w).map(move |x| (x, y))).map(|(x, y)| doc.top_key(frame, x, y)).collect()
 }
 
-type Points = Vec<(i32, i32)>;
+pub type Points = Vec<(i32, i32)>;
 
 /// (orphans, isolated) pixels of a frame's composite keys.
 fn stray_pixels(doc: &Document, frame: usize) -> (Points, Points) {
-    let (w, h) = (doc.width as i32, doc.height as i32);
-    let keys = key_map(doc, frame);
+    stray_in(&key_map(doc, frame), doc.width as i32, doc.height as i32)
+}
+
+/// (orphans, isolated) pixels of a `w` x `h` key grid: orphans have no
+/// 4-neighbour of the same key, isolated ones no opaque 4-neighbour.
+pub fn stray_in(keys: &[u8], w: i32, h: i32) -> (Points, Points) {
     let at = |x: i32, y: i32| if x < 0 || y < 0 || x >= w || y >= h { TRANSPARENT } else { keys[(y * w + x) as usize] };
     let (mut orphans, mut isolated) = (Vec::new(), Vec::new());
     for y in 0..h {
@@ -236,7 +246,7 @@ fn signed(v: i32) -> String {
     }
 }
 
-fn coords(list: &[(i32, i32)], max: usize) -> String {
+pub fn coords(list: &[(i32, i32)], max: usize) -> String {
     let mut s: Vec<String> = list.iter().take(max).map(|(x, y)| format!("({x},{y})")).collect();
     if list.len() > max {
         s.push(format!("… {} more", list.len() - max));
@@ -387,7 +397,14 @@ pub fn analyze(doc: &Document, tag: usize, opts: &AnimOptions) -> Result<Analysi
             ));
         }
     }
+    let traces = opts
+        .trace
+        .iter()
+        .map(|tr| crate::trace::trace(doc, &seq, looping, tr, opts.trace_threshold))
+        .collect::<Result<Vec<_>, _>>()?;
+    warnings.extend(traces.iter().flat_map(|p| p.warnings.iter().cloned()));
     Ok(Analysis {
+        traces,
         tag: t.name.clone(),
         direction: t.direction.id().to_string(),
         looping,
@@ -463,6 +480,9 @@ pub fn summary(doc: &Document, a: &Analysis) -> String {
             })
             .collect();
         s += &format!("track {l}: centre per step {}\n", path.join(" | "));
+    }
+    for p in &a.traces {
+        s += &format!("{}\n", crate::trace::describe(p));
     }
     if a.warnings.is_empty() {
         s += "warnings: none\n";
@@ -678,6 +698,14 @@ pub fn render(doc: &Document, tag: usize, a: &Analysis, opts: &AnimOptions) -> R
                     out.put(c.0 as u32, (c.1 + d) as u32, PATH);
                 }
                 path.push(c);
+            }
+            if !a.traces.is_empty() {
+                let screen = |x: i32, y: i32| {
+                    let z = zoom as i32;
+                    (x0 as i32 + (x - crop.x) * z + z / 2, fy as i32 + (y - crop.y) * z + z / 2)
+                };
+                let clip = (x0 as i32, fy as i32, (x0 + cw) as i32, (fy + ch) as i32);
+                crate::trace::draw_paths(&mut out, &a.traces, i, zoom, screen, clip);
             }
 
             // row 2: onion skin: previous step cool at ~35%, current warm

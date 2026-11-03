@@ -32,13 +32,14 @@ Aufruf:
                                           bei einer Karte (.tilemap.json): godot (Atlas, TileSet, .tscn)
                                           oder world_txt
   pixel-editor preview <DATEI> <AUS.png> [--zoom N] [--frame F] [--no-grid]
+                                          [--view normal,silhouette,grayscale,mirrored]
                                           (bei einer Karte: die ganze Karte mit Kachelraster)
   pixel-editor import-world <world.txt> <KARTE.tilemap.json> --tileset <TILESET.pxe.json> [--force]
                                           world.txt der Sandbox als Karte übernehmen
   pixel-editor export-world <KARTE.tilemap.json> <world.txt>
                                           Karte als world.txt schreiben (Kommentare bleiben erhalten)
   pixel-editor render-animation <DATEI> <TAG> <AUS.png> [--zoom N] [--region NAME|x,y,w,h]
-                                          [--track NAME|x,y,w,h] [--jump N]
+                                          [--track NAME|x,y,w,h] [--jump N] [--trace MARKER,…]
                                           Animation als Filmstreifen + Onion + Differenz, Analyse auf stdout
 ";
 
@@ -188,7 +189,18 @@ fn cli_preview(args: &[String]) -> Result<(), String> {
         None => (0..doc.frames.len()).collect(),
     };
     let zoom = flag(args, "--zoom").and_then(|z| z.parse().ok()).unwrap_or(render::PreviewOptions::auto_zoom(&doc));
-    let opts = render::PreviewOptions { zoom, grid: true, layer: None, regions: true, tiled: false };
+    let views = match flag(args, "--view") {
+        Some(v) => v.split(',').map(|s| render::View::parse(s.trim())).collect::<Result<_, _>>()?,
+        None => Vec::new(),
+    };
+    let opts = render::PreviewOptions {
+        zoom,
+        grid: !args.iter().any(|a| a == "--no-grid"),
+        layer: None,
+        regions: true,
+        tiled: false,
+        views,
+    };
     render::preview(&doc, &frames, &opts).save_png(Path::new(out))?;
     println!("{out}");
     Ok(())
@@ -208,6 +220,16 @@ fn cli_render_animation(args: &[String]) -> Result<(), String> {
         area: area("--region")?,
         track: area("--track")?,
         jump_threshold: flag(args, "--jump").and_then(|j| j.parse().ok()).unwrap_or(2),
+        trace: flag(args, "--trace")
+            .map(|t| {
+                t.split(',')
+                    .map(|n| pixel_core::trace::Trace {
+                        source: pixel_core::trace::TraceSource::Region(n.trim().into()),
+                    })
+                    .collect()
+            })
+            .unwrap_or_default(),
+        ..Default::default()
     };
     let a = animation::analyze(&doc, t, &opts)?;
     animation::render(&doc, t, &a, &opts)?.save_png(Path::new(out))?;

@@ -1,6 +1,8 @@
 use super::*;
 use std::time::Duration;
 
+mod review;
+
 fn call(s: &Server, name: &str, args: Value) -> (bool, String) {
     let r = s
         .handle(
