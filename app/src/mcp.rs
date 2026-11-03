@@ -102,6 +102,8 @@ struct Server {
     saved: std::cell::RefCell<Vec<PathBuf>>,
     /// Hash of the command already reported as untrusted (reported once).
     untrusted_told: std::cell::RefCell<Option<String>>,
+    /// Pixel-art knowledge: built-in, personal and project layer.
+    knowledge: crate::knowledge::Knowledge,
 }
 
 /// Display name of an MCP client: "claude-code"/"claude…" -> "Claude",
@@ -128,6 +130,7 @@ impl Server {
 
     fn with_trust(workdir: PathBuf, trust: crate::hook::TrustStore) -> Server {
         let instructions = instructions_for(&workdir);
+        let knowledge = crate::knowledge::Knowledge::new(crate::knowledge::personal_dir_from_env(), &workdir);
         Server {
             hooks: crate::hook::Runner::new(&workdir),
             workdir,
@@ -136,6 +139,7 @@ impl Server {
             trust,
             saved: Default::default(),
             untrusted_told: Default::default(),
+            knowledge,
         }
     }
 
@@ -364,6 +368,74 @@ impl Server {
             }
         }
         Ok(Out::Text(lines.join("\n")))
+    }
+
+    // ---- knowledge ----------------------------------------------------------
+
+    /// Without topic: the topics of all layers. With topic: its text per
+    /// layer, built-in first, project last (later layers win on conflict).
+    fn get_guide(&self, a: &Value) -> Result<Out, String> {
+        use crate::knowledge::{summary, Layer};
+        let k = &self.knowledge;
+        let topics = k.topics();
+        let Some(topic) = a.get("topic").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) else {
+            let mut out =
+                String::from("Pixel-art guides (layers: built-in < personal < project; later wins on conflict):\n");
+            for t in &topics {
+                let entries = k.entries(t);
+                let layers: Vec<&str> = entries.iter().map(|e| e.layer.name()).collect();
+                let first = entries.first().map(|e| summary(&e.text)).unwrap_or("");
+                out.push_str(&format!("- {t} [{}]: {first}\n", layers.join(", ")));
+            }
+            out.push_str(&format!(
+                "Call get_guide with a topic to read it: \"checklist\" before handing work over, \"workflow\" once per \
+                 session. Personal: {}; project: {}.",
+                k.dir(Layer::Personal).map(|p| p.display().to_string()).unwrap_or_else(|e| e),
+                self.rel(&k.project)
+            ));
+            return Ok(Out::Text(out));
+        };
+        let entries = k.entries(topic);
+        if entries.is_empty() {
+            return Err(format!("unknown topic {topic:?}; topics: {}", topics.join(", ")));
+        }
+        let mut out = String::new();
+        for e in &entries {
+            let head = match (&e.layer, &e.path) {
+                (Layer::BuiltIn, _) | (_, None) => format!("## {topic} ({})", e.layer.name()),
+                (Layer::Personal, Some(p)) => format!("## {topic} (personal, {})", p.display()),
+                (Layer::Project, Some(p)) => format!("## {topic} (project, {})", self.rel(p)),
+            };
+            out.push_str(&format!("{head}\n\n{}\n\n", e.text.trim()));
+        }
+        if entries.len() > 1 {
+            out.push_str("On conflict the project layer beats personal, personal beats built-in.");
+        }
+        Ok(Out::Text(out.trim_end().to_string()))
+    }
+
+    /// Append a dated lesson to the personal or project layer.
+    fn add_learning(&self, a: &Value) -> Result<Out, String> {
+        use crate::knowledge::Layer;
+        let topic = str_arg(a, "topic")?.trim();
+        let text = str_arg(a, "text")?;
+        let layer = match a.get("layer").and_then(Value::as_str).unwrap_or("personal") {
+            "personal" => Layer::Personal,
+            "project" => Layer::Project,
+            other => return Err(format!("layer must be \"personal\" or \"project\" (got {other:?})")),
+        };
+        let source = a.get("source").and_then(Value::as_str);
+        let k = &self.knowledge;
+        let (path, line) = k.entry_for(layer, topic, text, source, &crate::knowledge::today())?;
+        let shown = match layer {
+            Layer::Project => self.rel(&path),
+            _ => path.display().to_string(),
+        };
+        if bool_arg(a, "dry_run", false) {
+            return Ok(Out::Text(format!("dry run: would append to {shown} ({} layer):\n{line}", layer.name())));
+        }
+        k.append(&path, topic, &line)?;
+        Ok(Out::Text(format!("appended to {shown} ({} layer):\n{line}", layer.name())))
     }
 
     /// Paced write: show the change being drawn stroke by stroke (row by
@@ -663,6 +735,8 @@ impl Server {
             "list_documents" => self.list_documents(),
             "get_user_view" => self.get_user_view(),
             "hook_status" => self.hook_status(a),
+            "get_guide" => self.get_guide(a),
+            "add_learning" => self.add_learning(a),
             "create_document" => self.create_document(a),
             "get_document" => {
                 let (path, doc, warnings) = self.load(a)?;
@@ -2973,7 +3047,10 @@ set_legend, size with resize_tilemap, look with render_preview. Editing a tile i
 the map. The sandbox game's world.txt: import_world / export_world (byte-exact round trip; the game adds edges, cliff \
 faces and decor itself). Godot: export target godot on a map (TileSet + TileMapLayer scene) or godot_tileset on a tileset. \
 A workdir may define an on_save hook (.pxe-project.json, e.g. the project's own export); after a write that saves a \
-document the result says \"on_save started\", and hook_status shows whether it succeeded and its output.";
+document the result says \"on_save started\", and hook_status shows whether it succeeded and its output. \
+The editor ships pixel-art guidelines (built-in, plus the user's personal and this project's additions): before \
+drawing or animating call get_guide (topic \"checklist\" first; read \"workflow\" once per session). Record a lesson \
+with add_learning only after the user confirmed it.";
 
 fn tools() -> &'static Value {
     static TOOLS: OnceLock<Value> = OnceLock::new();
@@ -3262,6 +3339,14 @@ fn tool_list() -> Value {
                 "tile_w": int("tile width"), "tile_h": int("tile height (default = tile_w)"),
                 "duration_ms": int("frame duration, default 100"), "overwrite": boolean("replace an existing file")}), &["png_path", "name"]),
         tool("hook_status", "The workdir's on_save hook (.pxe-project.json: a command run after each save, e.g. the project's export): whether it is trusted, whether it is running, and the last run (for path, or the last one) with exit code, duration and output (stdout/stderr). Writes that save a document say \"on_save started\"; check here whether it succeeded.", json!({"path": {"type": "string", "description": "document; default: the last run of any document"}}), &[]),
+        tool("get_guide", "Pixel-art guidelines shipped with the editor, merged with the user's personal and this project's additions (on conflict project beats personal beats built-in). Without topic: the topics with their layers and first line. With topic: the built-in text, then the personal and project additions, each under a heading naming its layer and file. Start with \"checklist\" before drawing or animating; read \"workflow\" once per session.", json!({
+                "topic": {"type": "string", "description": "e.g. workflow, fundamentals, animation-principles, pixel-animation, checklist; omit to list all topics"}}), &[]),
+        tool("add_learning", "Append a dated lesson (\"- YYYY-MM-DD: text (source)\") to <topic>.md of the personal or project knowledge layer; creates the folder and file if needed, new topics allowed. Only record lessons the user confirmed or explicitly asked to keep, never your own guesses. Use the project layer for one project's conventions (stored in the workdir's .pxe-knowledge/), personal for the user's own preferences across projects. The built-in layer is read-only. get_guide shows the entries afterwards.", json!({
+                "topic": {"type": "string", "description": "lowercase letters, digits and '-', e.g. checklist or walk-cycles"},
+                "text": {"type": "string", "description": "the lesson, one line"},
+                "layer": {"type": "string", "enum": ["personal", "project"], "description": "default personal"},
+                "source": {"type": "string", "description": "where it comes from, e.g. \"user, review of walk_down\""},
+                "dry_run": dry}), &["topic", "text"]),
         tool("history", "Edit history of a document (MCP and GUI edits with their notes), newest first.", json!({"path": path, "limit": int("entries, default 20")}), &["path"]),
         tool("undo", "Undo the last edit(s) recorded in the history (also GUI saves). Repeated calls step further back.", json!({"path": path, "steps": int("default 1"), "dry_run": dry}), &["path"]),
         tool("snapshot", "Save the current state under a name, to compare or roll back later.", json!({"path": path, "name": {"type": "string"}, "note": {"type": "string"}}), &["path", "name"]),

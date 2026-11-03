@@ -362,6 +362,8 @@ oder `claude mcp add pixel-editor -- /pfad/zu/pixel-editor/target/release/pixel-
 | `history`, `undo(steps?)`, `snapshot(name, note?)`, `list_snapshots`, `diff_snapshot(name, layer?, frame?)`, `restore_snapshot(name)` | Verlauf und Schnappschüsse |
 | `focus(path, frame, layer?, region? \| rect?, note?)`, `open_editor(path)`; `pace_ms` an Schreibwerkzeugen | live zusehen (siehe „KI folgen“) |
 | `get_user_view` | was im Editor gerade offen und ausgewählt ist, samt Pixeln der Auswahl und allen „KI zeigen“-Markierungen mit Notizen (siehe „Was du gerade ansiehst“) |
+| `get_guide(topic?)` | Pixelart-Leitfäden aus drei Ebenen (siehe „Pixelart-Wissen“): ohne `topic` die Themenliste mit Ebenen, mit `topic` eingebauter Text, dann persönliche und Projekt-Ergänzungen |
+| `add_learning(topic, text, layer?, source?, dry_run?)` | bestätigte Erkenntnis datiert anhängen (`- JJJJ-MM-TT: Text (Quelle)`), Ebene `personal` (Standard) oder `project` |
 | `hook_status(path?)` | der `on_save`-Befehl aus `.pxe-project.json`: vertraut oder nicht, läuft gerade, letztes Ergebnis (Exit-Code, Dauer, Ausgabe) |
 | `clear_marks(path, frame?, numbers?)` | „KI zeigen“-Markierungen entfernen: alle des Dokuments, nur die eines Frames oder bestimmte Nummern |
 | `export(path, target, …)` | `png_sheet`, `godot`, `unity`, `gif`, `aseprite`, `godot_tileset` (Tileset als Atlas + TileSet); auf einer Karte `godot` (Atlas, TileSet, Szene) oder `world_txt` |
@@ -443,6 +445,16 @@ Zum Prüfen der GUI ohne Bildschirm: `cargo test screenshot` rendert offscreen n
 4. Animation: `add_frame(copy_from)` + kleine Änderungen. Bezieht sich der Nutzer auf „das hier“, erst `get_user_view` aufrufen. Wiederkehrende Frames mit `linked: true` anlegen, dann `set_frame_duration` und `set_tag` (Bereich + Richtung).
 5. `export` (für das Testspiel `godot`), für Aseprite-Nutzer `aseprite`.
 6. Umgebungen: Karte mit `create_tilemap` oder `import_world`, ansehen mit `get_tilemap` und `render_preview`, ändern mit `set_tiles` (immer den Diff prüfen). Tiles selbst bearbeitet man im Tileset-Dokument; jede Karte zeigt die Änderung sofort.
+
+## Pixelart-Wissen: eingebaut, persönlich, Projekt
+
+Der Editor bringt Handwerksregeln für Pixelart mit, damit eine KI sie vor dem Zeichnen liest (`get_guide`). Drei Ebenen, beim Lesen zusammengeführt; bei Widerspruch gilt Projekt vor persönlich vor eingebaut:
+
+1. **Eingebaut**: `knowledge/*.md` im Repo (englisch), per `include_str!` im Programm, zur Laufzeit nur lesbar. Themen: `workflow` (Arbeitsweise einer KI: künstlerische Rolle, vor dem Zeichnen, erst Pose dann Animation, Sichtkontrolle, sichere Entwürfe), `fundamentals` (Linien, Cluster, Banding, Licht, Rampen, Konturen, AA/Dither, Lesbarkeit), `animation-principles` (die 12 Prinzipien in Pixeln), `pixel-animation` (Walk, Timing, Bob, Ausrüstung, Spiegeln, Subpixel, Idle, Smear, Flimmern), `checklist` (vor der Abgabe). Kennzeichen `[consensus]`/`[style]`/`[practice]` und Quellen-URLs stehen dabei.
+2. **Persönlich**: gehört zur Installation, nicht zu einem Projekt: `$XDG_DATA_HOME/pixel-editor/knowledge/<thema>.md` (sonst `~/.local/share/pixel-editor/knowledge/`), umlenkbar nur mit `PXE_KNOWLEDGE_DIR`.
+3. **Projekt**: `<arbeitsordner>/.pxe-knowledge/<thema>.md`, dazu wie bisher `.pxe-instructions.md` (hängt an den Server-Anweisungen).
+
+`get_guide` ohne Thema listet alle Themen mit ihren Ebenen und der ersten Überschrift, mit Thema kommen die Texte nacheinander unter je einer Überschrift mit Ebene und Datei. `add_learning` hängt eine datierte Zeile an die Datei der gewählten Ebene an (legt Ordner und Datei mit `# <thema>` an; Themennamen aus Kleinbuchstaben, Ziffern und `-`, neue Themen erlaubt) und schreibt nie die eingebaute Ebene. Gedacht nur für Erkenntnisse, die der Nutzer bestätigt hat: Projekt-Konventionen in die Projekt-Ebene, eigene projektübergreifende Vorlieben in die persönliche. Beide Dateien sind normales Markdown und dürfen von Hand bearbeitet werden; Änderungen wirken sofort, ohne Neustart.
 
 ## Nach dem Speichern automatisch exportieren
 

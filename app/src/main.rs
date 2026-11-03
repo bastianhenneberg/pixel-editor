@@ -1,6 +1,7 @@
 mod gui;
 mod hook;
 mod ipc;
+mod knowledge;
 mod launch;
 mod mcp;
 mod view;
@@ -22,7 +23,9 @@ Aufruf:
   pixel-editor open <DATEI> [--workdir ORDNER] [--dry-run]
                                           Datei als Tab im laufenden Editorfenster des Arbeitsordners
                                           öffnen, sonst ein neues Fenster starten (losgelöst)
-  pixel-editor mcp <ARBEITSORDNER>        MCP-Server über stdio starten
+  pixel-editor mcp <ARBEITSORDNER>        MCP-Server über stdio starten; Pixelart-Leitfäden (get_guide):
+                                          eingebaut, persönlich ($PXE_KNOWLEDGE_DIR, sonst
+                                          $XDG_DATA_HOME/pixel-editor/knowledge), Projekt (.pxe-knowledge/)
   pixel-editor export <DATEI> <ZIEL> [AUSGABEORDNER] [--scale N] [--godot-res-dir res://…]
                                           ZIEL: png_sheet | godot | unity | gif | aseprite | godot_tileset
                                           (godot_tileset: Atlas-PNG + TileSet .tres eines Tilesets);

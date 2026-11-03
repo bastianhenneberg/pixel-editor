@@ -67,6 +67,8 @@ fn protocol_and_tools() {
         "move_frames(frames, to)",
         "set_reference",
         "never exported",
+        "call get_guide",
+        "add_learning only after the user confirmed",
     ] {
         assert!(instructions.contains(part), "instructions lack {part:?}: {instructions}");
     }
@@ -123,6 +125,8 @@ fn protocol_and_tools() {
         "set_reference",
         "set_layer",
         "hook_status",
+        "get_guide",
+        "add_learning",
     ] {
         assert!(names.contains(&required), "missing tool {required}");
     }
@@ -1271,6 +1275,115 @@ fn project_instructions_file() {
     std::fs::write(dir.join(".pxe-instructions.md"), "  \n").unwrap();
     assert_eq!(instructions_of(&Server::new(dir.canonicalize().unwrap())), INSTRUCTIONS);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// A server whose personal knowledge lives in `<dir>/personal` (not the
+/// process environment, which parallel tests share).
+fn knowledge_server(tag: &str) -> (Server, PathBuf) {
+    let (mut s, dir) = server(tag);
+    s.knowledge.personal = Some(dir.join("personal"));
+    (s, dir)
+}
+
+#[test]
+fn built_in_guides_are_embedded() {
+    let (s, dir) = server("guide-builtin");
+    let list = ok(&s, "get_guide", json!({}));
+    for t in ["workflow", "fundamentals", "animation-principles", "pixel-animation", "checklist"] {
+        assert!(list.contains(&format!("- {t} [built-in]: ")), "{t} missing: {list}");
+        let text = ok(&s, "get_guide", json!({"topic": t}));
+        assert!(text.starts_with(&format!("## {t} (built-in)\n\n# ")), "{text}");
+        assert!(!text.contains("(personal") && !text.contains("(project"), "{text}");
+    }
+    assert!(list.contains("- checklist [built-in]: Checklist before handing work over"), "{list}");
+    assert!(list.contains("\"workflow\" once per session"), "{list}");
+    let all: String = crate::knowledge::BUILT_IN.iter().map(|(_, t)| *t).collect();
+    for project_specific in ["Toast", "toast", "Bastian", "Toastbrot", "#591"] {
+        assert!(!all.contains(project_specific), "built-in knowledge names {project_specific:?}");
+    }
+    for marker in ["[consensus]", "[style]", "[practice]", "https://www.slynyrd.com/", "render_animation"] {
+        assert!(all.contains(marker), "built-in knowledge lacks {marker:?}");
+    }
+    let e = err(&s, "get_guide", json!({"topic": "nope"}));
+    assert!(e.contains("unknown topic \"nope\"; topics: workflow, fundamentals"), "{e}");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn guides_merge_layers_in_order() {
+    let (s, dir) = knowledge_server("guide-layers");
+    std::fs::create_dir_all(dir.join("personal")).unwrap();
+    std::fs::create_dir_all(dir.join(".pxe-knowledge")).unwrap();
+    std::fs::write(dir.join("personal/checklist.md"), "# checklist\n\n- personal rule\n").unwrap();
+    std::fs::write(dir.join(".pxe-knowledge/checklist.md"), "# checklist\n\n- project rule\n").unwrap();
+    std::fs::write(dir.join(".pxe-knowledge/tiles.md"), "# Tile sizes\n\n- 32x32\n").unwrap();
+    std::fs::write(dir.join(".pxe-knowledge/Not A Topic.md"), "ignored").unwrap();
+    let list = ok(&s, "get_guide", json!({}));
+    assert!(list.contains("- checklist [built-in, personal, project]: Checklist before"), "{list}");
+    assert!(list.contains("- tiles [project]: Tile sizes"), "{list}");
+    assert!(!list.contains("Not A Topic"), "{list}");
+    let text = ok(&s, "get_guide", json!({"topic": "checklist"}));
+    let built_in = text.find("## checklist (built-in)").unwrap();
+    let personal = text.find(&format!("## checklist (personal, {})", dir.join("personal/checklist.md").display()));
+    let project = text.find("## checklist (project, .pxe-knowledge/checklist.md)").unwrap();
+    let personal = personal.unwrap_or_else(|| panic!("{text}"));
+    assert!(built_in < personal && personal < project, "{text}");
+    assert!(text.find("- personal rule").unwrap() > personal && text.find("- project rule").unwrap() > project);
+    assert!(text.ends_with("project layer beats personal, personal beats built-in."), "{text}");
+    assert_eq!(
+        ok(&s, "get_guide", json!({"topic": "tiles"})),
+        "## tiles (project, .pxe-knowledge/tiles.md)\n\n# Tile sizes\n\n- 32x32"
+    );
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn add_learning_personal_and_project() {
+    let (s, dir) = knowledge_server("guide-learn");
+    let today = crate::knowledge::today();
+    // dry run writes nothing
+    let dry = ok(&s, "add_learning", json!({"topic": "checklist", "text": "Check the sword side", "dry_run": true}));
+    assert!(dry.starts_with("dry run: would append to"), "{dry}");
+    assert!(!dir.join("personal").exists());
+    // personal is the default; folder and file are created with a heading
+    let out = ok(&s, "add_learning", json!({"topic": "checklist", "text": "Check  the\nsword side", "source": "user"}));
+    let personal = dir.join("personal/checklist.md");
+    assert_eq!(
+        out,
+        format!("appended to {} (personal layer):\n- {today}: Check the sword side (user)", personal.display())
+    );
+    ok(&s, "add_learning", json!({"topic": "checklist", "text": "Second", "layer": "personal"}));
+    assert_eq!(
+        std::fs::read_to_string(&personal).unwrap(),
+        format!("# checklist\n\n- {today}: Check the sword side (user)\n- {today}: Second\n")
+    );
+    // project layer, new topic
+    let out = ok(&s, "add_learning", json!({"topic": "walk-cycles", "text": "8 frames x 95 ms", "layer": "project"}));
+    assert!(out.starts_with("appended to .pxe-knowledge/walk-cycles.md (project layer):"), "{out}");
+    let text = ok(&s, "get_guide", json!({"topic": "walk-cycles"}));
+    assert!(text.contains(&format!("- {today}: 8 frames x 95 ms")), "{text}");
+    let text = ok(&s, "get_guide", json!({"topic": "checklist"}));
+    assert!(text.contains("## checklist (personal, ") && text.contains("Check the sword side"), "{text}");
+    // invalid topics, layers and empty text are refused, nothing written
+    for bad in ["../evil", "a/b", "Walk", "x.md", ""] {
+        let e = err(&s, "add_learning", json!({"topic": bad, "text": "x", "layer": "project"}));
+        assert!(e.contains("invalid topic"), "{bad}: {e}");
+    }
+    assert!(err(&s, "add_learning", json!({"topic": "x", "text": "x", "layer": "built-in"}))
+        .contains("\"personal\" or \"project\""));
+    assert!(err(&s, "add_learning", json!({"topic": "x", "text": "  "})).contains("text is empty"));
+    assert!(err(&s, "add_learning", json!({"topic": "x"})).contains("missing required argument \"text\""));
+    let files: Vec<_> =
+        std::fs::read_dir(dir.join(".pxe-knowledge")).unwrap().flatten().map(|e| e.file_name()).collect();
+    assert_eq!(files, vec![std::ffi::OsString::from("walk-cycles.md")]);
+    assert!(!dir.join("evil.md").exists());
+    // without a personal folder only the project layer is writable
+    let (mut s, dir2) = server("guide-nopersonal");
+    s.knowledge.personal = None;
+    assert!(err(&s, "add_learning", json!({"topic": "x", "text": "y"})).contains("no personal knowledge folder"));
+    ok(&s, "add_learning", json!({"topic": "x", "text": "y", "layer": "project"}));
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_dir_all(&dir2).unwrap();
 }
 
 /// A workdir with a document, a `.pxe-project.json` running `script` via
