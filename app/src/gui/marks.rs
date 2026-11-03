@@ -5,6 +5,8 @@
 //! a mark = select it (its note field opens; dragging moves it), the handles
 //! on its corners and edges resize it, right click removes the mark under
 //! the pointer. Ctrl+Shift+K adds the selection (or the whole frame).
+//! With every tool, a right click on a mark's label opens a menu to
+//! remove just that mark.
 //!
 //! The marks live in `.pxe-history/<file>/marks.json` (see `crate::view`).
 //! Every change re-reads the file first, so marks the assistant removed
@@ -33,6 +35,15 @@ pub struct Edges {
     pub right: bool,
     pub top: bool,
     pub bottom: bool,
+}
+
+/// The open right-click menu of a mark label.
+#[derive(Clone, Copy, Debug)]
+pub struct MarkMenu {
+    pub n: u32,
+    pub pos: Pos2,
+    /// Opened this frame: the press that opened it does not close it.
+    pub fresh: bool,
 }
 
 /// Grab distance of the resize handles, in points.
@@ -336,8 +347,8 @@ impl EditorApp {
         to_screen: impl Fn(PxRect) -> Rect,
         canvas: Rect,
         px: f32,
-    ) -> (Vec<(Rect, Color32)>, Vec<(Pos2, String, Color32)>) {
-        let (mut rects, mut labels) = (Vec::new(), Vec::new());
+    ) -> (Vec<(Rect, Color32)>, Vec<(Pos2, String, Color32)>, Vec<u32>) {
+        let (mut rects, mut labels, mut ns) = (Vec::new(), Vec::new(), Vec::new());
         for m in self.marks.on_frame(self.frame) {
             let sr = to_screen(self.mark_rect(m)).expand(2.0 * px); // the marked pixels stay visible
             rects.extend(outline(sr.expand(px), px, Color32::BLACK));
@@ -348,6 +359,7 @@ impl EditorApp {
             }
             let at = if m.rect.is_none() { canvas.left_top() } else { sr.left_top() };
             labels.push((at, label, PIN_COLOR));
+            ns.push(m.n);
             if self.mark_sel == Some(m.n) && self.tool == Tool::Point {
                 rects.extend(outline(sr.shrink(2.0 * px), px, Color32::WHITE));
                 let (l, r, t, b) = (sr.min.x, sr.max.x, sr.min.y, sr.max.y);
@@ -362,7 +374,60 @@ impl EditorApp {
         if let Some(MarkDrag::New { start, last }) = self.canvas.mark_drag {
             rects.extend(outline(to_screen(drag_rect(start, last)), px, PIN_COLOR));
         }
-        (rects, labels)
+        (rects, labels, ns)
+    }
+
+    /// A right click on a mark label (any tool) opens its menu; true when
+    /// this press belongs to the label or the open menu, not to the tool.
+    pub(super) fn mark_label_input(&mut self, resp: &egui::Response, pointer: &egui::PointerState) -> bool {
+        if self.canvas.mark_menu.is_some() {
+            // the menu is open: a press goes to it (or closes it)
+            return pointer.any_pressed() || pointer.any_down();
+        }
+        if !(resp.hovered() && pointer.secondary_pressed()) || self.canvas.note_focused {
+            return false;
+        }
+        let Some(sp) = pointer.latest_pos() else { return false };
+        // the topmost label wins (painted last)
+        let Some(&(_, n)) = self.canvas.mark_labels.iter().rev().find(|(r, _)| r.contains(sp)) else {
+            return false;
+        };
+        self.canvas.mark_menu = Some(MarkMenu { n, pos: sp, fresh: true });
+        true
+    }
+
+    /// The right-click menu of a mark label: remove that mark.
+    pub(super) fn mark_menu_ui(&mut self, ctx: &egui::Context) {
+        let Some(menu) = self.canvas.mark_menu else { return };
+        let Some(m) = self.marks.on_frame(self.frame).find(|m| m.n == menu.n) else {
+            self.canvas.mark_menu = None; // removed meanwhile (clear_marks) or other frame
+            return;
+        };
+        let mut title = format!("#{}", m.n);
+        if !m.note.is_empty() {
+            title += &format!(" {}", shorten(&m.note));
+        }
+        let mut remove = false;
+        let area = egui::Area::new(egui::Id::unique("mark_menu"))
+            .fixed_pos(menu.pos)
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                egui::Frame::menu(ui.style()).show(ui, |ui| {
+                    ui.colored_label(PIN_COLOR, title);
+                    remove = ui.button("Entfernen").clicked();
+                });
+            });
+        let (pressed, escape, at) =
+            ctx.input(|i| (i.pointer.any_pressed(), i.key_pressed(egui::Key::Escape), i.pointer.interact_pos()));
+        let outside = pressed && !menu.fresh && at.is_some_and(|p| !area.response.rect.contains(p));
+        if remove {
+            self.canvas.mark_menu = None;
+            self.remove_mark(menu.n);
+        } else if escape || outside {
+            self.canvas.mark_menu = None;
+        } else if let Some(mm) = &mut self.canvas.mark_menu {
+            mm.fresh = false;
+        }
     }
 
     /// The note field of the selected mark, under it on the canvas. Enter

@@ -2086,6 +2086,61 @@ fn marks_add_note_select_move_resize_and_remove() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Right click on a mark's label, with any tool: a menu removes just that
+/// mark; the click paints nothing. Escape closes the menu.
+#[test]
+fn mark_label_menu_removes_one_mark() {
+    let _gpu = gpu_lock();
+    let (dir, walk, _, _) = tabs_setup("mark-menu");
+    let mut h = harness(tabs_app(&walk));
+    h.run_steps(2);
+    h.state_mut().tool = Tool::Point;
+    drag_px(&mut h, (2, 6), (5, 9));
+    type_note(&mut h, "hier");
+    drag_px(&mut h, (10, 10), (12, 12));
+    h.key_press(egui::Key::Enter);
+    h.run_steps(2);
+    assert_eq!(crate::view::read_marks(&walk).marks.len(), 2);
+    h.state_mut().tool = Tool::Pencil;
+    h.run_steps(1);
+    let before = h.state().doc.clone();
+    let label = |h: &Harness<'_, EditorApp>, n: u32| {
+        h.state().canvas.mark_labels.iter().find(|(_, m)| *m == n).map(|(r, _)| r.center()).unwrap()
+    };
+    let right_click = |h: &mut Harness<'_, EditorApp>, p: Pos2| {
+        h.hover_at(p);
+        h.step();
+        press_btn(h, p, PointerButton::Secondary, true);
+        h.step();
+        press_btn(h, p, PointerButton::Secondary, false);
+        h.run_steps(2);
+    };
+
+    // Escape closes the menu, nothing removed
+    let p = label(&h, 2);
+    right_click(&mut h, p);
+    assert_eq!(h.state().canvas.mark_menu.map(|m| m.n), Some(2));
+    h.key_press(egui::Key::Escape);
+    h.run_steps(1);
+    assert!(h.state().canvas.mark_menu.is_none());
+    assert_eq!(crate::view::read_marks(&walk).marks.len(), 2);
+
+    // the menu of #1 removes only #1
+    let p = label(&h, 1);
+    right_click(&mut h, p);
+    assert!(h.query_by_label("#1 hier").is_some(), "the menu names the mark");
+    // "Entfernen" exists elsewhere too: the one in the menu, at the click
+    let near = |n: &egui_kittest::Node<'_>| n.rect().center().distance(p);
+    h.get_all_by_label("Entfernen").min_by(|a, b| near(a).total_cmp(&near(b))).unwrap().click();
+    h.run_steps(2);
+    let ns: Vec<u32> = crate::view::read_marks(&walk).marks.iter().map(|m| m.n).collect();
+    assert_eq!(ns, vec![2]);
+    assert_eq!(h.state().status, "KI-Markierung #1 entfernt");
+    assert!(h.state().canvas.mark_menu.is_none());
+    assert_eq!(h.state().doc, before, "the right clicks painted nothing");
+    std::fs::remove_dir_all(&dir).unwrap();
+}
+
 /// Marks belong to the document: each tab has its own, they survive a
 /// restart, the old pointer.json is taken over, and marks the AI removes
 /// (MCP clear_marks) disappear live.

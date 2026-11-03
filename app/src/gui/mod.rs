@@ -1439,6 +1439,7 @@ impl eframe::App for EditorApp {
         egui::Panel::right("properties").resizable(true).default_size(240.0).show(ui, |ui| self.properties_panel(ui));
         egui::CentralPanel::default().show(ui, |ui| self.canvas_ui(ui));
         self.note_field(&ctx);
+        self.mark_menu_ui(&ctx);
         self.preview_window(&ctx, now);
         self.save_settings(&ctx);
 

@@ -87,6 +87,10 @@ pub struct CanvasState {
     pub(super) note_focused: bool,
     /// Give the note field the keyboard on its next paint.
     pub(super) focus_note: bool,
+    /// Screen rects of the mark labels painted last frame, with their numbers.
+    pub(super) mark_labels: Vec<(Rect, u32)>,
+    /// The right-click menu of a mark label (see `marks::MarkMenu`).
+    pub(super) mark_menu: Option<super::marks::MarkMenu>,
     panning: bool,
     /// The symmetry axis being dragged by its grip.
     pub(super) axis_drag: Option<super::transform::AxisDrag>,
@@ -115,6 +119,8 @@ impl Default for CanvasState {
             mark_drag: None,
             note_focused: false,
             focus_note: false,
+            mark_labels: Vec::new(),
+            mark_menu: None,
             panning: false,
             axis_drag: None,
             wheel: 0.0,
@@ -326,14 +332,17 @@ impl EditorApp {
 
         // ---- input: symmetry axis grips, then tools
         let grips = self.axis_grips(canvas, cell);
+        // a right click on a mark label opens its menu, with every tool
+        let label_menu = self.mark_label_input(&resp, &pointer);
         if !self.canvas.panning
+            && !label_menu
             && !self.reference_input(&resp, &pointer, cell)
             && !self.axis_input(&resp, &pointer, canvas, cell, &grips)
         {
             self.tool_input(&resp, &pointer, mods, to_px);
         }
         // selection tools: a right click (not a drag) opens the selection menu
-        if self.tool.selects() {
+        if self.tool.selects() && self.canvas.mark_menu.is_none() {
             resp.context_menu(|ui| self.selection_menu_entries(ui));
         }
         self.rebuild_textures(ui.ctx());
@@ -487,10 +496,13 @@ impl EditorApp {
             }
         }
         // "KI zeigen": the marks of this frame, the selected one with handles
+        let mark_labels_from = labels.len();
+        let mut mark_ns = Vec::new();
         if !clean {
-            let (rects, texts) = self.mark_overlays(to_screen, canvas, px);
+            let (rects, texts, ns) = self.mark_overlays(to_screen, canvas, px);
             marker_arms.extend(rects);
             labels.extend(texts);
+            mark_ns = ns;
         }
         // follow mode: changed pixels flash, the outline fades out
         for fl in self.follow.flashes.iter().filter(|_| !clean) {
@@ -532,10 +544,14 @@ impl EditorApp {
             painter.galley(r.min + Vec2::new(8.0, 4.0), galley, Color32::BLACK);
         }
         // labels are UI text (anti-aliased), drawn outside the art pixels
-        for (pos, text, col) in labels {
+        self.canvas.mark_labels.clear();
+        for (i, (pos, text, col)) in labels.into_iter().enumerate() {
             let galley = painter.layout_no_wrap(text, egui::FontId::proportional(11.0), Color32::BLACK);
             let r =
                 Rect::from_min_size(pos - Vec2::new(0.0, galley.size().y + 2.0), galley.size() + Vec2::new(4.0, 2.0));
+            if let Some(&n) = i.checked_sub(mark_labels_from).and_then(|j| mark_ns.get(j)) {
+                self.canvas.mark_labels.push((r, n));
+            }
             painter.rect_filled(r, 2.0, col);
             painter.galley(r.min + Vec2::new(2.0, 1.0), galley, Color32::BLACK);
         }
